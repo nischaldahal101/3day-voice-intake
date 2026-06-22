@@ -1,14 +1,22 @@
-// API base URL. Resolved from the current window host so a phone hitting the
-// dev server over LAN talks to the orchestrator on the same network (the laptop).
-// Override the constant below if you ever point this at a fixed URL (ngrok, prod).
+// API base URL.
+//
+//  - Production builds: set VITE_API_BASE_URL (Vite bakes it in at build
+//    time). `.env.production` in the app root holds the deployed value.
+//  - Local dev: when VITE_API_BASE_URL is unset, falls back to
+//    http://<current hostname>:5100. That keeps both laptop (localhost)
+//    AND phone-on-LAN (192.168.x.x) dev working without any env vars.
+//
+// Vite only exposes env vars prefixed VITE_ to the browser, and replaces
+// `import.meta.env.VITE_*` references at build time — there is no runtime
+// lookup, and nothing un-prefixed leaks out.
 export const API_BASE = (() => {
-  const override = null // e.g. 'https://abcd-1234.ngrok-free.app'
-  if (override) return override
+  const fromEnv = import.meta.env.VITE_API_BASE_URL
+  if (fromEnv) return fromEnv.replace(/\/$/, '')
   const host = (typeof window !== 'undefined' && window.location.hostname) || 'localhost'
   return `http://${host}:5100`
 })()
 
-const INTAKE_KEY = 'dev-intake-key'
+const INTAKE_KEY = import.meta.env.VITE_INTAKE_KEY || 'dev-intake-key'
 
 function authHeaders(extra = {}) {
   return { 'x-intake-key': INTAKE_KEY, ...extra }
