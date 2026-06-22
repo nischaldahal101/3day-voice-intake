@@ -1,0 +1,21 @@
+# Secrets — NEVER commit these
+.env
+*.env
+.env.*
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / React
+node_modules/
+dist/
+.vite/
+
+# OS
+.DS_Store
+
+# Old JSON data (we use Postgres now)
+mock_data.json
