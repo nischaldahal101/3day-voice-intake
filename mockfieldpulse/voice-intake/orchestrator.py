@@ -437,12 +437,28 @@ def app_customers():
     page = 1
     try:
         while True:
-            resp = requests.get(
-                f"{base}/customers",
-                headers={"x-api-key": key},
-                params={"page": page, "per_page": 200},
-                timeout=10,
-            )
+            # 60s timeout + single retry on Timeout — handles the Render
+            # free-tier cold-start case where the first call takes 30–60s
+            # to wake the mock service. In practice the retry only fires
+            # on page 1; once the mock is warm, subsequent pages are fast.
+            try:
+                resp = requests.get(
+                    f"{base}/customers",
+                    headers={"x-api-key": key},
+                    params={"page": page, "per_page": 200},
+                    timeout=60,
+                )
+            except requests.Timeout:
+                logger.warning(
+                    "FieldPulse /customers timed out — retrying once after brief sleep"
+                )
+                time.sleep(1)
+                resp = requests.get(
+                    f"{base}/customers",
+                    headers={"x-api-key": key},
+                    params={"page": page, "per_page": 200},
+                    timeout=60,
+                )
             if resp.status_code != 200:
                 logger.error(
                     "FieldPulse /customers returned %d: %s",
@@ -527,7 +543,10 @@ def app_create_customer():
             f"{base}/customers",
             headers={"x-api-key": key},
             json=body_out,
-            timeout=10,
+            # 60s for cold-start tolerance. No retry on this POST because
+            # the mock could create a customer on the first attempt even
+            # if the response is slow; retrying would risk a duplicate.
+            timeout=60,
         )
         if resp.status_code not in (200, 201):
             logger.error(

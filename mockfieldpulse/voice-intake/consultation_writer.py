@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -42,7 +43,9 @@ BASE_URL = os.environ.get("FIELDPULSE_BASE_URL", "http://localhost:5000").rstrip
 API_KEY = os.environ.get("FIELDPULSE_API_KEY", "dev-test-key-12345")
 _HEADERS = {"x-api-key": API_KEY}
 _SOURCE = "consultation_ai"
-_TIMEOUT = 10
+# 60s rather than 10s so a cold-starting hosted mock (Render free-tier can
+# take 30–60s to wake) has time to respond on the first call after idle.
+_TIMEOUT = 60
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -72,7 +75,18 @@ def _request(method, path, body=None, params=None, allow_404=False):
 
 
 def _get(path, params=None, allow_404=False):
-    return _request("GET", path, params=params, allow_404=allow_404)
+    """GET with a single retry on timeout — gives a cold-starting hosted
+    mock a second chance after the first call woke it up. Only GETs are
+    retried; POST/PATCH stay single-attempt to avoid duplicate writes."""
+    try:
+        return _request("GET", path, params=params, allow_404=allow_404)
+    except WriterError as exc:
+        msg = str(exc).lower()
+        if "timed out" not in msg and "timeout" not in msg:
+            raise
+        logger.warning("GET %s timed out — retrying once after brief sleep", path)
+        time.sleep(1)
+        return _request("GET", path, params=params, allow_404=allow_404)
 
 
 def _post(path, body):

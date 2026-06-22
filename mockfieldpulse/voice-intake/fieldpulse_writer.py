@@ -41,7 +41,9 @@ BASE_URL = os.environ.get("FIELDPULSE_BASE_URL", "http://localhost:5000").rstrip
 API_KEY = os.environ.get("FIELDPULSE_API_KEY", "dev-test-key-12345")
 _HEADERS = {"x-api-key": API_KEY}
 _SOURCE = "voice_intake_ai"
-_TIMEOUT = 10
+# 60s rather than 10s so a cold-starting hosted mock (Render free-tier can
+# take 30–60s to wake) has time to respond on the first call after idle.
+_TIMEOUT = 60
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _WEEKDAYS = (
