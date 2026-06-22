@@ -1,0 +1,24 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Mock server runtime state (regenerated on first run)
+mock_data.json
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
