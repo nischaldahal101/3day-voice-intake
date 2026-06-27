@@ -4,4 +4,5 @@ anthropic==0.104.0
 deepgram-sdk==6.1.1
 requests==2.32.5
 python-dotenv==1.2.1
+boto3==1.42.97
 gunicorn==23.0.0
