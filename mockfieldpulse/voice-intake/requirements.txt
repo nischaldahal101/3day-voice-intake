@@ -5,4 +5,8 @@ deepgram-sdk==6.1.1
 requests==2.32.5
 python-dotenv==1.2.1
 boto3==1.42.97
+psycopg[binary]==3.2.13
+psycopg-pool==3.2.8
+redis==7.0.1
+rq==2.8.0
 gunicorn==23.0.0
