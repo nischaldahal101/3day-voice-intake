@@ -8,6 +8,7 @@ that wrap operations in try/except and raise StorageError on failure.
 import logging
 import mimetypes
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -139,6 +140,52 @@ def delete_audio(key: str) -> None:
         raise StorageError(
             f"Failed to delete r2://{R2_BUCKET_NAME}/{key}: {exc}"
         )
+
+
+_EXT_RE = re.compile(r"^[a-z0-9]{1,10}$")
+
+
+def generate_consultation_key(filename: str) -> str:
+    """Return a unique R2 key of the form `consultations/<uuid>.<ext>`.
+
+    Preserves the filename's extension (lowercased, validated) so downstream
+    `mimetypes.guess_type()` in the transcriber picks the right MIME. Falls
+    back to `.bin` for weird / missing extensions.
+    """
+    ext = os.path.splitext(filename or "")[1].lstrip(".").lower()
+    if not _EXT_RE.match(ext):
+        ext = "bin"
+    return f"consultations/{uuid.uuid4()}.{ext}"
+
+
+def generate_upload_url(key: str, content_type: str, expires_in: int = 3600) -> str:
+    """Return a presigned PUT URL for direct-to-R2 uploads.
+
+    The client MUST send the exact same `Content-Type` header at PUT time
+    that was passed here — boto3 bakes it into the SigV4 signature, and R2
+    returns 403 SignatureDoesNotMatch on any mismatch.
+    """
+    _ensure_configured()
+    logger.info(
+        "Generating presigned PUT url for r2://%s/%s (expires_in=%ds)",
+        R2_BUCKET_NAME, key, expires_in,
+    )
+    try:
+        url = _client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": R2_BUCKET_NAME,
+                "Key": key,
+                "ContentType": content_type,
+            },
+            ExpiresIn=expires_in,
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.error("Failed to generate upload URL: %s", exc)
+        raise StorageError(
+            f"Failed to generate upload URL for r2://{R2_BUCKET_NAME}/{key}: {exc}"
+        )
+    return url
 
 
 def audio_exists(key: str) -> bool:

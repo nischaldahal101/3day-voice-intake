@@ -1,4 +1,4 @@
-export default function Home({ onStart }) {
+export default function Home({ onStart, onRecent }) {
   return (
     <section className="screen screen-home">
       <header className="hero">
@@ -16,6 +16,11 @@ export default function Home({ onStart }) {
         <button className="btn btn-primary btn-lg" onClick={onStart}>
           New Consultation
         </button>
+        {onRecent && (
+          <button className="btn btn-secondary" onClick={onRecent}>
+            Recent consultations
+          </button>
+        )}
         <p className="footer-hint">
           For 3 Day Kitchen <em>&amp;</em> Bath sales reps
         </p>

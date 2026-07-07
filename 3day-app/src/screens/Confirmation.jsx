@@ -60,6 +60,9 @@ export default function Confirmation({ customer, result, onDone }) {
   const fpUrl = result && result.fieldpulse && result.fieldpulse.fieldpulse_url
   const elapsed = result && result.elapsed_seconds
   const matchPath = result && result.fieldpulse && result.fieldpulse.match_path
+  const transcript = (result && typeof result.transcript === 'string')
+    ? result.transcript
+    : ''
 
   return (
     <section className="screen screen-confirmation">
@@ -93,6 +96,19 @@ export default function Confirmation({ customer, result, onDone }) {
               </li>
             ))}
           </ul>
+        )}
+        {transcript && (
+          <details className="confirm-transcript">
+            <summary className="confirm-transcript-toggle">
+              <span>Show transcript</span>
+              <span className="confirm-transcript-count">
+                {transcript.length.toLocaleString()} chars
+              </span>
+            </summary>
+            <div className="confirm-transcript-body">
+              <p className="confirm-transcript-text">{transcript}</p>
+            </div>
+          </details>
         )}
       </div>
       <div className="footer-actions">

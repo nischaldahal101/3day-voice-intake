@@ -8,6 +8,7 @@ and returns the combined result. Intended to be reached by an iPhone Shortcut
 
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -18,10 +19,18 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from consultation_writer import write_consultation_to_fieldpulse
 from consultation_writer import WriterError as ConsultWriterError
-from extractor import ExtractionError, extract_consultation, extract_intake
+from extractor import ExtractionError, extract_intake
 from fieldpulse_writer import WriterError, write_intake_to_fieldpulse
+from jobs import create_job, get_job, list_recent_jobs
+from pipeline import run_from_transcript as _run_consult_from_transcript
+from queue_setup import enqueue_consultation
+from storage import (
+    StorageError,
+    audio_exists,
+    generate_consultation_key,
+    generate_upload_url,
+)
 from transcriber import TranscriptionError, transcribe_audio
 
 _HERE = Path(__file__).resolve().parent
@@ -249,9 +258,10 @@ def test_with_sample():
 def _run_consultation_pipeline(transcript, customer_id, source, transcription_seconds=None):
     """Extract -> write consultation. Returns (response_dict, http_status_code).
 
-    Handles the extraction and writer failures explicitly (mirrors the intake
-    pipeline). transcription_seconds is included in the response when a
-    transcription step ran upstream.
+    Delegates the actual extract+write work to pipeline.run_from_transcript
+    (which is also what the async worker uses via pipeline.run_from_audio),
+    so there's one source of truth for the consultation flow. This function
+    just maps stage-specific exceptions to HTTP status codes.
     """
     start = time.monotonic()
     logger.info(
@@ -260,7 +270,9 @@ def _run_consultation_pipeline(transcript, customer_id, source, transcription_se
     )
 
     try:
-        extraction = extract_consultation(transcript)
+        result = _run_consult_from_transcript(
+            transcript, customer_id=customer_id, source=source,
+        )
     except ExtractionError as exc:
         elapsed = round(time.monotonic() - start, 1)
         logger.warning("Consultation extraction failed after %.1fs: %s", elapsed, exc)
@@ -269,39 +281,24 @@ def _run_consultation_pipeline(transcript, customer_id, source, transcription_se
             "error": str(exc),
             "elapsed_seconds": elapsed,
         }, 422
-    logger.info(
-        "Consultation extraction done (project_type=%s)",
-        extraction.get("project_type"),
-    )
-
-    try:
-        fieldpulse = write_consultation_to_fieldpulse(
-            extraction,
-            customer_id=customer_id,
-            original_transcript=transcript,
-        )
     except ConsultWriterError as exc:
         elapsed = round(time.monotonic() - start, 1)
         logger.error("Consultation writer failed after %.1fs: %s", elapsed, exc)
+        # pipeline attaches the completed extraction to the WriterError so
+        # we can still show Claude's output when the FieldPulse write fails.
         return {
             "status": "writer_failed",
             "error": str(exc),
-            "extraction": extraction,
+            "extraction": getattr(exc, "extraction", None),
             "elapsed_seconds": elapsed,
         }, 502
-    logger.info(
-        "Consultation write done (match_path=%s customer=%s job=%s)",
-        fieldpulse.get("match_path"),
-        fieldpulse.get("customer_id"),
-        fieldpulse.get("job_id"),
-    )
 
     elapsed = round(time.monotonic() - start, 1)
     response = {
         "status": "success",
-        "transcript": transcript,
-        "extraction": extraction,
-        "fieldpulse": fieldpulse,
+        "transcript": result["transcript"],
+        "extraction": result["extraction"],
+        "fieldpulse": result["fieldpulse"],
         "elapsed_seconds": elapsed,
     }
     if transcription_seconds is not None:
@@ -327,7 +324,11 @@ def _handle_consultation(transcript, customer_id, source, transcription_seconds=
 
 @app.post("/process-consultation")
 def process_consultation():
-    """End-to-end consultation: audio file -> transcribe -> extract -> write.
+    """DEPRECATED — synchronous consultation endpoint. Kept working until
+    the app is rewired to the async flow below (upload-url / submit /
+    job-status). Prefer the async flow for new callers.
+
+    End-to-end consultation: audio file -> transcribe -> extract -> write.
 
     Accepts EITHER:
       - multipart/form-data with field `audio` (audio file) and optional
@@ -417,6 +418,166 @@ def test_consultation_sample():
     return _handle_consultation(
         SAMPLE_CONSULTATION_TRANSCRIPT, customer_id=None, source="test-consultation-sample"
     )
+
+
+# --- Async consultation flow (direct-to-R2 upload) -------------------------
+# Replaces /process-consultation. The app calls these three in order:
+#   1. POST /consultation/upload-url   -> get a presigned R2 PUT URL + audio_key
+#   2. (browser PUTs the audio directly to R2 — bypasses the orchestrator)
+#   3. POST /consultation/submit       -> creates the job + enqueues; returns
+#                                         job_id and HTTP 202
+#   4. GET  /job-status/<job_id>       -> polled until status=='done'|'failed'
+
+# Anything under audio/* is accepted; `video/webm` is included because
+# browser MediaRecorder often labels audio-only WebM as video/webm.
+_ALLOWED_CONTENT_TYPE_EXTRAS = {"video/webm"}
+_CUSTOMER_ID_RE = re.compile(r"^cust_[A-Za-z0-9]+$")
+_AUDIO_KEY_RE = re.compile(r"^consultations/[A-Za-z0-9\-]+\.[A-Za-z0-9]{1,10}$")
+
+
+def _is_allowed_content_type(ct):
+    if not isinstance(ct, str) or not ct:
+        return False
+    # Strip codec params, e.g. "audio/webm;codecs=opus" -> "audio/webm"
+    base = ct.split(";", 1)[0].strip().lower()
+    return base.startswith("audio/") or base in _ALLOWED_CONTENT_TYPE_EXTRAS
+
+
+def _bad_request(message, code=400):
+    return jsonify({"error": message}), code
+
+
+@app.post("/consultation/upload-url")
+def consultation_upload_url():
+    """Step 1 of the async flow. Body:
+        { "filename": "...", "content_type": "audio/...", "customer_id"?: "cust_..." }
+
+    Returns { "upload_url", "audio_key" }. The app then PUTs the audio
+    directly to `upload_url`, sending the SAME `Content-Type` header it
+    passed here (the value is baked into the SigV4 signature; R2 will
+    reject the PUT otherwise).
+    """
+    body = request.get_json(silent=True) or {}
+    filename = (body.get("filename") or "").strip()
+    content_type = (body.get("content_type") or "").strip()
+    customer_id = (body.get("customer_id") or "").strip() or None
+
+    if not filename:
+        return _bad_request("'filename' is required")
+    if not content_type:
+        return _bad_request("'content_type' is required")
+    if not _is_allowed_content_type(content_type):
+        return _bad_request(
+            f"content_type '{content_type}' is not an allowed audio type "
+            f"(accepted: audio/*, video/webm)"
+        )
+    if customer_id and not _CUSTOMER_ID_RE.match(customer_id):
+        return _bad_request(
+            f"customer_id '{customer_id}' has invalid format (expected cust_...)"
+        )
+
+    try:
+        audio_key = generate_consultation_key(filename)
+        upload_url = generate_upload_url(audio_key, content_type)
+    except StorageError as exc:
+        logger.error("Upload URL generation failed: %s", exc)
+        return jsonify({"error": str(exc)}), 502
+
+    logger.info(
+        "Issued upload URL: audio_key=%s content_type=%s customer_id=%s",
+        audio_key, content_type, customer_id or "—",
+    )
+    return jsonify({
+        "upload_url": upload_url,
+        "audio_key": audio_key,
+    })
+
+
+@app.post("/consultation/submit")
+def consultation_submit():
+    """Step 2 of the async flow. Body:
+        { "audio_key": "consultations/...", "customer_id"?: "...", "source"?: "..." }
+
+    Verifies the R2 object actually exists (means the client PUT succeeded),
+    creates a consultation_jobs row, enqueues it for the worker, and returns
+    { "job_id", "status": "queued" } with HTTP 202.
+    """
+    body = request.get_json(silent=True) or {}
+    audio_key = (body.get("audio_key") or "").strip()
+    customer_id = (body.get("customer_id") or "").strip() or None
+    source = (body.get("source") or "3day-app").strip() or "3day-app"
+
+    if not audio_key:
+        return _bad_request("'audio_key' is required")
+    if not _AUDIO_KEY_RE.match(audio_key):
+        return _bad_request(
+            f"audio_key '{audio_key}' has invalid format "
+            f"(expected consultations/<uuid>.<ext>)"
+        )
+    if customer_id and not _CUSTOMER_ID_RE.match(customer_id):
+        return _bad_request(
+            f"customer_id '{customer_id}' has invalid format (expected cust_...)"
+        )
+
+    try:
+        exists = audio_exists(audio_key)
+    except StorageError as exc:
+        logger.error("Failed to verify R2 key: %s", exc)
+        return jsonify({"error": f"Could not verify R2 upload: {exc}"}), 502
+
+    if not exists:
+        return _bad_request(
+            f"audio_key '{audio_key}' does not exist in R2 — the upload may "
+            f"have failed. Request a fresh upload URL and try again.",
+            code=404,
+        )
+
+    job = create_job(
+        audio_key=audio_key, customer_id=customer_id, source=source
+    )
+    enqueue_consultation(job["id"])
+    logger.info(
+        "Enqueued consultation job %s (audio_key=%s customer_id=%s source=%s)",
+        job["id"], audio_key, customer_id or "—", source,
+    )
+    return jsonify({
+        "job_id": job["id"],
+        "status": job["status"],
+    }), 202
+
+
+@app.get("/jobs/recent")
+def jobs_recent():
+    """List recent consultation jobs newest-first for the app's history view.
+    Optional ?limit= (default 20, hard-capped at 50)."""
+    raw = request.args.get("limit", "20")
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return _bad_request(f"'limit' must be an integer (got {raw!r})")
+    limit = max(1, min(limit, 50))
+    return jsonify({"jobs": list_recent_jobs(limit)})
+
+
+@app.get("/job-status/<job_id>")
+def consultation_job_status(job_id):
+    """Poll a consultation job's status. Returns the current record; on
+    done the `result` JSONB is included; on failed the `error` field is."""
+    job = get_job(job_id)
+    if job is None:
+        return jsonify({"error": f"Job not found: {job_id}"}), 404
+
+    response = {
+        "job_id": job["id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    }
+    if job["status"] == "done" and job.get("result") is not None:
+        response["result"] = job["result"]
+    if job["status"] == "failed" and job.get("error"):
+        response["error"] = job["error"]
+    return jsonify(response)
 
 
 # --- App-facing endpoints (read-only, used by the React app) ---------------

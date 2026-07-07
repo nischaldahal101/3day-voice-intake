@@ -163,6 +163,54 @@ def get_job(job_id: str) -> dict | None:
     return _serialize_job(row) if row else None
 
 
+def list_recent_jobs(limit: int = 20) -> list:
+    """Return recent jobs newest-first for a list view.
+
+    The response is intentionally compact — a `summary` field extracts a
+    handful of headline values (project_type, match_path, FieldPulse ids,
+    admin URL) from the result JSONB rather than dumping the full extraction
+    + fieldpulse + transcript payload. Failed jobs include their `error`.
+    """
+    limit = max(1, min(int(limit), 100))
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, status, customer_id, source, result, error,
+                   created_at, updated_at
+              FROM consultation_jobs
+             ORDER BY created_at DESC
+             LIMIT %s
+            """,
+            [limit],
+        )
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        item = {
+            "id": r["id"],
+            "status": r["status"],
+            "customer_id": r["customer_id"],
+            "source": r["source"],
+            "created_at": _iso(r["created_at"]),
+            "updated_at": _iso(r["updated_at"]),
+        }
+        result = r["result"]
+        if result:
+            extraction = result.get("extraction") or {}
+            fieldpulse = result.get("fieldpulse") or {}
+            item["summary"] = {
+                "project_type": extraction.get("project_type"),
+                "match_path": fieldpulse.get("match_path"),
+                "fieldpulse_customer_id": fieldpulse.get("customer_id"),
+                "fieldpulse_job_id": fieldpulse.get("job_id"),
+                "fieldpulse_url": fieldpulse.get("fieldpulse_url"),
+            }
+        if r["error"]:
+            item["error"] = r["error"]
+        out.append(item)
+    return out
+
+
 def update_job_status(
     job_id: str, status: str, result: dict = None, error: str = None
 ) -> dict:

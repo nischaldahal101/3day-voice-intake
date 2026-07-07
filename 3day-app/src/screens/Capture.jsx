@@ -16,8 +16,10 @@ function pickMimeType() {
 
 function fmtDuration(sec) {
   const s = Math.floor(sec)
-  const m = Math.floor(s / 60)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
   const ss = String(s % 60).padStart(2, '0')
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${ss}`
   return `${m}:${ss}`
 }
 
@@ -29,7 +31,10 @@ function fmtBytes(bytes) {
 }
 
 export default function Capture({ customer, onBack, onSubmit }) {
-  const [mode, setMode] = useState('record')
+  // Upload is the default mode: browser MediaRecorder can't record in the
+  // background on mobile, so long consults go through the phone's native
+  // recorder → Upload here. Record stays for quick, in-hand captures.
+  const [mode, setMode] = useState('upload')
   const [isRecording, setIsRecording] = useState(false)
   const [audioBlob, setAudioBlob] = useState(null)
   const [transcript, setTranscript] = useState('')
@@ -44,6 +49,35 @@ export default function Capture({ customer, onBack, onSubmit }) {
   const startTsRef = useRef(0)
   const fileInputRef = useRef(null)
 
+  // Screen Wake Lock — keeps the phone display from auto-locking while the
+  // rep is actively recording. Feature-detected: browsers without the API
+  // (or where the request fails) silently skip; nothing else changes.
+  const wakeLockRef = useRef(null)
+
+  async function acquireWakeLock() {
+    if (typeof navigator === 'undefined' || !navigator.wakeLock) return
+    if (wakeLockRef.current) return
+    try {
+      const lock = await navigator.wakeLock.request('screen')
+      wakeLockRef.current = lock
+      // The OS/browser can release the lock on its own (tab hidden, low
+      // battery, etc). Clear our ref so a subsequent visibilitychange can
+      // re-acquire cleanly.
+      lock.addEventListener('release', () => {
+        if (wakeLockRef.current === lock) wakeLockRef.current = null
+      })
+    } catch (_) {
+      // Permissions denied or unsupported context — best-effort only.
+    }
+  }
+
+  async function releaseWakeLock() {
+    const lock = wakeLockRef.current
+    wakeLockRef.current = null
+    if (!lock) return
+    try { await lock.release() } catch (_) { /* ignore */ }
+  }
+
   useEffect(() => {
     return () => {
       if (recorderRef.current && recorderRef.current.state !== 'inactive') {
@@ -53,8 +87,27 @@ export default function Capture({ customer, onBack, onSubmit }) {
         streamRef.current.getTracks().forEach((t) => t.stop())
       }
       if (timerRef.current) clearInterval(timerRef.current)
+      releaseWakeLock()
     }
   }, [])
+
+  // Wake Lock is auto-released the moment the tab hides. If the rep comes
+  // back and recording is still going, re-acquire so the display doesn't
+  // silently stop being held awake.
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const onVis = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        isRecording &&
+        !wakeLockRef.current
+      ) {
+        acquireWakeLock()
+      }
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [isRecording])
 
   async function startRecording() {
     setRecordError(null)
@@ -93,6 +146,7 @@ export default function Capture({ customer, onBack, onSubmit }) {
           clearInterval(timerRef.current)
           timerRef.current = null
         }
+        releaseWakeLock()
       }
       recorder.start(250)
       setIsRecording(true)
@@ -100,6 +154,9 @@ export default function Capture({ customer, onBack, onSubmit }) {
       timerRef.current = setInterval(() => {
         setElapsed((Date.now() - startTsRef.current) / 1000)
       }, 200)
+      // Fire-and-forget; if the API is missing or the request fails, we
+      // just don't get the wake lock — recording still works.
+      acquireWakeLock()
     } catch (err) {
       const name = (err && err.name) || ''
       let msg = 'Microphone access was denied or unavailable.'
@@ -120,6 +177,7 @@ export default function Capture({ customer, onBack, onSubmit }) {
       }
       setRecordError(msg)
       setIsRecording(false)
+      releaseWakeLock()
     }
   }
 
@@ -128,6 +186,8 @@ export default function Capture({ customer, onBack, onSubmit }) {
       recorderRef.current.stop()
     }
     setIsRecording(false)
+    // recorder.onstop also releases, but call here in case onstop fires late.
+    releaseWakeLock()
   }
 
   function discardRecording() {
@@ -186,19 +246,21 @@ export default function Capture({ customer, onBack, onSubmit }) {
       <div className="mode-tabs" role="tablist">
         <button
           role="tab"
-          aria-selected={mode === 'record'}
-          className={`mode-tab ${mode === 'record' ? 'is-active' : ''}`}
-          onClick={() => setMode('record')}
-        >
-          Record
-        </button>
-        <button
-          role="tab"
           aria-selected={mode === 'upload'}
           className={`mode-tab ${mode === 'upload' ? 'is-active' : ''}`}
           onClick={() => setMode('upload')}
         >
           Upload
+          <span className="mode-tab-sub">Recommended</span>
+        </button>
+        <button
+          role="tab"
+          aria-selected={mode === 'record'}
+          className={`mode-tab ${mode === 'record' ? 'is-active' : ''}`}
+          onClick={() => setMode('record')}
+        >
+          Record
+          <span className="mode-tab-sub">Quick capture</span>
         </button>
         <button
           role="tab"
@@ -207,71 +269,11 @@ export default function Capture({ customer, onBack, onSubmit }) {
           onClick={() => setMode('paste')}
         >
           Paste
+          <span className="mode-tab-sub">Transcript</span>
         </button>
       </div>
 
       <div className="capture-body">
-        {mode === 'record' && (
-          <div className="record-zone">
-            {!audioBlob && !isRecording && (
-              <>
-                <p className="record-hint">
-                  Tap to start. Hold the phone near the conversation — Deepgram
-                  handles real, two-speaker dialogue.
-                </p>
-                <button
-                  className="record-btn"
-                  onClick={startRecording}
-                  aria-label="Start recording"
-                >
-                  <span className="record-btn-dot" />
-                </button>
-                <p className="record-cta">Tap to record</p>
-              </>
-            )}
-            {isRecording && (
-              <>
-                <p className="record-hint">Listening…</p>
-                <button
-                  className="record-btn is-recording"
-                  onClick={stopRecording}
-                  aria-label="Stop recording"
-                >
-                  <span className="record-btn-square" />
-                </button>
-                <p className="record-timer" aria-live="polite">
-                  {fmtDuration(elapsed)}
-                </p>
-                <p className="record-cta">Tap to stop</p>
-              </>
-            )}
-            {audioBlob && !isRecording && (
-              <div className="record-done">
-                <div className="record-done-badge" aria-hidden>
-                  <svg viewBox="0 0 24 24" width="22" height="22">
-                    <path
-                      d="M5 12.5l4.5 4.5L19 7"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                </div>
-                <p className="record-done-title">Recording ready</p>
-                <p className="record-done-meta">
-                  {fmtDuration(elapsed)} · {fmtBytes(audioBlob.size)}
-                </p>
-                <button className="btn btn-tertiary" onClick={discardRecording}>
-                  Re-record
-                </button>
-              </div>
-            )}
-            {recordError && <div className="record-error">{recordError}</div>}
-          </div>
-        )}
-
         {mode === 'upload' && (
           <div className="upload-zone">
             <input
@@ -283,10 +285,18 @@ export default function Capture({ customer, onBack, onSubmit }) {
             />
             {!uploadedFile && (
               <>
-                <p className="record-hint">
-                  Already have a recording from another app? Tap below and pick
-                  the file from your phone.
-                </p>
+                <div className="upload-lead">
+                  <p className="upload-lead-title">
+                    Best for real in-home consults
+                  </p>
+                  <p className="upload-lead-body">
+                    Record with your phone&rsquo;s built-in <strong>Voice
+                    Memos</strong> (iPhone) or <strong>Recorder</strong>{' '}
+                    (Android). Those apps keep recording even if you lock the
+                    phone or switch apps &mdash; the browser can&rsquo;t. When
+                    the consult is done, come back here and pick the file.
+                  </p>
+                </div>
                 <button
                   type="button"
                   className="upload-card"
@@ -338,6 +348,73 @@ export default function Capture({ customer, onBack, onSubmit }) {
           </div>
         )}
 
+        {mode === 'record' && (
+          <div className="record-zone">
+            {!audioBlob && !isRecording && (
+              <>
+                <p className="record-hint">
+                  Good for a quick capture with the phone in your hand.{' '}
+                  <strong>Screen must stay on</strong> &mdash; if you lock the
+                  phone or switch apps, browser recording stops. For a full
+                  consult, use the Upload tab.
+                </p>
+                <button
+                  className="record-btn"
+                  onClick={startRecording}
+                  aria-label="Start recording"
+                >
+                  <span className="record-btn-dot" />
+                </button>
+                <p className="record-cta">Tap to record</p>
+              </>
+            )}
+            {isRecording && (
+              <>
+                <p className="record-hint">Listening…</p>
+                <button
+                  className="record-btn is-recording"
+                  onClick={stopRecording}
+                  aria-label="Stop recording"
+                >
+                  <span className="record-btn-square" />
+                </button>
+                <p className="record-timer" aria-live="polite">
+                  {fmtDuration(elapsed)}
+                </p>
+                <p className="record-cta">Tap to stop</p>
+                <p className="record-note" role="status">
+                  Keep this screen open. Browser recording stops if you lock
+                  the phone or switch apps.
+                </p>
+              </>
+            )}
+            {audioBlob && !isRecording && (
+              <div className="record-done">
+                <div className="record-done-badge" aria-hidden>
+                  <svg viewBox="0 0 24 24" width="22" height="22">
+                    <path
+                      d="M5 12.5l4.5 4.5L19 7"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </div>
+                <p className="record-done-title">Recording ready</p>
+                <p className="record-done-meta">
+                  {fmtDuration(elapsed)} · {fmtBytes(audioBlob.size)}
+                </p>
+                <button className="btn btn-tertiary" onClick={discardRecording}>
+                  Re-record
+                </button>
+              </div>
+            )}
+            {recordError && <div className="record-error">{recordError}</div>}
+          </div>
+        )}
+
         {mode === 'paste' && (
           <div className="paste-zone">
             <label htmlFor="transcript" className="paste-label">
@@ -366,6 +443,10 @@ export default function Capture({ customer, onBack, onSubmit }) {
         >
           Submit Consultation
         </button>
+        <p className="capture-async-note">
+          Long recording? Processing continues on our servers after upload —
+          you can close the app once it&rsquo;s sent.
+        </p>
       </div>
     </section>
   )
