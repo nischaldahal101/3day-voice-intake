@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import requests
+from clerk_backend_api import AuthenticateRequestOptions, Clerk
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -40,7 +41,41 @@ load_dotenv(_HERE / ".env")
 # curl commands keep working. (Under gunicorn on Render, gunicorn binds
 # via --bind 0.0.0.0:$PORT and this app.run() never executes.)
 PORT = int(os.environ.get("PORT", 5100))
-DEFAULT_INTAKE_KEY = "dev-intake-key"
+
+# --- Clerk auth ------------------------------------------------------------
+#
+# Verifies incoming session tokens against Clerk before any protected route
+# runs. Networkless once Clerk's JWKS is cached — one round-trip on first
+# request, then all subsequent verifies are local RSA checks.
+#
+# Endpoints that must have this on:
+#   /consultation/upload-url, /consultation/submit, /job-status/<id>,
+#   /jobs/recent, /app/customers (GET+POST), /process-consultation.
+# Public: /health only.
+#
+# We used to require x-intake-key on every request. That's retired here —
+# Clerk sessions are the real gate now.
+_CLERK_SECRET = os.environ.get("CLERK_SECRET_KEY")
+if not _CLERK_SECRET:
+    # Loud failure at boot: an unprotected orchestrator is worse than one
+    # that won't start. Local dev must set CLERK_SECRET_KEY in .env.
+    raise RuntimeError(
+        "CLERK_SECRET_KEY is not set. Add it to voice-intake/.env "
+        "(Clerk dashboard → API Keys → 'Secret key' — starts with sk_test_ or sk_live_)."
+    )
+_clerk_sdk = Clerk(bearer_auth=_CLERK_SECRET)
+
+# Origins Clerk should accept tokens from — used to defend against a token
+# issued for a different app being replayed here. Comma-separated env var
+# lets ops list every host the app runs on (localhost:5173 for dev; the
+# deployed app URL in prod).
+_AUTHORIZED_PARTIES = [
+    p.strip() for p in os.environ.get(
+        "CLERK_AUTHORIZED_PARTIES",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if p.strip()
+]
 
 # --- Logging ----------------------------------------------------------------
 
@@ -59,12 +94,12 @@ app = Flask(__name__)
 # localhost:5173) can hit this orchestrator from a browser. For production,
 # REPLACE origins="*" with the deployed app's actual domain — e.g.
 #   CORS(app, origins=["https://app.example.com"], supports_credentials=True)
-# Also: keep allow_headers including "x-intake-key" so the browser can send
-# the existing auth header on cross-origin requests.
+# Authorization must be in allow_headers so the browser is willing to send
+# the Clerk Bearer token on cross-origin requests.
 CORS(
     app,
     origins="*",
-    allow_headers=["Content-Type", "x-intake-key"],
+    allow_headers=["Content-Type", "Authorization"],
     methods=["GET", "POST", "OPTIONS"],
 )
 
@@ -142,24 +177,54 @@ HOMEOWNER: That works. Thursday at six.
 
 # --- Auth -------------------------------------------------------------------
 
-@app.before_request
-def _require_intake_key():
-    """Every endpoint except /health requires a valid x-intake-key header.
+# Routes that do NOT require a Clerk session token. Everything else must have
+# a valid Bearer token on the Authorization header. Keep this list tight —
+# add here only if a caller genuinely can't send a token (health checks,
+# public probes). All new app-facing endpoints should stay off this list.
+_PUBLIC_PATHS = frozenset(["/health"])
 
-    OPTIONS (CORS preflight) requests are also exempt — browsers don't send
-    custom headers on preflights, so blocking them here would break CORS.
-    Flask-CORS responds with the appropriate Access-Control-Allow-* headers.
+
+@app.before_request
+def _require_clerk_session():
+    """Verify the Clerk session token on every non-public request.
+
+    Flow:
+      1. Skip OPTIONS (CORS preflights don't carry auth headers and are
+         answered by Flask-CORS with the right Access-Control-Allow-* set).
+      2. Skip anything in _PUBLIC_PATHS (currently just /health).
+      3. Call Clerk's authenticate_request against the incoming request.
+         Networkless after the first JWKS fetch.
+      4. On not-signed-in, return 401 with a JSON error body.
+      5. On success, stash the Clerk user id on flask.g in case a route
+         wants to attribute writes to a specific user (Chunk C will use
+         this for org-scoping).
     """
-    if request.method == "OPTIONS" or request.path == "/health":
+    if request.method == "OPTIONS" or request.path in _PUBLIC_PATHS:
         return
-    expected = os.environ.get("INTAKE_API_KEY", DEFAULT_INTAKE_KEY)
-    provided = request.headers.get("x-intake-key")
-    if not provided or provided != expected:
-        logger.warning("Rejected request to %s: missing/invalid x-intake-key", request.path)
+    try:
+        state = _clerk_sdk.authenticate_request(
+            request,
+            AuthenticateRequestOptions(authorized_parties=_AUTHORIZED_PARTIES),
+        )
+    except Exception as exc:  # noqa: BLE001 — never want SDK bugs to 500 auth
+        logger.warning("Clerk auth threw on %s: %s", request.path, exc)
         return jsonify({
             "status": "unauthorized",
-            "error": "Missing or invalid x-intake-key header",
+            "error": "Session verification failed.",
         }), 401
+    if not state.is_signed_in:
+        reason = state.message or "Not signed in."
+        logger.info("Rejected request to %s: %s", request.path, reason)
+        return jsonify({
+            "status": "unauthorized",
+            "error": reason,
+        }), 401
+    # Stash for later routes / logging. Clerk session tokens put the user id
+    # in the 'sub' claim.
+    from flask import g
+    payload = state.payload or {}
+    g.clerk_user_id = payload.get("sub")
+    g.clerk_session_id = payload.get("sid")
 
 
 # --- Core pipeline ----------------------------------------------------------
@@ -758,7 +823,6 @@ def app_create_customer():
 # --- Startup ----------------------------------------------------------------
 
 if __name__ == "__main__":
-    intake_key = os.environ.get("INTAKE_API_KEY", DEFAULT_INTAKE_KEY)
     bar = "─" * 64
     print(bar)
     print("Voice Intake Orchestrator")
@@ -766,14 +830,19 @@ if __name__ == "__main__":
     print(f"  Bound to:     0.0.0.0:{PORT}  (reachable via ngrok)")
     print("  Endpoints:")
     print(f"    GET  /health                    (no auth)")
-    print(f"    POST /process-transcript        (intake — JSON)")
-    print(f"    POST /test-with-sample          (intake smoke test)")
-    print(f"    POST /process-consultation      (consultation — audio or JSON)")
-    print(f"    POST /test-consultation-sample  (consultation smoke test)")
-    print(f"    GET  /app/customers             (proxy: customer picker list)")
-    print(f"    POST /app/customers             (proxy: create customer)")
+    print(f"    POST /process-transcript        (Clerk-protected — JSON)")
+    print(f"    POST /test-with-sample          (Clerk-protected — smoke test)")
+    print(f"    POST /process-consultation      (Clerk-protected — audio or JSON)")
+    print(f"    POST /test-consultation-sample  (Clerk-protected — smoke test)")
+    print(f"    POST /consultation/upload-url   (Clerk-protected — presigned R2)")
+    print(f"    POST /consultation/submit       (Clerk-protected — enqueue job)")
+    print(f"    GET  /job-status/<job_id>       (Clerk-protected — poll)")
+    print(f"    GET  /jobs/recent               (Clerk-protected — history)")
+    print(f"    GET  /app/customers             (Clerk-protected — picker list)")
+    print(f"    POST /app/customers             (Clerk-protected — create)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
-    print(f"  Auth header:  x-intake-key: {intake_key}")
+    print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
+    print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")
     print("  Note: mock FieldPulse must be running on http://localhost:5000")
     print(bar)
     # debug=False → no auto-reloader re-running the pipeline during testing.

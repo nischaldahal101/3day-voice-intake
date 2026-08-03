@@ -16,24 +16,75 @@ export const API_BASE = (() => {
   return `http://${host}:5100`
 })()
 
-const INTAKE_KEY = import.meta.env.VITE_INTAKE_KEY || 'dev-intake-key'
+// ---------------------------------------------------------------------------
+// Auth: attach the current Clerk session token as a Bearer to every request.
+//
+// ClerkProvider (main.jsx) sets `window.Clerk` when it mounts, so this
+// module — plain JS, not a React component — can reach it globally. If the
+// user isn't signed in yet, or Clerk hasn't finished loading, getToken()
+// returns null and we send the request unauthenticated (which the
+// orchestrator will 401 — the correct signal).
+//
+// On 401 anywhere in this file we call signOut() so the app's SignedIn
+// wrapper flips to SignedOut and the sign-in card reappears. That way a
+// stale/expired token doesn't leave the app stuck in a "logged in but every
+// request fails" limbo.
+// ---------------------------------------------------------------------------
 
-function authHeaders(extra = {}) {
-  return { 'x-intake-key': INTAKE_KEY, ...extra }
+async function getClerkToken() {
+  if (typeof window === 'undefined') return null
+  const clerk = window.Clerk
+  if (!clerk || !clerk.session) return null
+  try {
+    return await clerk.session.getToken()
+  } catch (_) {
+    return null
+  }
 }
 
-// -------------------- Customers (unchanged) --------------------
+async function authHeaders(extra = {}) {
+  const token = await getClerkToken()
+  const h = { ...extra }
+  if (token) h['Authorization'] = `Bearer ${token}`
+  return h
+}
+
+async function handleAuthFailure() {
+  if (typeof window === 'undefined' || !window.Clerk) return
+  try { await window.Clerk.signOut() } catch (_) { /* best effort */ }
+}
+
+// Throws a labeled Error on a non-2xx response; also triggers signOut on 401
+// so the app bounces back to the sign-in screen instead of quietly failing.
+async function assertOk(resp, opName) {
+  if (resp.ok) return
+  if (resp.status === 401) {
+    await handleAuthFailure()
+    const err = new Error('Your session expired. Please sign in again.')
+    err.status = 401
+    throw err
+  }
+  let detail = ''
+  try {
+    const data = await resp.clone().json()
+    detail = data && data.error ? data.error : ''
+  } catch (_) {
+    try { detail = await resp.text() } catch (_) { /* ignore */ }
+  }
+  const err = new Error(
+    `${opName} failed (HTTP ${resp.status})${detail ? ': ' + detail.slice(0, 200) : ''}`,
+  )
+  err.status = resp.status
+  throw err
+}
+
+// -------------------- Customers --------------------
 
 export async function fetchCustomers() {
   const resp = await fetch(`${API_BASE}/app/customers`, {
-    headers: authHeaders(),
+    headers: await authHeaders(),
   })
-  if (!resp.ok) {
-    const detail = await resp.text().catch(() => '')
-    throw new Error(
-      `Couldn't load customers (HTTP ${resp.status}). ${detail.slice(0, 200)}`,
-    )
-  }
+  await assertOk(resp, "Couldn't load customers")
   const data = await resp.json()
   return data.customers || []
 }
@@ -41,7 +92,7 @@ export async function fetchCustomers() {
 export async function createCustomer({ first_name, last_name, phone, email }) {
   const resp = await fetch(`${API_BASE}/app/customers`, {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       first_name,
       last_name,
@@ -49,15 +100,8 @@ export async function createCustomer({ first_name, last_name, phone, email }) {
       email: email && email.trim() ? email.trim() : null,
     }),
   })
+  await assertOk(resp, "Couldn't create customer")
   const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) {
-    const msg =
-      (data && data.error) ||
-      `Couldn't create customer (HTTP ${resp.status}).`
-    const err = new Error(msg)
-    err.status = resp.status
-    throw err
-  }
   return data.customer
 }
 
@@ -89,26 +133,21 @@ export function filenameForBlob(blob, fallbackExt) {
 export async function requestUploadUrl({ filename, contentType, customerId }) {
   const resp = await fetch(`${API_BASE}/consultation/upload-url`, {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       filename,
       content_type: contentType,
       customer_id: customerId || null,
     }),
   })
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) {
-    const err = new Error(
-      (data && data.error) || `upload-url failed (HTTP ${resp.status})`,
-    )
-    err.status = resp.status
-    throw err
-  }
-  return data // { upload_url, audio_key }
+  await assertOk(resp, 'upload-url')
+  return resp.json() // { upload_url, audio_key }
 }
 
 // XHR (not fetch) so we can report upload progress. R2 requires the
 // Content-Type header to match what was signed byte-for-byte.
+// Note: this hits R2 directly (presigned URL), NOT our orchestrator — no
+// Clerk token attaches or should attach.
 export function putToR2(uploadUrl, blob, contentType, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
@@ -134,51 +173,33 @@ export function putToR2(uploadUrl, blob, contentType, onProgress) {
 export async function submitConsultationJob({ audioKey, customerId, source }) {
   const resp = await fetch(`${API_BASE}/consultation/submit`, {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       audio_key: audioKey,
       customer_id: customerId || null,
       source: source || '3day-app',
     }),
   })
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) {
-    const err = new Error(
-      (data && data.error) || `submit failed (HTTP ${resp.status})`,
-    )
-    err.status = resp.status
-    throw err
-  }
-  return data // { job_id, status }
+  await assertOk(resp, 'submit')
+  return resp.json() // { job_id, status }
 }
 
 export async function fetchJobStatus(jobId) {
   const resp = await fetch(
     `${API_BASE}/job-status/${encodeURIComponent(jobId)}`,
-    { headers: authHeaders() },
+    { headers: await authHeaders() },
   )
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) {
-    const err = new Error(
-      (data && data.error) || `job-status failed (HTTP ${resp.status})`,
-    )
-    err.status = resp.status
-    throw err
-  }
-  return data
+  await assertOk(resp, 'job-status')
+  return resp.json()
 }
 
 export async function fetchRecentJobs(limit = 20) {
   const resp = await fetch(
     `${API_BASE}/jobs/recent?limit=${encodeURIComponent(limit)}`,
-    { headers: authHeaders() },
+    { headers: await authHeaders() },
   )
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) {
-    throw new Error(
-      (data && data.error) || `recent jobs failed (HTTP ${resp.status})`,
-    )
-  }
+  await assertOk(resp, 'recent jobs')
+  const data = await resp.json()
   return data.jobs || []
 }
 
@@ -191,9 +212,14 @@ export async function fetchRecentJobs(limit = 20) {
 export async function submitConsultationSync({ transcript, customerId, source = '3day-app' }) {
   const resp = await fetch(`${API_BASE}/process-consultation`, {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ transcript, customer_id: customerId, source }),
   })
+  // Preserve the old caller contract: return { ok, status, data } rather
+  // than throwing on non-2xx (the Paste flow surfaces friendly errors).
+  // But still trigger sign-out on 401 so the app doesn't hang signed-in
+  // with a dead token.
+  if (resp.status === 401) await handleAuthFailure()
   const data = await resp.json().catch(() => ({}))
   return { ok: resp.ok, status: resp.status, data }
 }

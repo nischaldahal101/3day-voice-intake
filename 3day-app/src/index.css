@@ -132,6 +132,16 @@ a { color: var(--terracotta-dark); }
   background:
     radial-gradient(80% 50% at 50% -10%, var(--terracotta-tint), transparent 60%),
     var(--bg);
+  position: relative;
+}
+/* Clerk UserButton slot — top-right of the Home screen. Absolute so it
+   floats over the terracotta gradient without disturbing the hero layout
+   or the footer's space-between distribution. */
+.home-account {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 5;
 }
 .hero {
   padding: 96px 4px 0;
@@ -186,6 +196,71 @@ a { color: var(--terracotta-dark); }
   padding: 16px 20px calc(20px + var(--safe-bottom));
   background: linear-gradient(to top, var(--bg) 70%, rgba(250, 246, 242, 0));
   z-index: 4;
+}
+
+/* =========================================================================
+   Sign-in screen (Clerk gate) — mirrors the Home screen chrome so the
+   login step feels like part of the app, not a hand-off to a third-party.
+   ========================================================================= */
+.screen-signin {
+  justify-content: flex-start;
+  padding: 0 24px calc(32px + var(--safe-bottom));
+  background:
+    radial-gradient(80% 50% at 50% -10%, var(--terracotta-tint), transparent 60%),
+    var(--bg);
+}
+.signin-header {
+  padding: 72px 4px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.signin-eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--terracotta-dark);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.signin-eyebrow em {
+  font-family: var(--display);
+  font-style: italic;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.signin-title {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 40px;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+.signin-title em {
+  font-style: italic;
+  color: var(--terracotta-dark);
+  font-weight: 500;
+}
+.signin-sub {
+  margin: 4px 0 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.signin-card-slot {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  margin-top: 4px;
+}
+/* Clerk drops its own <div class="cl-rootBox"> in here. Constrain the width
+   so the sign-in card matches the app's other primary surfaces on both
+   phone and tablet widths. */
+.signin-card-slot > * {
+  width: 100%;
+  max-width: 420px;
 }
 .footer-hint {
   margin: 0;

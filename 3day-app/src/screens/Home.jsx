@@ -1,6 +1,21 @@
+import { UserButton } from '@clerk/clerk-react'
+
 export default function Home({ onStart, onRecent }) {
   return (
     <section className="screen screen-home">
+      {/* Clerk's UserButton — shows the signed-in user's avatar and opens a
+          menu with "Sign out". Anchored top-right so it's always reachable
+          without pushing hero copy around. */}
+      <div className="home-account">
+        <UserButton
+          afterSignOutUrl="/"
+          appearance={{
+            elements: {
+              userButtonAvatarBox: { width: '36px', height: '36px' },
+            },
+          }}
+        />
+      </div>
       <header className="hero">
         <span className="hero-eyebrow">3 Day Kitchen <em>&amp;</em> Bath</span>
         <h1 className="hero-title">
