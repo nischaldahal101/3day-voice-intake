@@ -19,3 +19,10 @@ dist/
 
 # Old JSON data (we use Postgres now)
 mock_data.json
+
+# Local-only AI agent setup and private business docs (repo is public)
+AGENTS.md
+CLAUDE.md
+.claude/
+.agents/
+docs/
