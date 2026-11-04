@@ -1,17 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { fetchCustomers } from '../lib/api.js'
-
-const DATE_FORMAT = { month: 'short', day: 'numeric', year: 'numeric' }
+import { formatCustomerDate } from '../lib/format.js'
 
 // "Added Nov 3, 2026" from the server's created_at; null if missing/bad.
-// A date-only value ("2026-11-03") is a calendar date: build it as a local
-// date so it never shifts a day. A full timestamp is shown in local time.
 function addedLabel(createdAt) {
-  if (typeof createdAt !== 'string' || !createdAt) return null
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(createdAt)
-  const d = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(createdAt)
-  if (Number.isNaN(d.getTime())) return null
-  return `Added ${d.toLocaleDateString(undefined, DATE_FORMAT)}`
+  const date = formatCustomerDate(createdAt)
+  return date ? `Added ${date}` : null
 }
 
 // Read-only picker. The list keeps the server's order (newest added first);
@@ -48,7 +42,7 @@ export default function CustomerPicker({ onBack, onSelect }) {
     const q = query.trim().toLowerCase()
     if (!q) return customers
     return customers.filter((c) => {
-      const hay = [c.display_name, c.first_name, c.last_name, c.phone, c.email]
+      const hay = [c.display_name, c.first_name, c.last_name, c.phone, c.email, c.address]
         .filter(Boolean)
         .join(' ')
         .toLowerCase()
@@ -71,7 +65,7 @@ export default function CustomerPicker({ onBack, onSelect }) {
         <input
           className="search-input"
           type="search"
-          placeholder="Search by name, phone, or email"
+          placeholder="Search by name, phone, email, or address"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           autoCapitalize="words"
@@ -125,6 +119,9 @@ export default function CustomerPicker({ onBack, onSelect }) {
                       {added ? <span className="dot">·</span> : null}
                       {added || ''}
                     </span>
+                    {c.address ? (
+                      <span className="customer-meta customer-address">{c.address}</span>
+                    ) : null}
                   </button>
                 </li>
               )

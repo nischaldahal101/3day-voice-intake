@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import CustomerProfileCard from './CustomerProfileCard.jsx'
 
 function pickMimeType() {
   if (typeof MediaRecorder === 'undefined') return ''
@@ -242,6 +243,8 @@ export default function Capture({ customer, onBack, onSubmit }) {
           <h2 className="topbar-title">{customerName}</h2>
         </div>
       </header>
+
+      <CustomerProfileCard customer={customer} />
 
       <div className="mode-tabs" role="tablist">
         <button

@@ -239,7 +239,8 @@ class TestShapes(Base):
         self.assertEqual(out[0]["phone"], "+15555550100")
         self.assertEqual(out[0]["created_at"], "2026-03-01T10:00:00Z")
         self.assertEqual(set(out[0]), {"id", "display_name", "first_name", "last_name",
-                                       "phone", "email", "created_at"})
+                                       "phone", "email", "company_name", "address",
+                                       "created_at"})
 
     def test_real_wrapper_dict_paginated_laravel_style(self):
         r1 = {"error": False, "response": {"data": [{"id": 1, "created_at": "2026-01-01 00:00:00"}],
@@ -1078,6 +1079,7 @@ class TestRound2Fields(Base):
         out = {c["id"]: c for c in list_customers()}
         self.assertEqual(out[1], {"id": 1, "display_name": None, "first_name": None,
                                   "last_name": None, "phone": "6185550100", "email": None,
+                                  "company_name": None, "address": None,
                                   "created_at": None})
         self.assertEqual(out[2]["display_name"], "Doe, Jane")
         self.assertEqual(out[2]["phone"], "+16185550101")
@@ -1316,3 +1318,53 @@ class TestRound3Allowlists(unittest.TestCase):
                 self.assertIn("<unlisted key>", text)
                 self.assertIn("display_name", text)
                 self.assertIn("created_at", text)
+
+
+class TestProfileFields(Base):
+    """Capture-screen profile card: one-line `address` + `company_name`."""
+
+    def one(self, **fields):
+        self.serve(FakeResp(real([{"id": 7, **fields}], total=1)))
+        return list_customers()[0]
+
+    def test_real_flat_address_full(self):
+        c = self.one(address_1="12 Main St", address_2="Apt 2", city="O'Fallon",
+                     state="IL", zip_code="62269", company_name="  Acme Remodel  ")
+        self.assertEqual(c["address"], "12 Main St, Apt 2, O'Fallon, IL 62269")
+        self.assertEqual(c["company_name"], "Acme Remodel")
+
+    def test_real_flat_address_partial(self):
+        self.assertEqual(self.one(city="O'Fallon", state="IL")["address"], "O'Fallon, IL")
+
+    def test_zip_only_and_zip_placeholder_not_duplicated(self):
+        self.assertEqual(self.one(zip_code=62269)["address"], "62269")
+        c = self.one(address_1="62269", city="O'Fallon", state="IL", zip_code="62269")
+        self.assertEqual(c["address"], "O'Fallon, IL 62269")
+
+    def test_mock_nested_address(self):
+        self.serve(FakeResp(mock_page([{
+            "id": "cust_001", "address": {"street": "412 Cambridge Court", "city": "O'Fallon",
+                                          "state": "IL", "postal_code": "62269"},
+        }], 1, 1)))
+        c = list_customers()[0]
+        self.assertEqual(c["address"], "412 Cambridge Court, O'Fallon, IL 62269")
+        self.assertIsNone(c["company_name"])
+
+    def test_flat_keys_win_over_nested_dict(self):
+        c = self.one(address={"street": "old"}, address_1="1 New Rd", city="Belleville")
+        self.assertEqual(c["address"], "1 New Rd, Belleville")
+
+    def test_plain_string_address(self):
+        self.assertEqual(self.one(address="  9 Elm St, Belleville IL ")["address"],
+                         "9 Elm St, Belleville IL")
+
+    def test_empty_and_garbage_become_null(self):
+        for fields in ({}, {"address": {}}, {"address": []}, {"address": ""},
+                       {"address_1": "  ", "address_2": None, "city": "", "state": None,
+                        "zip_code": ""},
+                       {"address_1": {"x": 1}, "city": ["a"], "state": True},
+                       {"company_name": ""}, {"company_name": {"x": 1}}):
+            with self.subTest(fields=fields):
+                c = self.one(**fields)
+                self.assertIsNone(c["address"])
+                self.assertIsNone(c["company_name"])

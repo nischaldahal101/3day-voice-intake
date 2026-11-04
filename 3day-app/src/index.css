@@ -392,6 +392,7 @@ a { color: var(--terracotta-dark); }
 }
 .customer-name { font-weight: 600; font-size: 16px; }
 .customer-meta { font-size: 13px; color: var(--text-muted); }
+.customer-address { overflow-wrap: anywhere; }
 .dot { margin: 0 6px; opacity: 0.6; }
 
 .state {
@@ -465,6 +466,83 @@ a { color: var(--terracotta-dark); }
   padding: 28px 24px 16px;
   display: flex;
   flex-direction: column;
+}
+
+/* Customer profile card. Narrow: compact card between the header and the
+   tabs. Wide (>= 1100px): the capture column stays exactly where it was
+   (centred, 480px) and the card sits in a column to its right, sticky. The
+   :has() gate means a browser without it just keeps the narrow layout. */
+.profile-card {
+  margin: 12px 20px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+.profile-card p { margin: 0; }
+.profile-name {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.profile-company { color: var(--text-secondary); overflow-wrap: anywhere; }
+.profile-rows {
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.profile-row {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+}
+.profile-row dt {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding-top: 1px;
+}
+.profile-row dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.profile-row a { color: var(--terracotta-dark); text-decoration: none; }
+.profile-row a:hover { text-decoration: underline; }
+.profile-card .profile-since { margin-top: 8px; color: var(--text-secondary); }
+.profile-id { font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+
+@media (min-width: 1100px) {
+  .app:has(> .screen-capture) { max-width: 1088px; }
+  .app:has(> .screen-capture) > .screen-capture {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 480px minmax(0, 1fr);
+    grid-template-rows: auto auto 1fr auto;
+    column-gap: 24px;
+  }
+  .app:has(> .screen-capture) > .screen-capture > * { grid-column: 2; }
+  .app:has(> .screen-capture) > .screen-capture > .profile-card {
+    grid-column: 3;
+    grid-row: 1 / -1;
+    align-self: start;
+    position: sticky;
+    top: 24px;
+    margin: 24px 0 0;
+    padding: 16px 18px;
+    font-size: 14px;
+    max-width: 300px;
+  }
+  .screen-capture > .profile-card .profile-name { font-size: 18px; }
 }
 
 /* Record zone */

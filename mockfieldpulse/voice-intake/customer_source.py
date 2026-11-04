@@ -1,7 +1,7 @@
 """Read-only customer list for the app's customer picker.
 
 One public function, `list_customers()`, returns every customer as a small
-dict (id, names, phone, email, created_at), sorted newest-added first, with
+dict (id, names, phone, email, company_name, address, created_at), sorted newest-added first, with
 customers that have no usable date at the end.
 
 Where it reads from:
@@ -37,8 +37,9 @@ Errors: messages are fixed, status-based text. Upstream bodies, the base URL
 and its credentials/query are never echoed (to the browser or to logs).
 Key names in shape errors come only from an allowlist (`safe_keys`).
 
-Field types: display_name / first_name / last_name / phone / email are
-normalised to str or None. Numbers become strings; booleans, objects and
+Field types: display_name / first_name / last_name / phone / email /
+company_name / address are normalised to str or None. `address` is one line
+built here from the real flat keys or the mock's nested dict (`_address`). Numbers become strings; booleans, objects and
 arrays become None (the record is kept, the bad field is dropped).
 
 Dates: created_at is "YYYY-MM-DDTHH:MM:SSZ" for instants, "YYYY-MM-DD" for
@@ -602,6 +603,36 @@ def _text(v):
     return None
 
 
+def _address(item):
+    """One display line, or None. Real FieldPulse sends flat address_1,
+    address_2, city, state, zip_code; the mock sends a nested
+    "address": {street, city, state, postal_code}. A plain-string "address"
+    is used as-is. Empty parts are skipped:
+    "12 Main St, Apt 2, O'Fallon, IL 62269"."""
+    flat = item
+    nested = item.get("address")
+    if isinstance(nested, str):
+        return _text(nested)
+    if isinstance(nested, dict) and not any(
+        _text(item.get(k)) for k in ("address_1", "address_2", "city", "state", "zip_code")
+    ):
+        flat = {
+            "address_1": nested.get("street") or nested.get("address_1"),
+            "address_2": nested.get("street_2") or nested.get("address_2"),
+            "city": nested.get("city"),
+            "state": nested.get("state"),
+            "zip_code": nested.get("postal_code") or nested.get("zip_code") or nested.get("zip"),
+        }
+    line1, line2, city, state, zip_code = (
+        _text(flat.get(k)) for k in ("address_1", "address_2", "city", "state", "zip_code")
+    )
+    # docs/FIELDPULSE_API.md §3: a ZIP with no street is stored in address_1 too.
+    if line1 and line1 == zip_code:
+        line1 = None
+    region = " ".join(p for p in (state, zip_code) if p) or None
+    return ", ".join(p for p in (line1, line2, city, region) if p) or None
+
+
 # --- Dates + sorting --------------------------------------------------------
 
 _DATE_ONLY_FORMATS = ("%Y-%m-%d", "%m/%d/%Y")
@@ -737,6 +768,8 @@ def _sorted_simplified(records):
                 "id": cid.strip() if isinstance(cid, str) else cid,
                 **{f: _text(c.get(f)) for f in _TEXT_FIELDS},
                 "phone": _text(c.get("phone")) or _text(c.get("phone_e164")),
+                "company_name": _text(c.get("company_name")),
+                "address": _address(c),
                 "created_at": _format_created(parsed),
             },
         ))

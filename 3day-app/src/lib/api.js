@@ -80,7 +80,9 @@ async function assertOk(resp, opName) {
 
 // -------------------- Customers --------------------
 
-const CUSTOMER_TEXT_FIELDS = ['display_name', 'first_name', 'last_name', 'phone', 'email', 'created_at']
+const CUSTOMER_TEXT_FIELDS = [
+  'display_name', 'first_name', 'last_name', 'phone', 'email', 'company_name', 'address', 'created_at',
+]
 
 // String or null, so a bad field from the server can never reach React as an
 // object child. Numbers become strings.
@@ -101,8 +103,9 @@ function normalizeCustomer(c) {
 
 // Read-only. Returns customers in the order the server sends them (newest
 // added first), each as {id, display_name, first_name, last_name, phone,
-// email, created_at} with every non-id field a string or null. Customers are
-// created in FieldPulse, never from this app.
+// email, company_name, address, created_at} with every non-id field a string
+// or null. company_name/address are display-only (not in customerIdentity).
+// Customers are created in FieldPulse, never from this app.
 export async function fetchCustomers() {
   const resp = await fetch(`${API_BASE}/app/customers`, {
     headers: await authHeaders(),
