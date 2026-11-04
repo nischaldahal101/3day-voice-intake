@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
+from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -58,12 +61,32 @@ DATABASE_URL = os.environ.get(
 # Separate pool from the mock's (different process, different connections).
 # Same database for dev; in production this can point at the orchestrator's
 # own Postgres add-on.
+#
+# Hardening (review-log F-26): a request must never wait forever on the DB.
+#   - check: each connection is pinged when handed out, so a dead one (DB
+#     restart, dropped TCP) is replaced instead of failing/hanging a request.
+#   - max_idle / max_lifetime: recycle connections well before Render/the
+#     network drops them silently.
+#   - timeout: getconn waits 10s, not 30s, so a stall surfaces quickly.
+#   - server-side timeouts on every connection: no statement may run > 20s,
+#     wait for a lock > 5s, or sit idle inside a transaction > 60s. Every
+#     jobs.py transaction is a few short statements with no I/O between them
+#     (the worker never holds a transaction across Claude / Deepgram /
+#     FieldPulse HTTP calls), so these limits only ever cut off a stall.
+_SERVER_OPTIONS = (
+    "-c statement_timeout=20000 -c lock_timeout=5000 "
+    "-c idle_in_transaction_session_timeout=60000"
+)
 pool = ConnectionPool(
     DATABASE_URL,
     min_size=1,
     max_size=5,
     open=False,
-    kwargs={"row_factory": dict_row},
+    timeout=10.0,
+    max_idle=300.0,
+    max_lifetime=1800.0,
+    check=ConnectionPool.check_connection,
+    kwargs={"row_factory": dict_row, "options": _SERVER_OPTIONS},
 )
 
 _SCHEMA_SQL = """
@@ -128,22 +151,127 @@ CREATE TABLE IF NOT EXISTS fieldpulse_writes (
 # migrating (review-log F-22).
 _SCHEMA_LOCK_KEY = 0x3D_4B_10B5  # arbitrary constant, only used here
 
+# What _SCHEMA_SQL creates, derived from the SQL itself so the two can't drift:
+# relations (tables + indexes) and (table, column) pairs. A statement of any
+# other shape makes _schema_objects return None, which means "always run the
+# DDL" (safe, just slower); test_jobs_bootstrap fails if that ever happens.
+_DDL_PATTERNS = (
+    ("relation", re.compile(r"^CREATE TABLE IF NOT EXISTS (\w+)\s*\(", re.I | re.S)),
+    ("relation", re.compile(r"^CREATE INDEX IF NOT EXISTS (\w+)\s+ON\b", re.I | re.S)),
+    ("column", re.compile(r"^ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+)\b", re.I | re.S)),
+)
+
+
+def _schema_objects(sql: str = None):
+    """(relations, columns) that `sql` (default _SCHEMA_SQL) creates, or None
+    if any statement isn't one of the recognised idempotent forms."""
+    sql = _SCHEMA_SQL if sql is None else sql
+    body = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+    relations, columns = [], []
+    for stmt in (s.strip() for s in body.split(";")):
+        if not stmt:
+            continue
+        for kind, pattern in _DDL_PATTERNS:
+            m = pattern.match(stmt)
+            if m:
+                if kind == "relation":
+                    relations.append(m.group(1).lower())
+                else:
+                    columns.append((m.group(1).lower(), m.group(2).lower()))
+                break
+        else:
+            return None
+    return relations, columns
+
+
+# Catalog-only check: to_regclass resolves a name through search_path (same as
+# the unqualified DDL) WITHOUT locking the relation, and pg_attribute is a
+# plain catalog read, so this never queues behind (or in front of) a lock on
+# consultation_jobs.
+_MISSING_SQL = """
+SELECT
+  (SELECT count(*) FROM unnest(%(rels)s::text[]) AS r(name)
+    WHERE to_regclass(r.name) IS NULL)
+  +
+  (SELECT count(*) FROM unnest(%(tbls)s::text[], %(cols)s::text[]) AS c(tbl, col)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_attribute a
+       WHERE a.attrelid = to_regclass(c.tbl) AND a.attname = c.col
+         AND a.attnum > 0 AND NOT a.attisdropped))
+  AS missing
+"""
+
+_DDL_ATTEMPTS = 3
+_DDL_BACKOFF_S = (1.0, 3.0)   # sleep after attempt 1, after attempt 2
+
+
+def _schema_missing(conn) -> bool:
+    """True if any table/index/column _SCHEMA_SQL creates is absent (or the
+    SQL can't be checked). Catalog reads only; commits its own read."""
+    objects = _schema_objects()
+    if objects is None:
+        return True
+    relations, columns = objects
+    with conn.cursor() as cur:
+        cur.execute(_MISSING_SQL, {
+            "rels": relations,
+            "tbls": [t for t, _ in columns],
+            "cols": [c for _, c in columns],
+        })
+        row = cur.fetchone()
+    conn.commit()
+    missing = row["missing"] if isinstance(row, dict) else row[0]
+    return bool(missing)
+
+
+def _apply_schema(conn) -> None:
+    """Run _SCHEMA_SQL in one transaction under the F-22 advisory lock. The
+    advisory lock is the transaction's FIRST statement, in its own execute,
+    so a process that waits for it runs the DDL only after the other process
+    has committed (released automatically on commit/rollback). lock_timeout
+    bounds every lock wait (the advisory lock and ALTER TABLE's
+    AccessExclusiveLock), so the DDL can't sit queued in front of every
+    other query on the table: it fails with LockNotAvailable instead."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", [_SCHEMA_LOCK_KEY])
+        cur.execute("SET LOCAL lock_timeout = '5s'")
+        cur.execute("SET LOCAL statement_timeout = '20s'")
+        cur.execute(_SCHEMA_SQL)
+    conn.commit()
+
 
 def _bootstrap():
-    """Open the pool and ensure the schema exists. Runs once on import so
-    the orchestrator, the RQ worker, and the test script all see the
-    table immediately. The advisory lock is the transaction's FIRST
-    statement, in its own execute, so a process that waits for it runs the
-    DDL only after the other process has committed. It is released
-    automatically on commit/rollback."""
+    """Open the pool and ensure the schema exists. Runs once on import (the
+    orchestrator, every RQ work-horse, tests). The usual case, schema already
+    there, is one catalog query and NO DDL, so no table lock is ever taken
+    (review-log F-26: an ALTER TABLE queued for AccessExclusiveLock on every
+    worker boot stalled every orchestrator query behind it). When DDL is
+    needed it runs with bounded lock waits, is retried a few times, and then
+    raises: boot fails loudly rather than freezing other processes."""
     pool.open()
     pool.wait()
     try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT pg_advisory_xact_lock(%s)", [_SCHEMA_LOCK_KEY])
-                cur.execute(_SCHEMA_SQL)
-            conn.commit()
+        for attempt in range(1, _DDL_ATTEMPTS + 1):
+            try:
+                with pool.connection() as conn:
+                    if not _schema_missing(conn):
+                        if attempt > 1:
+                            logger.info("Schema present (created by another process)")
+                        return
+                    logger.info("Schema incomplete: applying DDL (attempt %d)", attempt)
+                    _apply_schema(conn)
+                    logger.info("Schema DDL applied")
+                    return
+            except (psycopg_errors.LockNotAvailable, psycopg_errors.QueryCanceled,
+                    psycopg_errors.DeadlockDetected) as exc:
+                if attempt == _DDL_ATTEMPTS:
+                    logger.error("Schema bootstrap gave up after %d attempts: %s",
+                                 attempt, exc)
+                    raise
+                delay = _DDL_BACKOFF_S[min(attempt, len(_DDL_BACKOFF_S)) - 1]
+                logger.warning("Schema bootstrap attempt %d blocked (%s: %s); retrying in %.0fs",
+                               attempt, type(exc).__name__, str(exc).strip(), delay)
+                time.sleep(delay)
     except Exception:
         pool.close()
         raise
