@@ -27,3 +27,10 @@ export function getActiveJob() {
 export function clearActiveJob() {
   try { localStorage.removeItem(KEY) } catch (_) { /* ignore */ }
 }
+
+// Forget `jobId` if it is the stored in-flight job (e.g. it was deleted in
+// the admin panel), so a reload doesn't try to resume a job that is gone.
+export function forgetJob(jobId) {
+  const active = getActiveJob()
+  if (active && jobId && active.job_id === jobId) clearActiveJob()
+}

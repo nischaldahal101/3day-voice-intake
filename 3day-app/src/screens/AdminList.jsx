@@ -48,6 +48,13 @@ export default function AdminList({ onBack, onOpen, initial }) {
   const counts = (data && data.counts && typeof data.counts === 'object') ? data.counts : {}
   const open = (id) => onOpen(id, { q, fp, offset })
 
+  // The restored page can be past the end (e.g. its last row was just
+  // deleted): step back instead of showing an empty page.
+  const pastEnd = !!items && items.length === 0 && offset > 0
+  useEffect(() => {
+    if (pastEnd) setOffset((o) => Math.max(0, o - PAGE))
+  }, [pastEnd])
+
   return (
     <section className="screen screen-admin">
       <header className="topbar">

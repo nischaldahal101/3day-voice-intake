@@ -102,7 +102,9 @@ CORS(
     app,
     origins="*",
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"],
+    # DELETE: admin "Delete consultation" (our DB only). Methods only; the
+    # origins lockdown above is still a separate, flagged production step.
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
 )
 
 
@@ -777,7 +779,8 @@ def app_customers():
 # --- Admin panel (stage 3) ---------------------------------------------------
 #
 # Thin routes over admin_panel.py; protected by _require_clerk_session like
-# everything else. Reads only our Postgres; the send action only enqueues.
+# everything else. Reads only our Postgres; the send action only enqueues;
+# delete removes the consultation from OUR Postgres (+ R2 audio), never FieldPulse.
 
 @app.get("/admin/consultations")
 def admin_consultations():
@@ -810,6 +813,14 @@ def admin_consultation_send(job_id):
     return jsonify(out), code
 
 
+@app.delete("/admin/consultations/<job_id>")
+def admin_consultation_delete(job_id):
+    from flask import g
+    code, out = admin_panel.delete_consultation(
+        job_id, user_id=getattr(g, "clerk_user_id", None))
+    return jsonify(out), code
+
+
 # --- Startup ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -829,7 +840,7 @@ if __name__ == "__main__":
     print(f"    GET  /job-status/<job_id>       (Clerk-protected — poll)")
     print(f"    GET  /jobs/recent               (Clerk-protected — history)")
     print(f"    GET  /app/customers             (Clerk-protected — picker list)")
-    print(f"    GET  /admin/consultations[/<id>[/audio-url]], POST .../<id>/send  (Clerk-protected — admin)")
+    print(f"    GET  /admin/consultations[/<id>[/audio-url]], POST .../<id>/send, DELETE .../<id>  (Clerk-protected — admin)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
     print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
     print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")

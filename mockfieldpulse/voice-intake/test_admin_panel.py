@@ -26,9 +26,10 @@ from test_fieldpulse_sync import (  # noqa: E402
 import fieldpulse_sync as fs  # noqa: E402
 
 for _mod, _attrs in (("jobs", ("list_jobs_for_admin", "list_fieldpulse_writes",
-                               "save_manual_send", "release_held_fieldpulse_writes")),
+                               "save_manual_send", "release_held_fieldpulse_writes",
+                               "delete_job")),
                      ("queue_setup", ("enqueue_manual_send",)),
-                     ("storage", ("generate_download_url",))):
+                     ("storage", ("generate_download_url", "delete_audio"))):
     for _a in _attrs:
         if not hasattr(sys.modules[_mod], _a):
             setattr(sys.modules[_mod], _a, lambda *a, **k: None)
@@ -290,11 +291,13 @@ class TestRoutes(unittest.TestCase):
                              {None: [self.orch._require_clerk_session]}), \
                 mock.patch.object(ap.jobs, "get_job", side_effect=AssertionError("no auth")), \
                 mock.patch.object(ap.jobs, "list_jobs_for_admin",
-                                  side_effect=AssertionError("no auth")):
+                                  side_effect=AssertionError("no auth")), \
+                mock.patch.object(ap.jobs, "delete_job", side_effect=AssertionError("no auth")):
             for method, path in (("get", "/admin/consultations"),
                                  ("get", "/admin/consultations/job_1"),
                                  ("get", "/admin/consultations/job_1/audio-url"),
-                                 ("post", "/admin/consultations/job_1/send")):
+                                 ("post", "/admin/consultations/job_1/send"),
+                                 ("delete", "/admin/consultations/job_1")):
                 for headers in ({}, {"Authorization": "Bearer not-a-real-token"}):
                     with self.subTest(path=path, headers=bool(headers)):
                         r = getattr(self.client, method)(path, headers=headers)
@@ -337,6 +340,33 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(queued, [("job_abc", rid)])
         self.assertEqual(saved[0]["status"], "queued")
         self.assertEqual(len(saved[0]["requested_by"]), 120)
+
+    def test_delete_route_and_cors_preflight(self):
+        db = FakeJobsDB([done_job(id="job_abc")])
+        with self.unauthed(), db.patched(), \
+                mock.patch.object(ap.storage, "delete_audio") as rm, \
+                mock.patch("requests.request", side_effect=AssertionError("no HTTP")), \
+                mock.patch("requests.post", side_effect=AssertionError("no HTTP")):
+            r = self.client.delete("/admin/consultations/job_abc")
+            self.assertEqual(r.status_code, 200, r.get_json())
+            self.assertEqual(r.get_json()["audio"], "deleted")
+            rm.assert_called_once_with("consultations/abc-123.webm")
+            self.assertEqual(self.client.delete("/admin/consultations/job_abc").status_code, 404)
+        db = FakeJobsDB([done_job(id="job_q", status="processing")])
+        with self.unauthed(), db.patched():
+            self.assertEqual(self.client.delete("/admin/consultations/job_q").status_code, 409)
+        # Preflight: no auth header, must allow DELETE + Authorization (Clerk before_request on).
+        app = self.orch.app
+        with mock.patch.dict(app.before_request_funcs,
+                             {None: [self.orch._require_clerk_session]}):
+            r = self.client.open("/admin/consultations/job_abc", method="OPTIONS", headers={
+                "Origin": "https://app.example.com",
+                "Access-Control-Request-Method": "DELETE",
+                "Access-Control-Request-Headers": "authorization"})
+        self.assertIn(r.status_code, (200, 204))
+        self.assertIn("DELETE", r.headers.get("Access-Control-Allow-Methods", ""))
+        self.assertIn("authorization", r.headers.get("Access-Control-Allow-Headers", "").lower())
+        self.assertTrue(r.headers.get("Access-Control-Allow-Origin"))
 
     def test_audio_route(self):
         with self.unauthed(), \
@@ -400,6 +430,103 @@ class TestRequestManualSend(unittest.TestCase):
         self.assertEqual(code, 503)
         self.assertEqual([e["status"] for e in self.saved], ["queued", "error"])
         self.assertEqual(self.saved[0]["id"], self.saved[1]["id"])
+
+
+# --- Delete (our DB only; never FieldPulse) ------------------------------------------------
+
+class FakeJobsDB:
+    """jobs.delete_job semantics in memory: guard runs on the row, refusal leaves it."""
+
+    def __init__(self, rows, writes=None):
+        self.rows = {r["id"]: r for r in rows}
+        self.writes = dict(writes or {})
+
+    def delete_job(self, job_id, guard=None):
+        job = self.rows.get(job_id)
+        if job is None:
+            return None
+        reason = guard(job) if guard else None
+        if reason:
+            return {"deleted": False, "reason": reason, "job": job}
+        del self.rows[job_id]
+        return {"deleted": True, "job": job, "writes_deleted": len(self.writes.pop(job_id, []))}
+
+    def patched(self):
+        return mock.patch.object(ap.jobs, "delete_job", side_effect=self.delete_job)
+
+
+class TestDelete(unittest.TestCase):
+    def call(self, rows, job_id="job_abc", writes=None, delete_audio=None):
+        self.db = FakeJobsDB(rows, writes)
+        with self.db.patched(), \
+                mock.patch.object(ap.storage, "delete_audio",
+                                  side_effect=delete_audio) as self.rm, \
+                mock.patch.object(fs, "sync_consultation", side_effect=AssertionError("no sync")), \
+                mock.patch.object(ap.queue_setup, "enqueue_manual_send",
+                                  side_effect=AssertionError("no queue")), \
+                mock.patch("requests.request", side_effect=AssertionError("no FieldPulse")), \
+                mock.patch("requests.post", side_effect=AssertionError("no FieldPulse")), \
+                mock.patch("requests.get", side_effect=AssertionError("no FieldPulse")):
+            return ap.delete_consultation(job_id, "user_1")
+
+    def test_done_job_with_audio_and_writes(self):
+        code, body = self.call([done_job()], writes={"job_abc": ["comment", "return_task"]})
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"deleted": True, "id": "job_abc", "audio": "deleted",
+                                "fieldpulse_writes_deleted": 2})
+        self.rm.assert_called_once_with("consultations/abc-123.webm")
+        self.assertEqual(self.db.rows, {})
+        self.assertNotIn("audio_key", json.dumps(body))
+
+    def test_failed_paste_job_has_no_audio(self):
+        code, body = self.call([job(status="failed", audio_key=None, transcript="x" * 40,
+                                    result=None, error="extract failed")])
+        self.assertEqual((code, body["audio"]), (200, "none"))
+        self.rm.assert_not_called()
+
+    def test_missing_is_404(self):
+        self.assertEqual(self.call([], job_id="nope")[0], 404)
+        self.rm.assert_not_called()
+
+    def test_queued_and_processing_are_refused(self):
+        for status in ("queued", "processing"):
+            with self.subTest(status=status):
+                code, body = self.call([done_job(status=status)])
+                self.assertEqual(code, 409)
+                self.assertIn("still being processed", body["error"])
+                self.assertIn("job_abc", self.db.rows)
+                self.rm.assert_not_called()
+
+    def test_in_flight_manual_send_is_refused_until_stale(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        for when, status, expect in ((now, "queued", 409),
+                                     (now - timedelta(minutes=14), "queued", 409),
+                                     (now - timedelta(minutes=16), "queued", 200),
+                                     (now, "finished", 200), (now, "error", 200)):
+            with self.subTest(age=str(now - when), status=status):
+                j = done_job()
+                j["result"]["fieldpulse_manual_sends"] = [
+                    {"id": "ms_1", "status": "finished", "requested_at": now.isoformat()},
+                    {"id": "ms_2", "status": status, "requested_at": when.isoformat()}]
+                code, body = self.call([j])
+                self.assertEqual(code, expect, body)
+                self.assertEqual("job_abc" in self.db.rows, expect == 409)
+
+    def test_garbage_result_does_not_block(self):
+        for result in ("junk", {"fieldpulse_manual_sends": "junk"},
+                       {"fieldpulse_manual_sends": [None, 3, {"status": "queued",
+                                                              "requested_at": "not a date"}]}):
+            with self.subTest(result=result):
+                self.assertEqual(self.call([done_job(result=result)])[0], 200)
+
+    def test_r2_failure_still_deletes(self):
+        code, body = self.call([done_job()],
+                               delete_audio=ap.storage.StorageError("R2 is down"))
+        self.assertEqual((code, body["audio"]), (200, "failed"))
+        self.assertEqual(self.db.rows, {})
+        code, body = self.call([done_job()], delete_audio=TimeoutError("slow"))
+        self.assertEqual((code, body["audio"]), (200, "failed"))
 
 
 # --- Manual send through fieldpulse_sync (mode gating, release, idempotency) --------------
@@ -558,6 +685,19 @@ class TestWorkerManualSend(unittest.TestCase):
         self.saved.clear()
         self.run_it(None)
         self.assertEqual(self.saved, [])
+
+    def test_job_deleted_during_send_exits_cleanly(self):
+        # F-28: save_manual_send finds no row (deleted mid-send): no crash, no error entry.
+        calls = []
+        with mock.patch.object(self.w, "get_job", return_value=done_job()), \
+                mock.patch.object(self.w, "save_manual_send",
+                                  side_effect=lambda jid, e, sync=None: calls.append(e) and False), \
+                mock.patch.object(self.w, "sync_consultation",
+                                  return_value={"status": "failed", "mode": "live"}), \
+                mock.patch.object(self.w.logger, "exception",
+                                  side_effect=AssertionError("must not log a crash")):
+            self.w.send_consultation_to_fieldpulse("job_abc", "ms_1")
+        self.assertEqual([e["status"] for e in calls], ["finished"])
 
 
 # --- storage.generate_download_url (real module, local signing only) ----------------------

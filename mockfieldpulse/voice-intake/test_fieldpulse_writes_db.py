@@ -256,6 +256,153 @@ class TestWritesDB(unittest.TestCase):
         order = [r["created_at"] for r in J.list_jobs_for_admin(5000)]
         self.assertEqual(order, sorted(order, reverse=True))
 
+    def test_delete_job_is_one_transaction_and_guarded(self):
+        J = self.jobs
+        keep = self.new_job()["id"]
+        jid = self.new_job()["id"]
+        J.update_job_status(jid, "done", result={"extraction": {}})
+        for step in ("comment", "return_task"):
+            J.record_fieldpulse_write(jid, step, "planned", "dry_run", request={"m": step})
+            J.record_fieldpulse_write(keep, step, "planned", "dry_run", request={"m": step})
+        J.save_customer_link("fieldpulse", "18809123", "mock_1")
+        seen = []
+        out = J.delete_job(jid, guard=lambda job: seen.append(job["status"]) or "busy")
+        self.assertEqual((out["deleted"], out["reason"], seen), (False, "busy", ["done"]))
+        self.assertIsNotNone(J.get_job(jid))
+        self.assertEqual(len(J.list_fieldpulse_writes(jid)), 2)
+        out = J.delete_job(jid, guard=lambda job: None)
+        self.assertEqual((out["deleted"], out["writes_deleted"], out["job"]["id"]), (True, 2, jid))
+        self.assertIsNone(J.get_job(jid))
+        self.assertEqual(J.list_fieldpulse_writes(jid), [])
+        self.assertIsNone(J.delete_job(jid))
+        self.assertFalse(J.save_manual_send(jid, {"id": "ms_x", "status": "queued"}))
+        with self.assertRaises(J.JobError):
+            J.update_job_status(jid, "done")
+        # Other jobs, their writes, and the per-customer link are untouched.
+        self.assertIsNotNone(J.get_job(keep))
+        self.assertEqual(len(J.list_fieldpulse_writes(keep)), 2)
+        self.assertEqual(J.get_customer_link("fieldpulse", "18809123"), "mock_1")
+        # A crashing guard rolls back: nothing deleted.
+        def boom(job):
+            raise RuntimeError("guard crashed")
+        with self.assertRaises(RuntimeError):
+            J.delete_job(keep, guard=boom)
+        self.assertIsNotNone(J.get_job(keep))
+        self.assertEqual(len(J.list_fieldpulse_writes(keep)), 2)
+
+    def test_delete_waits_for_a_row_lock_holder(self):
+        J = self.jobs
+        jid = self.new_job()["id"]
+        J.update_job_status(jid, "done", result={})
+        holding, release, done = threading.Event(), threading.Event(), []
+
+        def hold():
+            with J.pool.connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM consultation_jobs WHERE id = %s FOR UPDATE", [jid])
+                holding.set()
+                release.wait(5)
+                cur.execute("UPDATE consultation_jobs SET status = 'processing' WHERE id = %s",
+                            [jid])
+            done.append(True)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        holding.wait(5)
+        threading.Timer(0.5, release.set).start()
+        out = J.delete_job(jid, guard=lambda job: "busy" if job["status"] == "processing" else None)
+        t.join(5)
+        # The guard saw the committed 'processing' status, not the stale 'done'.
+        self.assertEqual((out["deleted"], out.get("reason")), (False, "busy"))
+        self.assertIsNotNone(J.get_job(jid))
+
+    # --- F-28: claim and delete are coordinated through the job row ---------
+
+    def _live(self):
+        return mock.patch.dict(os.environ, {
+            "FIELDPULSE_WRITE_MODE": "live", "FIELDPULSE_WRITE_BASE_URL": "https://fp.invalid",
+            "FIELDPULSE_WRITE_API_KEY": "k"})
+
+    def test_claim_then_delete_is_refused_until_finished(self):
+        J = self.jobs
+        jid = self.new_job()["id"]
+        J.update_job_status(jid, "done", result={})
+        J.record_fieldpulse_write(jid, "comment", "planned", "live", request={"m": 1})
+        self.assertTrue(J.claim_fieldpulse_write(jid, "comment", 3))     # worker is mid-send
+        out = J.delete_job(jid, guard=lambda job: None)
+        self.assertFalse(out["deleted"])
+        self.assertIn("in progress", out["reason"])
+        self.assertIn("comment", out["reason"])
+        self.assertEqual(len(J.list_fieldpulse_writes(jid)), 1)
+        # Finished as "sent, no answer" (always has an error): no longer blocks.
+        J.finish_fieldpulse_write(jid, "comment", "sent", error="no response")
+        self.assertTrue(J.delete_job(jid, guard=lambda job: None)["deleted"])
+
+    def test_delete_then_claim_never_sends(self):
+        J, fs = self.jobs, self.fs
+        j = J.get_job(self.new_job()["id"])
+        J.update_job_status(j["id"], "done", result={})
+        J.record_fieldpulse_write(j["id"], "comment", "planned", "live", request={"m": 1})
+        self.assertTrue(J.delete_job(j["id"])["deleted"])
+        self.assertFalse(J.claim_fieldpulse_write(j["id"], "comment", 3))
+        J.record_fieldpulse_write(j["id"], "comment", "planned", "live", request={"m": 1})  # no-op
+        self.assertEqual(J.list_fieldpulse_writes(j["id"]), [])
+        # The worker still holds the old job dict (delayed manual send): nothing goes out.
+        ex = {"project_type": "bath", "notes_summary": "Bath refresh.",
+              "return_appointment": {"scheduled": False}}
+        with self._live(), mock.patch.object(fs, "_send", side_effect=AssertionError("sent!")):
+            fs.sync_consultation(j, ex, manual=True)
+            fs.sync_consultation(j, ex)
+        self.assertEqual(J.list_fieldpulse_writes(j["id"]), [])
+
+    def test_claim_waits_for_a_running_delete_then_fails(self):
+        J = self.jobs
+        jid = self.new_job()["id"]
+        J.update_job_status(jid, "done", result={})
+        J.record_fieldpulse_write(jid, "comment", "planned", "live", request={"m": 1})
+        in_delete, claimed = threading.Event(), []
+
+        def slow_guard(job):          # runs while delete_job holds FOR UPDATE
+            in_delete.set()
+            threading.Event().wait(0.7)
+            return None
+
+        def claim():
+            in_delete.wait(5)
+            claimed.append(J.claim_fieldpulse_write(jid, "comment", 3))
+
+        t = threading.Thread(target=claim)
+        t.start()
+        out = J.delete_job(jid, guard=slow_guard)
+        t.join(5)
+        self.assertTrue(out["deleted"])
+        self.assertEqual(claimed, [False])
+
+    def test_delete_waits_for_a_running_claim_then_refuses(self):
+        J = self.jobs
+        jid = self.new_job()["id"]
+        J.update_job_status(jid, "done", result={})
+        J.record_fieldpulse_write(jid, "comment", "planned", "live", request={"m": 1})
+        holding, results = threading.Event(), []
+
+        def claim_slowly():           # the claim's own lock + UPDATE, committed late
+            with J.pool.connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM consultation_jobs WHERE id = %s FOR KEY SHARE", [jid])
+                cur.execute("UPDATE fieldpulse_writes SET status = 'sent', error = NULL, "
+                            "attempts = attempts + 1 WHERE job_id = %s", [jid])
+                holding.set()
+                threading.Event().wait(0.7)
+            results.append("claimed")
+
+        t = threading.Thread(target=claim_slowly)
+        t.start()
+        holding.wait(5)
+        out = J.delete_job(jid, guard=lambda job: None)
+        t.join(5)
+        self.assertEqual(results, ["claimed"])
+        self.assertFalse(out["deleted"])
+        self.assertIn("in progress", out["reason"])
+        self.assertIsNotNone(J.get_job(jid))
+
     def test_manual_send_end_to_end_releases_and_is_idempotent(self):
         J, fs = self.jobs, self.fs
         j = J.get_job(self.new_job()["id"])

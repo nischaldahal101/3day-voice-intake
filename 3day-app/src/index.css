@@ -1406,6 +1406,15 @@ pre.admin-pre { margin: 0; font-size: 12px; }
 }
 .admin-msg { margin: 0 0 6px; font-size: 14px; }
 .admin-send { margin: 10px 0 4px; }
+/* Admin delete: outlined in red so it never reads as the primary action. */
+.btn-danger {
+  background: var(--surface);
+  color: var(--danger);
+  border: 1px solid var(--danger);
+}
+.btn-danger:active:not(:disabled) { background: var(--danger-bg); }
+.btn-danger:disabled { opacity: 0.45; cursor: not-allowed; }
+.admin-delete { border-color: var(--danger-bg); }
 .admin-step {
   margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
 }

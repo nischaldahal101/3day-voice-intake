@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
@@ -54,6 +55,16 @@ _client = boto3.client(
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
     region_name="auto",
+)
+# Same credentials, bounded: for calls made inside an HTTP request handler.
+_quick_client = boto3.client(
+    "s3",
+    endpoint_url=R2_ENDPOINT_URL,
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name="auto",
+    config=Config(connect_timeout=3, read_timeout=5,
+                  retries={"max_attempts": 1, "mode": "standard"}),  # 1 retry = 2 tries
 )
 
 
@@ -130,11 +141,13 @@ def download_audio(key: str, local_path: str) -> str:
 
 def delete_audio(key: str) -> None:
     """Delete an R2 object. S3/R2 returns success even if the key didn't
-    exist, so this function is effectively idempotent."""
+    exist, so this function is effectively idempotent. Called from an HTTP
+    request (admin delete), so it uses a client with short timeouts and one
+    retry: an R2 outage fails it in seconds instead of hanging the request."""
     _ensure_configured()
     logger.info("Deleting r2://%s/%s", R2_BUCKET_NAME, key)
     try:
-        _client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+        _quick_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
     except (ClientError, BotoCoreError) as exc:
         logger.error("R2 delete failed: %s", exc)
         raise StorageError(

@@ -1,7 +1,8 @@
 """Admin panel data for Nick and Mike (stage 3): every consultation, in full,
 from OUR Postgres only (consultation_jobs + fieldpulse_writes). Never reads
-the mock or FieldPulse, and never talks to FieldPulse: the one action
-("Send to FieldPulse" / "Retry") only queues a worker job.
+the mock or FieldPulse, and never talks to FieldPulse: "Send to FieldPulse" /
+"Retry" only queues a worker job, and "Delete" removes the consultation from
+OUR database (+ its R2 audio) only; whatever is in FieldPulse stays there.
 
 Four entry points, each returning (http_status, json_body) so the routes in
 orchestrator.py stay one-liners:
@@ -10,6 +11,7 @@ orchestrator.py stay one-liners:
     consultation_detail(job_id)
     request_manual_send(job_id, user_id, user_name)
     audio_url(job_id)
+    delete_consultation(job_id, user_id)
 
 Hidden in here: the FieldPulse status of a consultation (one label per row,
 computed from the write rows + the stored sync summary, legacy mock jobs
@@ -347,3 +349,52 @@ def audio_url(job_id):
         logger.error("[%s] audio url failed: %s", job_id, exc)
         return 502, {"error": "Could not create an audio link right now."}
     return 200, {"url": url, "expires_in": 900}
+
+
+# A queued manual send younger than this blocks delete: the worker may be
+# about to run (or running) sync_consultation for it. Longer than the dedupe
+# window + the RQ job timeout (300s). An older 'queued' entry means the queue
+# lost it (or it ran late); a late run on a deleted job finds no row and stops.
+_SEND_IN_FLIGHT = timedelta(minutes=15)
+
+
+def _delete_refusal(job, now=None):
+    """Why this job can't be deleted right now, or None. Runs under the row lock."""
+    if job.get("status") in ("queued", "processing"):
+        return ("This consultation is still being processed. Wait until it is done or "
+                "failed, then delete it.")
+    now = now or datetime.now(timezone.utc)
+    sends = _dict(job.get("result")).get("fieldpulse_manual_sends")
+    for s in (sends if isinstance(sends, list) else []):
+        if not isinstance(s, dict) or s.get("status") != "queued":
+            continue
+        when = _parse_iso(s.get("requested_at"))
+        if when and now - when < _SEND_IN_FLIGHT:
+            return ("A FieldPulse send for this consultation is queued or running. Wait "
+                    "for it to finish, then delete it.")
+    return None
+
+
+def delete_consultation(job_id, user_id=None):
+    """Hard-delete a consultation from OUR database (job row + its FieldPulse
+    write records, one transaction), then best-effort delete its R2 audio.
+    Never talks to FieldPulse: anything already sent there stays."""
+    out = jobs.delete_job(job_id, guard=_delete_refusal)
+    if out is None:
+        return 404, {"error": f"Consultation not found: {job_id}"}
+    if not out["deleted"]:
+        return 409, {"error": out["reason"]}
+    key = out["job"].get("audio_key")
+    audio = "none"
+    if key:
+        try:
+            storage.delete_audio(key)
+            audio = "deleted"
+        except Exception as exc:  # noqa: BLE001 — the DB delete already succeeded
+            audio = "failed"
+            logger.error("[%s] deleted, but its audio %s was not removed from R2: %s",
+                         job_id, key, exc)
+    logger.info("[%s] consultation deleted by %s (%d FieldPulse write rows, audio %s)",
+                job_id, _text(user_id, 64) or "?", out["writes_deleted"], audio)
+    return 200, {"deleted": True, "id": job_id, "audio": audio,
+                 "fieldpulse_writes_deleted": out["writes_deleted"]}

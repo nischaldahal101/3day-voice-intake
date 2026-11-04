@@ -535,6 +535,15 @@ def record_fieldpulse_write(
     Never touches a step that is already 'succeeded' or 'sent'."""
     if status not in ("planned", "skipped"):
         raise JobError(f"record_fieldpulse_write: bad status {status!r}")
+    try:
+        _record_write(job_id, step, status, mode, request, error)
+    except psycopg_errors.ForeignKeyViolation:
+        # The job was deleted (admin panel) mid-sync: nothing to record; the
+        # following claim fails too, so nothing is sent (F-28).
+        logger.info("Write %s/%s not recorded: job no longer exists", job_id, step)
+
+
+def _record_write(job_id, step, status, mode, request, error):
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -559,9 +568,21 @@ def record_fieldpulse_write(
 def claim_fieldpulse_write(job_id: str, step: str, max_attempts: int) -> bool:
     """Atomically move a planned/failed step to 'sent' (attempts + 1) right
     before the HTTP call. False if it isn't claimable (already sent/succeeded,
-    skipped, out of attempts, or claimed by a concurrent worker)."""
+    skipped, out of attempts, claimed by a concurrent worker, or the job was
+    deleted).
+
+    Serializes with delete_job (review-log F-28): the claim first takes FOR KEY
+    SHARE on the parent consultation_jobs row, which conflicts with delete_job's
+    FOR UPDATE. Delete first -> the row is gone -> no claim -> no send. Claim
+    first -> delete_job sees the in-flight claim (status 'sent', error NULL)
+    and refuses."""
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM consultation_jobs WHERE id = %s FOR KEY SHARE", [job_id])
+            if cur.fetchone() is None:
+                conn.rollback()
+                logger.info("Claim %s/%s refused: job no longer exists", job_id, step)
+                return False
             cur.execute(
                 """
                 UPDATE fieldpulse_writes
@@ -688,6 +709,59 @@ def list_jobs_for_admin(scan_limit: int = 2000) -> list:
         item["updated_at"] = _iso(r["updated_at"])
         out.append(item)
     return out
+
+
+def delete_job(job_id: str, guard=None) -> dict | None:
+    """Hard-delete one consultation from OUR database: its fieldpulse_writes
+    rows and its consultation_jobs row, in one transaction. Never touches
+    FieldPulse, R2 or customer_links (links are per customer, shared by every
+    consultation for that customer).
+
+    The row is locked (FOR UPDATE) first, so a concurrent worker update or
+    manual-send save waits and then finds the row gone. `guard(job)` (the
+    serialized row) runs under that lock and returns a reason string to refuse,
+    or None to go ahead, so the check and the delete can't race.
+
+    A FieldPulse step that is claimed and in flight (status 'sent' with no
+    error: claim_fieldpulse_write cleared it, finish_fieldpulse_write hasn't
+    run) always refuses, before `guard`: the worker may be mid-send, and
+    deleting would lose the only record of it (review-log F-28). Claims take
+    FOR KEY SHARE on this row, so a claim and a delete never interleave. A
+    finished "sent, no answer" step always has an error and does not block.
+    A worker killed between claim and finish leaves a claim that blocks delete
+    until someone checks FieldPulse (deliberate: it may have been sent).
+
+    Returns None if the job doesn't exist, else
+      {"deleted": False, "reason": str, "job": job}   (refused; rolled back)
+      {"deleted": True, "job": job, "writes_deleted": int}"""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM consultation_jobs WHERE id = %s FOR UPDATE", [job_id])
+            row = cur.fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            job = _serialize_job(row)
+            cur.execute(
+                "SELECT step FROM fieldpulse_writes "
+                "WHERE job_id = %s AND status = 'sent' AND error IS NULL ORDER BY step",
+                [job_id])
+            in_flight = [r["step"] for r in cur.fetchall()]
+            if in_flight:
+                reason = (f"A FieldPulse send is in progress for this consultation "
+                          f"({', '.join(in_flight)}). Wait for it to finish, then delete it.")
+            else:
+                reason = guard(job) if guard else None
+            if reason:
+                conn.rollback()
+                return {"deleted": False, "reason": reason, "job": job}
+            cur.execute("DELETE FROM fieldpulse_writes WHERE job_id = %s", [job_id])
+            writes_deleted = cur.rowcount
+            cur.execute("DELETE FROM consultation_jobs WHERE id = %s", [job_id])
+        conn.commit()
+    logger.info("Deleted job %s (status=%s, %d FieldPulse write rows)",
+                job_id, job["status"], writes_deleted)
+    return {"deleted": True, "job": job, "writes_deleted": writes_deleted}
 
 
 _MANUAL_SENDS_KEPT = 20

@@ -169,10 +169,16 @@ def send_consultation_to_fieldpulse(job_id, request_id):
                                                  "extraction to send."})
             return
         logger.info("[%s] manual FieldPulse send (request %s)", job_id, request_id)
+        # If the admin deleted the consultation meanwhile, every claim fails
+        # (jobs.claim_fieldpulse_write checks the row under a lock, F-28), so
+        # nothing is sent, and save_manual_send finds no row: stop quietly.
         sync = sync_consultation(job, extraction, manual=True)
-        save_manual_send(job_id, {**entry, "status": "finished", "finished_at": now(),
-                                  "outcome": sync.get("status"), "mode": sync.get("mode"),
-                                  "message": sync.get("message")}, sync=sync)
+        if not save_manual_send(job_id, {**entry, "status": "finished", "finished_at": now(),
+                                         "outcome": sync.get("status"), "mode": sync.get("mode"),
+                                         "message": sync.get("message")}, sync=sync):
+            logger.info("[%s] manual send: consultation was deleted meanwhile; nothing recorded",
+                        job_id)
+            return
         logger.info("[%s] manual send done: %s", job_id, sync.get("status"))
     except Exception as exc:  # noqa: BLE001
         logger.exception("[%s] manual send crashed", job_id)

@@ -7,7 +7,7 @@ import {
   requestUploadUrl,
   submitConsultationJob,
 } from './lib/api.js'
-import { clearActiveJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
+import { clearActiveJob, forgetJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
 import { parseAdminHash } from './lib/admin.js'
 import Home from './screens/Home.jsx'
 import CustomerPicker from './screens/CustomerPicker.jsx'
@@ -27,10 +27,20 @@ const isAdminScreen = (s) => s === 'admin' || s === 'admin-detail'
 function setAdminHash(hash) {
   if (window.location.hash !== hash) window.location.hash = hash // fires hashchange
 }
+// Replace (not push) the hash: used after a delete, so browser Back doesn't
+// land on the deleted consultation's URL. replaceState fires no hashchange.
+function replaceAdminHash(hash) {
+  window.history.replaceState(null, '', window.location.pathname + window.location.search + hash)
+}
 function clearAdminHash() {
   if (parseAdminHash(window.location.hash)) {
     window.history.pushState(null, '', window.location.pathname + window.location.search)
   }
+}
+
+const GONE = {
+  title: 'That consultation no longer exists',
+  message: 'It was deleted from the admin panel. Anything already sent to FieldPulse is still there.',
 }
 
 // Take a done /job-status response and shape it for the existing Confirmation
@@ -106,7 +116,18 @@ export default function App() {
       }
       setPhase(data.status) // queued | processing
       pollTimerRef.current = setTimeout(() => pollOnce(jobId), 3000)
-    } catch (_) {
+    } catch (e) {
+      if (e && e.status === 404) {
+        // Deleted (admin panel, maybe on another device): stop, don't resume it again.
+        stopPolling()
+        forgetJob(jobId)
+        setActiveJobId((cur) => (cur === jobId ? null : cur))
+        setPhase(null)
+        if (isAdminScreen(screenRef.current)) return
+        setErrorState(GONE)
+        setScreen('error')
+        return
+      }
       // transient — keep polling
       pollTimerRef.current = setTimeout(() => pollOnce(jobId), 3000)
     }
@@ -165,6 +186,21 @@ export default function App() {
     setScreen('admin-detail')
     setAdminHash(`#admin/${jobId}`)
   }, [])
+
+  // After AdminDetail deleted a consultation: forget it locally (stored
+  // in-flight job, polling, a loaded result), then back to a fresh list.
+  const onAdminDeleted = useCallback((jobId) => {
+    forgetJob(jobId)
+    if (activeJobId === jobId) {
+      stopPolling()
+      setActiveJobId(null)
+      setPhase(null)
+      setJobResult(null)
+    }
+    setAdminJobId(null)
+    setScreen('admin')
+    replaceAdminHash('#admin')
+  }, [activeJobId, stopPolling])
 
   const leaveAdmin = useCallback(() => {
     clearAdminHash()
@@ -271,7 +307,9 @@ export default function App() {
           setScreen('confirmation')
         })
         .catch((e) => {
-          setErrorState({ title: "Couldn't load that consultation", message: e.message })
+          setErrorState(e && e.status === 404
+            ? GONE
+            : { title: "Couldn't load that consultation", message: e.message })
           setScreen('error')
         })
       return
@@ -340,7 +378,7 @@ export default function App() {
         <AdminList onBack={leaveAdmin} onOpen={openAdminDetail} initial={adminListState} />
       )}
       {screen === 'admin-detail' && adminJobId && (
-        <AdminDetail key={adminJobId} jobId={adminJobId} onBack={openAdmin} />
+        <AdminDetail key={adminJobId} jobId={adminJobId} onBack={openAdmin} onDeleted={onAdminDeleted} />
       )}
     </div>
   )

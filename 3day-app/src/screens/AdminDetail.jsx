@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useUser } from '@clerk/clerk-react'
-import { fetchAdminAudioUrl, fetchAdminConsultation, requestAdminSend } from '../lib/api.js'
+import {
+  deleteAdminConsultation, fetchAdminAudioUrl, fetchAdminConsultation, requestAdminSend,
+} from '../lib/api.js'
 import {
   FP_LABEL, MODE_LABEL, SOURCE_LABEL, STEP_NAME, WRITE_STATUS_LABEL,
   copyText, display, fmtDateTime, fmtEpoch, groupExtraction, isObj, pretty, str,
@@ -343,9 +345,37 @@ function TranscriptSection({ d }) {
   )
 }
 
+// ---- Delete (our database only; FieldPulse is never touched) ----------------------
+
+const BUSY = new Set(['queued', 'processing'])
+
+function DeleteSection({ d, onDelete, deleting, deleteNote, sending }) {
+  const busy = BUSY.has(d.status)
+  return (
+    <div className="admin-card admin-delete">
+      <h3 className="admin-card-title">Delete</h3>
+      <p className="admin-note">
+        Removes this consultation from this app only (transcript, extracted details, FieldPulse
+        step records, audio). FieldPulse is not changed: anything already sent there stays.
+      </p>
+      <button
+        className="btn btn-danger"
+        disabled={busy || deleting || sending}
+        onClick={onDelete}
+      >
+        {deleting ? 'Deleting…' : 'Delete consultation'}
+      </button>
+      {busy && (
+        <p className="admin-note">It is still being processed. Wait until it is done or failed.</p>
+      )}
+      {deleteNote && <p className="admin-note is-error">{deleteNote}</p>}
+    </div>
+  )
+}
+
 // ---- Body (all five sections; exported so it can be rendered with fixture data) ----
 
-export function AdminDetailBody({ d, onSend, sending, sendNote }) {
+export function AdminDetailBody({ d, onSend, sending, sendNote, onDelete, deleting, deleteNote }) {
   return (
     <div className="admin-detail">
       <div className="admin-col">
@@ -365,6 +395,10 @@ export function AdminDetailBody({ d, onSend, sending, sendNote }) {
           <p className="admin-note">Everything stored for this consultation, as a last resort.</p>
           <RawJson value={d.raw} label="Whole job row (raw JSON)" />
         </div>
+        {onDelete && (
+          <DeleteSection d={d} onDelete={onDelete} deleting={deleting}
+            deleteNote={deleteNote} sending={sending} />
+        )}
       </div>
     </div>
   )
@@ -372,12 +406,14 @@ export function AdminDetailBody({ d, onSend, sending, sendNote }) {
 
 // ---- Screen -----------------------------------------------------------------------
 
-export default function AdminDetail({ jobId, onBack }) {
+export default function AdminDetail({ jobId, onBack, onDeleted }) {
   const { user } = useUser()
   const [d, setD] = useState(null)
   const [error, setError] = useState(null)
   const [sending, setSending] = useState(false)
   const [sendNote, setSendNote] = useState(null)
+  const [deleting, setDeleting] = useState(false)
+  const [deleteNote, setDeleteNote] = useState(null)
   const pollRef = useRef(null)
   const mounted = useRef(true)
 
@@ -446,6 +482,31 @@ export default function AdminDetail({ jobId, onBack }) {
     }
   }
 
+  const onDelete = async () => {
+    if (!d) return
+    const ok = window.confirm(
+      'Delete this consultation?\n\n' +
+      `Customer: ${str(d.customer_name) || 'No customer linked'}\n` +
+      `Date: ${fmtDateTime(d.created_at) || 'unknown'}\n\n` +
+      'This permanently removes it from this app: transcript, extracted details, FieldPulse ' +
+      'step records and the audio recording. It cannot be undone.\n\n' +
+      'FieldPulse is NOT changed. Anything already sent to FieldPulse (comment, task) stays there.',
+    )
+    if (!ok) return
+    setDeleting(true)
+    setDeleteNote(null)
+    try {
+      await deleteAdminConsultation(jobId)
+      if (mounted.current) onDeleted(jobId)
+    } catch (e) {
+      if (!mounted.current) return
+      setDeleting(false)
+      if (e && e.status === 404) { onDeleted(jobId); return } // already gone
+      setDeleteNote((e && e.message) || String(e))
+      load().catch(() => { /* keep the current view */ })      // e.g. 409: show the new status
+    }
+  }
+
   return (
     <section className="screen screen-admin">
       <header className="topbar">
@@ -468,7 +529,8 @@ export default function AdminDetail({ jobId, onBack }) {
         )}
         {!error && !d && <div className="state loading">Loading…</div>}
         {!error && d && (
-          <AdminDetailBody d={d} onSend={onSend} sending={sending} sendNote={sendNote} />
+          <AdminDetailBody d={d} onSend={onSend} sending={sending} sendNote={sendNote}
+            onDelete={onDeleted ? onDelete : null} deleting={deleting} deleteNote={deleteNote} />
         )}
       </div>
     </section>

@@ -242,9 +242,10 @@ export async function fetchRecentJobs(limit = 20) {
 }
 
 // -------------------- Admin panel (stage 3) --------------------
-// All read from our own database (never FieldPulse). The only action,
-// requestAdminSend, just queues a worker job; the worker's write mode decides
-// whether anything actually reaches FieldPulse.
+// All read from our own database (never FieldPulse). Two actions: delete
+// (our database only, see deleteAdminConsultation) and requestAdminSend,
+// which just queues a worker job; the worker's write mode decides whether
+// anything actually reaches FieldPulse.
 
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
@@ -297,4 +298,16 @@ export async function fetchAdminAudioUrl(jobId) {
   const data = await resp.json()
   if (!data || typeof data.url !== 'string') throw new Error("Couldn't get the audio link.")
   return data.url
+}
+
+// Delete a consultation from OUR database (job row + FieldPulse write records)
+// and its audio. Never touches FieldPulse. Returns { deleted, id, audio }.
+// 409 = still processing / a send is in flight; 404 = already gone.
+export async function deleteAdminConsultation(jobId) {
+  const resp = await fetch(`${API_BASE}/admin/consultations/${encodeURIComponent(jobId)}`, {
+    method: 'DELETE',
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, 'Delete')
+  return resp.json()
 }
