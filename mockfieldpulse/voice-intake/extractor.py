@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import anthropic
@@ -117,12 +117,25 @@ def _strip_code_fences(text):
 
 # --- Internal: shared Claude call + JSON parse ------------------------------
 
-def _extract(system_prompt_template: str, transcript: str, label: str) -> dict:
+def _user_message(transcript, reference_date=None, reference_tz=None):
+    """The user turn: the transcript, preceded by the consultation's date when
+    known. The date goes here (not in the system prompt) so the large system
+    prompt stays byte-identical and cacheable."""
+    if not isinstance(reference_date, date):
+        return transcript
+    day = (f"{reference_date.strftime('%A')}, {reference_date.strftime('%B')} "
+           f"{reference_date.day}, {reference_date.year}")
+    tz = f" ({reference_tz})" if reference_tz else ""
+    return f"Consultation date: {day}{tz}\n\nTranscript:\n{transcript}"
+
+
+def _extract(system_prompt_template: str, transcript: str, label: str,
+             user_message: str = None) -> dict:
     """Send the transcript to Claude with the given system prompt and parse JSON.
 
     Used by both extract_intake() and extract_consultation(). The behavior
     matches the original extract_intake exactly so existing callers are
-    unchanged.
+    unchanged. `user_message` (default: the transcript) is what is sent.
     """
     logger.info(
         "%s extraction started (transcript length: %d chars)", label, len(transcript)
@@ -143,7 +156,8 @@ def _extract(system_prompt_template: str, transcript: str, label: str) -> dict:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            messages=[{"role": "user", "content": transcript}],
+            messages=[{"role": "user",
+                       "content": transcript if user_message is None else user_message}],
         )
     except anthropic.APIError as exc:
         logger.error("%s extraction failed: API error: %s", label, exc)
@@ -187,13 +201,20 @@ def extract_intake(transcript: str) -> dict:
     return result
 
 
-def extract_consultation(transcript: str) -> dict:
+def extract_consultation(transcript: str, reference_date: date = None,
+                         reference_tz: str = None) -> dict:
     """Extract structured consultation data from a transcript.
 
     Mirrors extract_intake() but uses the consultation prompt and returns the
     consultation schema (project_type, scope, readiness, sales, ...).
+
+    `reference_date` (a datetime.date: the day the consultation happened, in
+    the branch timezone `reference_tz`) lets the model turn "next Thursday"
+    into return_appointment.resolved_date. Optional: without it the prompt
+    tells the model to leave relative dates null + flagged.
     """
-    result = _extract(SYSTEM_PROMPT_CONSULT, transcript, "Consultation")
+    result = _extract(SYSTEM_PROMPT_CONSULT, transcript, "Consultation",
+                      user_message=_user_message(transcript, reference_date, reference_tz))
 
     logger.info(
         "Consultation extraction succeeded (project_type: %s, match_confidence: %s)",

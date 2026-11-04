@@ -31,16 +31,49 @@ function jobTitle(job) {
   return 'Consultation in progress'
 }
 
+const SYNC_SHORT = {
+  dry_run: 'FieldPulse: dry run, nothing sent',
+  off: 'FieldPulse: off',
+  skipped: 'FieldPulse: not linked',
+  blocked: 'FieldPulse: not sent',
+  succeeded: 'FieldPulse: updated',
+  partial: 'FieldPulse: partly updated',
+  failed: 'FieldPulse: update failed',
+  pending: 'FieldPulse: pending',
+}
+
+function customerLabel(job) {
+  const c = job.customer
+  if (!c || typeof c !== 'object') return null
+  const name = typeof c.display_name === 'string' && c.display_name.trim()
+  if (name) return name
+  const parts = [c.first_name, c.last_name].filter((p) => typeof p === 'string' && p.trim())
+  return parts.join(' ') || null
+}
+
 function jobSubline(job) {
   const s = job.summary || {}
-  if (job.status === 'done') {
+  const who = customerLabel(job)
+  const sync = s.fieldpulse_sync && typeof s.fieldpulse_sync === 'object' ? s.fieldpulse_sync : null
+  if (job.status === 'done' && sync) {
     const bits = []
+    if (who) bits.push(who)
+    if (s.input === 'paste') bits.push('pasted')
+    bits.push(SYNC_SHORT[sync.status] || 'FieldPulse')
+    return bits.join(' · ')
+  }
+  if (job.status === 'done') {
+    // Old mock-writer jobs (before the real FieldPulse sync).
+    const bits = []
+    if (who) bits.push(who)
     if (s.match_path) bits.push(statusLabel(s.match_path))
-    if (s.fieldpulse_customer_id) bits.push(s.fieldpulse_customer_id)
+    if (s.fieldpulse_customer_id != null && typeof s.fieldpulse_customer_id !== 'object') {
+      bits.push(String(s.fieldpulse_customer_id))
+    }
     return bits.join(' · ') || 'Saved to FieldPulse'
   }
   if (job.status === 'failed') return job.error || 'Something went wrong.'
-  return 'Waiting on the backend worker…'
+  return who ? `${who} · waiting on the backend worker…` : 'Waiting on the backend worker…'
 }
 
 export default function RecentJobs({ onBack, onOpen }) {

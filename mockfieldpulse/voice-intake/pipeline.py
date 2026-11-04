@@ -1,17 +1,16 @@
-"""Shared transcribe -> extract -> write consultation pipeline.
+"""Consultation pipeline stages.
 
-Called by both:
-  - orchestrator.py's /process-consultation route (synchronous)
-  - worker.py's process_consultation_job (async, via RQ)
+  - transcribe(audio_path)   used by worker.py (the live async flow). The
+                             worker then extracts and calls fieldpulse_sync.
+  - run_from_transcript(...) DEPRECATED: only the old synchronous
+                             /process-consultation and /test-consultation-sample
+                             routes use it. It still writes to the MOCK via
+                             consultation_writer. The app no longer calls those
+                             routes (stage 6 removes them with the mock).
 
 Each stage raises its own module's exception (TranscriptionError,
-ExtractionError, WriterError), so callers can map failures to whatever
-they care about (HTTP status codes on the endpoint, `status='failed'`
-on the async job).
-
-On WriterError specifically the extraction is attached to the exception
-as `.extraction`, so the /process-consultation route can still expose
-what Claude figured out even when the FieldPulse write fails.
+ExtractionError, WriterError). On WriterError the extraction is attached as
+`.extraction` so the deprecated route can still show it.
 """
 
 import logging
@@ -32,7 +31,7 @@ if not logger.handlers:
 
 
 def run_from_transcript(transcript, customer_id=None, source=None, customer=None):
-    """Extract structured consultation data and write it to FieldPulse.
+    """DEPRECATED sync route only. Extract, then write to the MOCK FieldPulse.
 
     `customer` is the selected customer's identity snapshot (or None); the
     writer uses it only to create/link a mock customer for an external id.
@@ -78,12 +77,9 @@ def run_from_transcript(transcript, customer_id=None, source=None, customer=None
     }
 
 
-def run_from_audio(audio_path, customer_id=None, source=None, customer=None):
-    """Transcribe audio, then extract + write.
-
-    Returns {"transcript", "transcription_seconds", "extraction", "fieldpulse"}.
-    Raises TranscriptionError (transcribe stage), ExtractionError, or WriterError.
-    """
+def transcribe(audio_path):
+    """Transcribe one audio file. Returns (transcript, duration_seconds).
+    Raises TranscriptionError, including for an empty transcript."""
     logger.info("Transcribe stage (audio=%s)", audio_path)
     tr = transcribe_audio(audio_path)
     transcript = (tr.get("transcript") or "").strip()
@@ -94,9 +90,4 @@ def run_from_audio(audio_path, customer_id=None, source=None, customer=None):
     )
     if not transcript:
         raise TranscriptionError("Transcription returned an empty transcript")
-
-    result = run_from_transcript(
-        transcript, customer_id=customer_id, source=source, customer=customer
-    )
-    result["transcription_seconds"] = duration
-    return result
+    return transcript, duration

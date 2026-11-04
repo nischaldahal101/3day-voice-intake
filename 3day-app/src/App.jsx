@@ -6,7 +6,6 @@ import {
   putToR2,
   requestUploadUrl,
   submitConsultationJob,
-  submitConsultationSync,
 } from './lib/api.js'
 import { clearActiveJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
 import Home from './screens/Home.jsx'
@@ -16,44 +15,6 @@ import Processing from './screens/Processing.jsx'
 import Confirmation from './screens/Confirmation.jsx'
 import ErrorScreen from './screens/ErrorScreen.jsx'
 import RecentJobs from './screens/RecentJobs.jsx'
-
-const FRIENDLY = {
-  transcription_failed: {
-    title: "Couldn't transcribe that recording",
-    message:
-      "The audio didn't come through clearly enough to transcribe. Try recording somewhere quieter, or paste the transcript instead.",
-  },
-  extraction_failed: {
-    title: 'Analysis failed',
-    message:
-      "We got the transcript but couldn't pull structured data out of it. Tap retry — if it keeps failing, save the transcript and try later.",
-  },
-  writer_failed: {
-    title: 'Saved analysis, but FieldPulse update failed',
-    message:
-      "We got the structured data but couldn't update FieldPulse. The analysis is safe — retry to push it again.",
-  },
-  fieldpulse_unreachable: {
-    title: "Can't reach FieldPulse",
-    message:
-      'The FieldPulse server appears to be offline. Check the connection and try again.',
-  },
-}
-
-function explainSyncError(data, httpStatus) {
-  const s = data && data.status
-  if (FRIENDLY[s]) return { ...FRIENDLY[s], detail: data && data.error }
-  if (httpStatus >= 500) {
-    return {
-      title: 'Something went wrong on our side',
-      message: (data && data.error) || 'The server returned an unexpected error.',
-    }
-  }
-  return {
-    title: "Couldn't complete the consultation",
-    message: (data && data.error) || 'Unknown error.',
-  }
-}
 
 // Take a done /job-status response and shape it for the existing Confirmation
 // component (which was written against the old sync response). `elapsed_seconds`
@@ -68,7 +29,9 @@ function shapeJobResult(data) {
   } catch (_) { /* leave null */ }
   return {
     extraction: result.extraction,
-    fieldpulse: result.fieldpulse,
+    fieldpulse: result.fieldpulse,           // old mock-writer jobs only
+    fieldpulse_sync: result.fieldpulse_sync, // new jobs: real FieldPulse sync summary
+    input: result.input,
     transcription_seconds: result.transcription_seconds,
     transcript: result.transcript,
     elapsed_seconds: elapsed,
@@ -159,30 +122,39 @@ export default function App() {
     setScreen('home')
   }, [stopPolling])
 
-  // ---- submit: async path (Record + Upload modes) ---------------------
+  // ---- submit: one async path for Record, Upload and Paste ------------
+  // Audio is PUT straight to R2 first; a pasted transcript is sent with the
+  // submit itself. Either way the backend queues a job and we poll it.
 
-  const handleSubmitAsync = useCallback(async ({ audioBlob }) => {
-    setLastPayload({ audioBlob })
+  const handleSubmitAsync = useCallback(async (payload) => {
+    const { audioBlob, transcript } = payload
+    setLastPayload(payload)
     setUploadPct(0)
     setJobResult(null)
     setErrorState(null)
-    setPhase('uploading')
+    setPhase(audioBlob ? 'uploading' : 'submitting')
     setScreen('processing')
 
-    const contentType = baseContentType(audioBlob.type)
-    const filename = filenameForBlob(audioBlob)
     try {
-      const { upload_url, audio_key } = await requestUploadUrl({
-        filename,
-        contentType,
-        customerId: customer && customer.id,
-      })
-      await putToR2(upload_url, audioBlob, contentType, (pct) => setUploadPct(pct))
-      setPhase('submitting')
+      let input
+      if (audioBlob) {
+        const contentType = baseContentType(audioBlob.type)
+        const filename = filenameForBlob(audioBlob)
+        const { upload_url, audio_key } = await requestUploadUrl({
+          filename,
+          contentType,
+          customerId: customer && customer.id,
+        })
+        await putToR2(upload_url, audioBlob, contentType, (pct) => setUploadPct(pct))
+        setPhase('submitting')
+        input = { audioKey: audio_key }
+      } else {
+        input = { transcript }
+      }
       const submitted = await submitConsultationJob({
-        audioKey: audio_key,
+        ...input,
         customer,
-        source: '3day-app',
+        source: audioBlob ? '3day-app' : '3day-app-paste',
       })
       const active = {
         job_id: submitted.job_id,
@@ -203,41 +175,11 @@ export default function App() {
     }
   }, [customer, startPolling])
 
-  // ---- submit: sync path (Paste mode / transcript) --------------------
-
-  const handleSubmitSync = useCallback(async ({ transcript }) => {
-    setLastPayload({ transcript })
-    setJobResult(null)
-    setErrorState(null)
-    setPhase(null)
-    setScreen('processing')
-    try {
-      const { ok, status, data } = await submitConsultationSync({
-        transcript,
-        customerId: customer && customer.id,
-      })
-      if (ok && data && data.status === 'success') {
-        setJobResult(data)
-        setScreen('confirmation')
-      } else {
-        setErrorState({ ...explainSyncError(data, status), data })
-        setScreen('error')
-      }
-    } catch (e) {
-      setErrorState({
-        title: "Couldn't reach the server",
-        message: (e && e.message) || String(e),
-      })
-      setScreen('error')
-    }
-  }, [customer])
-
   // ---- unified submit dispatcher --------------------------------------
 
   const handleSubmit = useCallback((payload) => {
-    if (payload && payload.audioBlob) return handleSubmitAsync(payload)
-    if (payload && payload.transcript) return handleSubmitSync(payload)
-  }, [handleSubmitAsync, handleSubmitSync])
+    if (payload && (payload.audioBlob || payload.transcript)) return handleSubmitAsync(payload)
+  }, [handleSubmitAsync])
 
   const retry = useCallback(() => {
     if (lastPayload) return handleSubmit(lastPayload)
@@ -248,7 +190,12 @@ export default function App() {
 
   const openRecentJob = useCallback((job) => {
     stopPolling()
-    setCustomer(null)
+    // The picker snapshot stored on the job, for the name on Confirmation /
+    // Processing (display only; null for old jobs). Failed jobs keep the old
+    // behaviour (no customer), so Retry from there still starts clean.
+    const c = job && job.customer
+    const snapshot = c && typeof c === 'object' && !Array.isArray(c) ? c : null
+    setCustomer(job.status === 'failed' ? null : snapshot)
     setActiveJobId(job.id)
     if (job.status === 'done') {
       // Fetch full result for the confirmation screen.

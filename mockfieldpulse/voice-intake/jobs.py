@@ -96,6 +96,28 @@ CREATE TABLE IF NOT EXISTS customer_links (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (source, external_id)
 );
+-- Additive: a pasted transcript (paste path: no audio_key, the worker skips
+-- transcription and reads this). NULL for recorded/uploaded jobs.
+ALTER TABLE consultation_jobs ADD COLUMN IF NOT EXISTS transcript TEXT;
+-- One row per (job, FieldPulse write step), owned by fieldpulse_sync.py.
+-- UNIQUE(job_id, step) is the idempotency guard: a 'succeeded' or 'sent'
+-- step is never sent again. `request` is {method, path, body} only (never
+-- headers or the API key); `response` is truncated.
+CREATE TABLE IF NOT EXISTS fieldpulse_writes (
+    job_id                TEXT NOT NULL REFERENCES consultation_jobs(id) ON DELETE CASCADE,
+    step                  TEXT NOT NULL,
+    status                TEXT NOT NULL
+        CHECK (status IN ('planned', 'sent', 'succeeded', 'failed', 'skipped')),
+    mode                  TEXT NOT NULL,
+    request               JSONB,
+    response              JSONB,
+    fieldpulse_record_id  TEXT,
+    error                 TEXT,
+    attempts              INTEGER NOT NULL DEFAULT 0,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, step)
+);
 """
 
 
@@ -149,6 +171,7 @@ def _serialize_job(row):
         "customer_id": row["customer_id"],
         "customer": row.get("customer"),
         "audio_key": row["audio_key"],
+        "transcript": row.get("transcript"),
         "source": row["source"],
         "result": row["result"],
         "error": row["error"],
@@ -160,29 +183,35 @@ def _serialize_job(row):
 # --- Public API ------------------------------------------------------------
 
 def create_job(
-    audio_key: str, customer_id: str = None, source: str = None, customer: dict = None
+    audio_key: str = None, customer_id: str = None, source: str = None,
+    customer: dict = None, transcript: str = None,
 ) -> dict:
-    """Insert a new job with status='queued'. `customer` is the selected
-    customer's identity snapshot (or None). Returns the serialized record."""
+    """Insert a new job with status='queued'. Exactly one input: `audio_key`
+    (recorded/uploaded audio in R2) or `transcript` (pasted text). `customer`
+    is the selected customer's identity snapshot (or None). Returns the
+    serialized record."""
+    if bool(audio_key) == bool(transcript):
+        raise JobError("create_job needs exactly one of audio_key or transcript")
     new_id = f"job_{uuid.uuid4().hex[:12]}"
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO consultation_jobs
-                    (id, status, customer_id, customer, audio_key, source)
-                VALUES (%s, 'queued', %s, %s, %s, %s)
+                    (id, status, customer_id, customer, audio_key, transcript, source)
+                VALUES (%s, 'queued', %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 [new_id, customer_id, Jsonb(customer) if customer is not None else None,
-                 audio_key, source],
+                 audio_key, transcript, source],
             )
             row = cur.fetchone()
         conn.commit()
     job = _serialize_job(row)
     logger.info(
-        "Created job %s (audio_key=%s customer_id=%s source=%s)",
-        job["id"], audio_key, customer_id or "—", source or "—",
+        "Created job %s (audio_key=%s transcript=%s customer_id=%s source=%s)",
+        job["id"], audio_key or "—", f"{len(transcript)} chars" if transcript else "—",
+        customer_id or "—", source or "—",
     )
     return job
 
@@ -199,15 +228,17 @@ def list_recent_jobs(limit: int = 20) -> list:
     """Return recent jobs newest-first for a list view.
 
     The response is intentionally compact — a `summary` field extracts a
-    handful of headline values (project_type, match_path, FieldPulse ids,
-    admin URL) from the result JSONB rather than dumping the full extraction
-    + fieldpulse + transcript payload. Failed jobs include their `error`.
+    handful of headline values from the result JSONB rather than dumping the
+    full extraction + transcript payload. New jobs carry `fieldpulse_sync`
+    (status + plain-language message + step statuses); old mock-writer jobs
+    still carry match_path / FieldPulse ids. Failed jobs include their `error`.
+    `customer` is the picker snapshot (display only).
     """
     limit = max(1, min(int(limit), 100))
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, status, customer_id, source, result, error,
+            SELECT id, status, customer_id, customer, source, result, error,
                    created_at, updated_at
               FROM consultation_jobs
              ORDER BY created_at DESC
@@ -222,20 +253,32 @@ def list_recent_jobs(limit: int = 20) -> list:
             "id": r["id"],
             "status": r["status"],
             "customer_id": r["customer_id"],
+            "customer": r["customer"] if isinstance(r["customer"], dict) else None,
             "source": r["source"],
             "created_at": _iso(r["created_at"]),
             "updated_at": _iso(r["updated_at"]),
         }
         result = r["result"]
-        if result:
-            extraction = result.get("extraction") or {}
-            fieldpulse = result.get("fieldpulse") or {}
+        if isinstance(result, dict) and result:
+            extraction = result.get("extraction") if isinstance(result.get("extraction"), dict) else {}
+            fieldpulse = result.get("fieldpulse") if isinstance(result.get("fieldpulse"), dict) else {}
+            sync = result.get("fieldpulse_sync") if isinstance(result.get("fieldpulse_sync"), dict) else None
             item["summary"] = {
                 "project_type": extraction.get("project_type"),
+                "input": result.get("input"),
                 "match_path": fieldpulse.get("match_path"),
                 "fieldpulse_customer_id": fieldpulse.get("customer_id"),
                 "fieldpulse_job_id": fieldpulse.get("job_id"),
                 "fieldpulse_url": fieldpulse.get("fieldpulse_url"),
+                "fieldpulse_sync": {
+                    "status": sync.get("status"),
+                    "mode": sync.get("mode"),
+                    "message": sync.get("message"),
+                    "steps": [
+                        {"step": s.get("step"), "status": s.get("status")}
+                        for s in (sync.get("steps") or []) if isinstance(s, dict)
+                    ],
+                } if sync else None,
             }
         if r["error"]:
             item["error"] = r["error"]
@@ -319,3 +362,112 @@ def save_customer_link(
     linked = row["mock_customer_id"]
     logger.info("Customer link %s:%s -> %s", source, external_id, linked)
     return linked
+
+
+# --- FieldPulse write records (used only by fieldpulse_sync.py) -------------
+#
+# Statuses: planned (built, not sent) | sent (request went out, outcome not
+# known yet, or never answered) | succeeded | failed | skipped. 'succeeded'
+# and 'sent' rows are terminal for automation: nothing here overwrites them.
+# Rows recorded with mode 'dry_run' are never claimed (sent) and never
+# rewritten by a non-dry_run record: only a future explicit manual send
+# (stage 3 admin) may release them.
+
+def _serialize_write(row):
+    return {
+        "job_id": row["job_id"],
+        "step": row["step"],
+        "status": row["status"],
+        "mode": row["mode"],
+        "request": row["request"],
+        "response": row["response"],
+        "fieldpulse_record_id": row["fieldpulse_record_id"],
+        "error": row["error"],
+        "attempts": row["attempts"],
+        "created_at": _iso(row["created_at"]),
+        "updated_at": _iso(row["updated_at"]),
+    }
+
+
+def list_fieldpulse_writes(job_id: str) -> list:
+    """All write steps recorded for a job, oldest first."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM fieldpulse_writes WHERE job_id = %s ORDER BY created_at, step",
+            [job_id],
+        )
+        return [_serialize_write(r) for r in cur.fetchall()]
+
+
+def record_fieldpulse_write(
+    job_id: str, step: str, status: str, mode: str, request: dict = None, error: str = None
+) -> None:
+    """Insert or refresh a step as planned/skipped (with its exact request).
+    Never touches a step that is already 'succeeded' or 'sent'."""
+    if status not in ("planned", "skipped"):
+        raise JobError(f"record_fieldpulse_write: bad status {status!r}")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fieldpulse_writes (job_id, step, status, mode, request, error)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (job_id, step) DO UPDATE
+                   SET status = EXCLUDED.status, mode = EXCLUDED.mode,
+                       request = EXCLUDED.request, error = EXCLUDED.error,
+                       updated_at = now()
+                 WHERE fieldpulse_writes.status NOT IN ('succeeded', 'sent')
+                   -- a dry-run row is never rewritten by a later send mode
+                   AND NOT (fieldpulse_writes.mode = 'dry_run'
+                            AND EXCLUDED.mode <> 'dry_run')
+                """,
+                [job_id, step, status, mode,
+                 Jsonb(request) if request is not None else None, error],
+            )
+        conn.commit()
+
+
+def claim_fieldpulse_write(job_id: str, step: str, max_attempts: int) -> bool:
+    """Atomically move a planned/failed step to 'sent' (attempts + 1) right
+    before the HTTP call. False if it isn't claimable (already sent/succeeded,
+    skipped, out of attempts, or claimed by a concurrent worker)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE fieldpulse_writes
+                   SET status = 'sent', attempts = attempts + 1, error = NULL,
+                       response = NULL, updated_at = now()
+                 WHERE job_id = %s AND step = %s
+                   AND status IN ('planned', 'failed') AND attempts < %s
+                   AND mode <> 'dry_run'   -- dry-run rows: manual send only
+                RETURNING step
+                """,
+                [job_id, step, max_attempts],
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row is not None
+
+
+def finish_fieldpulse_write(
+    job_id: str, step: str, status: str, response: dict = None,
+    record_id: str = None, error: str = None,
+) -> None:
+    """Record the outcome of a claimed ('sent') step: succeeded | failed |
+    sent (no answer: stays 'sent' with an error, never auto-resent)."""
+    if status not in ("succeeded", "failed", "sent"):
+        raise JobError(f"finish_fieldpulse_write: bad status {status!r}")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE fieldpulse_writes
+                   SET status = %s, response = %s, fieldpulse_record_id = %s,
+                       error = %s, updated_at = now()
+                 WHERE job_id = %s AND step = %s AND status = 'sent'
+                """,
+                [status, Jsonb(response) if response is not None else None,
+                 record_id, error, job_id, step],
+            )
+        conn.commit()

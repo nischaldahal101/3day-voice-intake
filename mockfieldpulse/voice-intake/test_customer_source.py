@@ -719,21 +719,25 @@ class TestWriterCustomerLinks(unittest.TestCase):
 
 
 class TestWorkerPassesIdentity(unittest.TestCase):
-    def test_worker_hands_job_customer_to_pipeline(self):
+    def test_worker_hands_job_customer_to_sync(self):
+        # Stage 2: the worker no longer calls the mock writer; the job row
+        # (with the picker identity) goes to fieldpulse_sync instead.
         import worker
         identity = {"id": "111", "display_name": "Doe, Jane"}
         job = {"id": "job-9", "audio_key": "consultations/a-1.webm", "customer_id": "111",
                "customer": identity, "source": "3day-app"}
         seen = {}
 
-        def fake_run(path, customer_id=None, source=None, customer=None):
-            seen.update(customer_id=customer_id, customer=customer)
-            return {"extraction": {}, "fieldpulse": {}, "transcript": "x"}
+        def fake_sync(j, extraction):
+            seen.update(customer_id=j["customer_id"], customer=j["customer"])
+            return {"status": "dry_run", "steps": []}
 
         with mock.patch.object(worker, "get_job", return_value=job), \
                 mock.patch.object(worker, "update_job_status"), \
                 mock.patch.object(worker, "download_audio"), \
-                mock.patch.object(worker, "run_from_audio", side_effect=fake_run):
+                mock.patch.object(worker, "transcribe", return_value=("x", 1.0)), \
+                mock.patch.object(worker, "extract_consultation", return_value={}), \
+                mock.patch.object(worker, "sync_consultation", side_effect=fake_sync):
             worker.process_consultation_job("job-9")
         self.assertEqual(seen, {"customer_id": "111", "customer": identity})
 

@@ -49,6 +49,79 @@ function highlightsFor(extraction) {
   return out.slice(0, 5)
 }
 
+// Plain-language label per step status (backend: fieldpulse_sync.py).
+const STEP_LABEL = {
+  planned: 'Would do',
+  succeeded: 'Done',
+  failed: 'Failed',
+  sent: 'Sent, no answer',
+  skipped: 'Skipped',
+  held: 'Not sent (dry run)',
+}
+
+const SYNC_TITLE = {
+  dry_run: 'FieldPulse: dry run',
+  off: 'FieldPulse: off',
+  skipped: 'FieldPulse: not linked',
+  blocked: 'FieldPulse: not sent',
+  succeeded: 'FieldPulse: updated',
+  partial: 'FieldPulse: partly updated',
+  failed: 'FieldPulse: update failed',
+  pending: 'FieldPulse: pending',
+}
+
+function str(v) {
+  return typeof v === 'string' && v.trim() ? v : null
+}
+
+// New jobs carry result.fieldpulse_sync; old mock-writer jobs don't (they
+// render exactly as before). Every field is re-guarded: this is server JSON.
+function SyncPanel({ sync }) {
+  if (!sync || typeof sync !== 'object' || Array.isArray(sync)) return null
+  const status = str(sync.status) || 'pending'
+  const message = str(sync.message)
+  const steps = Array.isArray(sync.steps)
+    ? sync.steps.filter((s) => s && typeof s === 'object' && str(s.description))
+    : []
+  const comment = str(sync.comment_text)
+  return (
+    <div className={`confirm-sync sync-${status.replace(/[^a-z_]/g, '')}`}>
+      <p className="confirm-sync-title">{SYNC_TITLE[status] || 'FieldPulse'}</p>
+      {message && <p className="confirm-sync-msg">{message}</p>}
+      {steps.length > 0 && (
+        <ul className="confirm-sync-steps">
+          {steps.map((s, i) => (
+            <li key={`${str(s.step) || 'step'}-${i}`}>
+              <span className="confirm-sync-step-status">
+                {STEP_LABEL[s.status] || str(s.status) || ''}
+              </span>
+              <span className="confirm-sync-step-text">
+                {s.description}
+                {str(s.error) && s.status !== 'skipped' ? <> ({s.error})</> : null}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {comment && (
+        <details className="confirm-transcript">
+          <summary className="confirm-transcript-toggle">
+            <span>
+              {status === 'dry_run' ? 'Comment that would be added' : 'FieldPulse comment'}
+            </span>
+            <span className="confirm-transcript-count">
+              {comment.length.toLocaleString()} chars
+            </span>
+          </summary>
+          <div className="confirm-transcript-body">
+            <p className="confirm-transcript-text">{comment}</p>
+          </div>
+        </details>
+      )}
+    </div>
+  )
+}
+
 export default function Confirmation({ customer, result, onDone }) {
   const name =
     (customer && customer.display_name) ||
@@ -97,6 +170,7 @@ export default function Confirmation({ customer, result, onDone }) {
             ))}
           </ul>
         )}
+        <SyncPanel sync={result && result.fieldpulse_sync} />
         {transcript && (
           <details className="confirm-transcript">
             <summary className="confirm-transcript-toggle">

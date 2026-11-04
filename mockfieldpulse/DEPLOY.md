@@ -67,6 +67,38 @@ mock service over HTTPS once deployed.
 > `CREATE TABLE IF NOT EXISTS customer_links (...)` (real FieldPulse id -> mock customer id).
 > Existing rows are untouched (`customer` is NULL for them). No manual migration step.
 
+> **Schema (stage 2, automatic, additive):** `jobs.py` also runs
+> `ALTER TABLE consultation_jobs ADD COLUMN IF NOT EXISTS transcript TEXT` (pasted transcripts) and
+> `CREATE TABLE IF NOT EXISTS fieldpulse_writes (...)` (one row per job + FieldPulse write step),
+> under the same advisory lock. Old rows are untouched.
+
+---
+
+## Service 3 — Consultation worker (`voice-intake/`, RQ)
+
+Runs `worker.process_consultation_job` for each queued job (transcribe or paste → extract → save →
+FieldPulse sync). Start command: `rq worker consultations` (Root Directory `voice-intake`). It needs the
+same `DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` and `R2_*` as the orchestrator.
+
+### FieldPulse write variables — WORKER ONLY
+
+Only the worker calls `fieldpulse_sync.py`. **Do not put any of these on the orchestrator**, and never put
+`FIELDPULSE_READ_*` on the worker.
+
+| Name | Notes |
+|---|---|
+| `FIELDPULSE_WRITE_MODE` | `dry_run` (default when unset, and for any unknown value: records the requests, sends nothing) · `off` · `test_customer_only` · `live`. **Stage 2: leave unset or `dry_run`.** Changing it is a production change: Nick's go only. |
+| `FIELDPULSE_WRITE_BASE_URL` | Real FieldPulse base URL (doc §1). Not needed for dry_run. Never the mock URL. |
+| `FIELDPULSE_WRITE_API_KEY` | Mike's FieldPulse key for writes. Secret. Not needed for dry_run. |
+| `FIELDPULSE_TEST_CUSTOMER_ID` | Integer id of the test customer. `test_customer_only` sends for this customer and nothing else. |
+| `FIELDPULSE_TIMEZONE` | Optional, default `America/Chicago`. Used for task times. |
+| `FIELDPULSE_COMMENT_COMMENTABLE_TYPE` | Optional, default `customer`. **UNVERIFIED**; stage 4 confirms. |
+| `FIELDPULSE_AI_JOB_TAG_ID` | Optional job tag id for tasks. Unset = no tag. |
+| `ADMIN_BASE_URL` | Optional. Adds an admin-panel link to each comment (stage 3 serves `/jobs/<job_id>`). |
+
+The worker keeps `FIELDPULSE_BASE_URL` only because the deprecated mock code still imports it; the live
+flow no longer writes to the mock (stage 6 removes it).
+
 > **Deploy the mock first**, copy its `https://...onrender.com` URL into the
 > orchestrator's `FIELDPULSE_BASE_URL`, then deploy the orchestrator.
 

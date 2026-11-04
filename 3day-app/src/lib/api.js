@@ -119,8 +119,9 @@ export async function fetchCustomers() {
   return data.customers.map(normalizeCustomer)
 }
 
-// The selected customer's identity, sent with submit so the worker can
-// create/link a mock customer for a real FieldPulse id (never by name).
+// The selected customer's identity, sent with submit and stored on the job
+// (display only: names in Recent/Confirmation). The FieldPulse write uses
+// only the id.
 function customerIdentity(customer) {
   if (!customer || customer.id === undefined || customer.id === null) return null
   return {
@@ -198,14 +199,17 @@ export function putToR2(uploadUrl, blob, contentType, onProgress) {
   })
 }
 
-// `customer` is the picker's selected customer object (or null).
-export async function submitConsultationJob({ audioKey, customer, source }) {
+// `customer` is the picker's selected customer object (or null). Send exactly
+// one input: `audioKey` (audio already PUT to R2) or `transcript` (pasted
+// text; the worker skips transcription). Both go through the same job queue.
+export async function submitConsultationJob({ audioKey, transcript, customer, source }) {
   const identity = customerIdentity(customer)
+  const input = audioKey ? { audio_key: audioKey } : { transcript }
   const resp = await fetch(`${API_BASE}/consultation/submit`, {
     method: 'POST',
     headers: await authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
-      audio_key: audioKey,
+      ...input,
       customer_id: identity ? identity.id : null,
       customer: identity,
       source: source || '3day-app',
@@ -232,25 +236,4 @@ export async function fetchRecentJobs(limit = 20) {
   await assertOk(resp, 'recent jobs')
   const data = await resp.json()
   return data.jobs || []
-}
-
-// -------------------- Sync fallback (paste/type only) --------------------
-// Used only by the Paste tab. The old sync endpoint on the orchestrator is
-// marked deprecated but kept working — it's the only path that accepts a
-// pre-transcribed transcript, and the paste fallback exists specifically
-// for iOS Safari over HTTP where mic access is blocked.
-
-export async function submitConsultationSync({ transcript, customerId, source = '3day-app' }) {
-  const resp = await fetch(`${API_BASE}/process-consultation`, {
-    method: 'POST',
-    headers: await authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ transcript, customer_id: customerId, source }),
-  })
-  // Preserve the old caller contract: return { ok, status, data } rather
-  // than throwing on non-2xx (the Paste flow surfaces friendly errors).
-  // But still trigger sign-out on 401 so the app doesn't hang signed-in
-  // with a dead token.
-  if (resp.status === 401) await handleAuthFailure()
-  const data = await resp.json().catch(() => ({}))
-  return { ok: resp.ok, status: resp.status, data }
 }

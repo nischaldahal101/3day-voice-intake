@@ -42,6 +42,11 @@ SALES QUALIFICATION:
 - For all text/details fields, summarize what was actually said. Do not pad with assumptions.
 - For style: capture the look/feeling in the client's terms ("modern farmhouse", "bright and open", "they weren't sure").
 - For return_appointment: "scheduled" true only if a specific return/presentation appointment was set. Capture date/time in details if given.
+- For return_appointment.details: keep the ORIGINAL phrase as it was said ("next Thursday at 6", "the 12th, around 7 in the evening"). Do not rewrite it into a calendar date.
+- For return_appointment.resolved_date and resolved_time: the message may start with a line "Consultation date: <weekday>, <month> <day>, <year> (<timezone>)" before the transcript. That is the day the consultation happened; use it ONLY to turn a relative date into a calendar date.
+  - resolved_date: "YYYY-MM-DD", only when the date is unambiguous given the consultation date (e.g. "tomorrow", "this Friday", "Thursday the 12th", "November 12"). If it could mean more than one day (e.g. "next Thursday" when it could be this coming Thursday or the one after and the transcript doesn't settle it, "sometime next week", "early December"), or there is no "Consultation date:" line and the phrase has no full calendar date, use null and add a flag explaining why, quoting what was said (e.g. "return appointment date not resolved: said 'sometime next week'").
+  - resolved_time: "HH:MM" in 24-hour time, only when a time was actually said AND am/pm is clear from what was said or the surrounding conversation (e.g. "6 pm", "7 tonight", "after work at 6"). If no time was said, use null. NEVER invent or guess a time. If am/pm is unclear, use null and add a flag explaining why.
+  - If scheduled is not true, both are null.
 - For raw_quotes: include 3-6 verbatim phrases worth preserving — especially budget mentions, concerns, the close score, and anything revealing about motivation.
 - For flags: surface what was NOT covered (checklist topics the rep skipped), any inferences you made, and uncertainty. Examples: "budget not discussed", "close score (1-10) not asked", "electrical not covered", "project type inferred from context".
 - For notes_summary: 3-5 sentences a human would write summarizing the consultation — scope highlights, the client's readiness, and the sales read.
@@ -103,7 +108,9 @@ SALES QUALIFICATION:
   },
   "return_appointment": {
     "scheduled": "true | false | null",
-    "details": "string or null"
+    "details": "string or null",
+    "resolved_date": "YYYY-MM-DD or null",
+    "resolved_time": "HH:MM (24h) or null"
   },
   "notes_summary": "string, 3-5 sentences",
   "raw_quotes": ["array of strings"],

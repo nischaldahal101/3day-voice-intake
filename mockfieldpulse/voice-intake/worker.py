@@ -3,13 +3,22 @@
 For each job on the `consultations` queue:
   1. Look it up in Postgres (get_job). Missing -> JobError, RQ records failure.
   2. Mark status='processing'.
-  3. Download the audio from R2 to a temp file.
-  4. Run pipeline.run_from_audio: transcribe -> extract -> write.
-  5. On success: status='done', result=<summary JSONB>.
-  6. On any failure: log, mark status='failed' with a clear error string,
-     then re-raise so RQ also records the failure. Job never stays in
-     'processing'.
-  7. Always clean up the temp audio file (finally block).
+  3. Get the transcript:
+       - recorded/uploaded audio (audio_key): download from R2, transcribe;
+       - pasted transcript (jobs.transcript): use it as-is, no transcription.
+  4. Extract (Claude, null-flagged), told the consultation's date so a
+     relative return appointment ("next Thursday") can be resolved.
+  5. SAVE FIRST: transcript + extraction go on the row (still 'processing')
+     before anything touches FieldPulse (docs/FIELDPULSE_API.md §11).
+  6. fieldpulse_sync.sync_consultation: real FieldPulse write, gated by
+     FIELDPULSE_WRITE_MODE (default dry_run = nothing sent). It never raises
+     and never fails the job; its summary is stored as result.fieldpulse_sync.
+  7. status='done'. Any failure in steps 3-5: status='failed' with a clear
+     error, then re-raise so RQ also records it. Job never stays 'processing'.
+  8. Always clean up the temp audio file.
+
+The worker no longer calls the mock writer (consultation_writer); that module
+stays only for the deprecated sync route until stage 6 removes the mock.
 
 Start the worker with:
     cd voice-intake/
@@ -22,10 +31,10 @@ import os
 import sys
 import tempfile
 
-from consultation_writer import WriterError as ConsultWriterError
-from extractor import ExtractionError
+from extractor import ExtractionError, extract_consultation
+from fieldpulse_sync import consultation_reference, sync_consultation
 from jobs import JobError, get_job, update_job_status
-from pipeline import run_from_audio
+from pipeline import transcribe
 from storage import StorageError, download_audio
 from transcriber import TranscriptionError
 
@@ -48,58 +57,50 @@ def process_consultation_job(job_id):
         raise JobError(f"Job not found: {job_id}")
 
     audio_key = job.get("audio_key")
-    customer_id = job.get("customer_id")
-    source = job.get("source") or "async-worker"
-    if not audio_key:
-        _fail(job_id, "job has no audio_key")
-        raise JobError(f"Job {job_id} has no audio_key")
+    pasted = job.get("transcript")
+    pasted = pasted.strip() if isinstance(pasted, str) else ""
+    if not audio_key and not pasted:
+        _fail(job_id, "job has no audio_key and no transcript")
+        raise JobError(f"Job {job_id} has no audio_key and no transcript")
 
     logger.info(
-        "[%s] audio_key=%s customer_id=%s source=%s",
-        job_id, audio_key, customer_id or "—", source,
+        "[%s] input=%s customer_id=%s source=%s",
+        job_id, "audio" if audio_key else "paste",
+        job.get("customer_id") or "—", job.get("source") or "—",
     )
     update_job_status(job_id, "processing")
 
-    # Preserve the R2 key's extension so mimetypes.guess_type() in the
-    # transcriber sends Deepgram the right Content-Type.
-    ext = os.path.splitext(audio_key)[1] or ".bin"
-    fd, tmp_path = tempfile.mkstemp(prefix="consult_", suffix=ext)
-    os.close(fd)
-
+    tmp_path = None
     try:
-        logger.info("[%s] downloading r2 -> %s", job_id, tmp_path)
-        download_audio(audio_key, tmp_path)
+        if audio_key:
+            # Keep the R2 key's extension so the transcriber sends Deepgram
+            # the right Content-Type.
+            ext = os.path.splitext(audio_key)[1] or ".bin"
+            fd, tmp_path = tempfile.mkstemp(prefix="consult_", suffix=ext)
+            os.close(fd)
+            logger.info("[%s] downloading r2 -> %s", job_id, tmp_path)
+            download_audio(audio_key, tmp_path)
+            transcript, transcription_seconds = transcribe(tmp_path)
+        else:
+            transcript, transcription_seconds = pasted, None
 
-        logger.info("[%s] running pipeline (transcribe + extract + write)", job_id)
-        result = run_from_audio(
-            tmp_path, customer_id=customer_id, source=source,
-            customer=job.get("customer"),
-        )
+        # The consultation's own date (job created_at in FIELDPULSE_TIMEZONE),
+        # the same day fieldpulse_sync later validates the return date against.
+        ref_day, ref_tz = consultation_reference(job)
+        extraction = extract_consultation(transcript, reference_date=ref_day,
+                                          reference_tz=ref_tz)
 
-        # Store enough for the app's confirmation: extraction, the fieldpulse
-        # write result (customer/job ids, note/subtask ids, match_path,
-        # flags, fieldpulse_url), how long transcription took, and the full
-        # transcript itself so the Confirmation screen (and reopening a
-        # completed job from the Recent list) can show it without any
-        # secondary fetch. Deepgram transcripts even for 60-minute consults
-        # sit under ~60KB — trivial for JSONB.
+        # Save first: everything the app (and the stage-3 admin panel) needs
+        # is on the row before FieldPulse is touched.
         summary = {
-            "extraction": result.get("extraction"),
-            "fieldpulse": result.get("fieldpulse"),
-            "transcription_seconds": result.get("transcription_seconds"),
-            "transcript_chars": len(result.get("transcript") or ""),
-            "transcript": result.get("transcript"),
+            "input": "audio" if audio_key else "paste",
+            "extraction": extraction,
+            "transcription_seconds": transcription_seconds,
+            "transcript_chars": len(transcript),
+            "transcript": transcript,
+            "fieldpulse_sync": {"status": "pending"},
         }
-        update_job_status(job_id, "done", result=summary)
-        fp = summary["fieldpulse"] or {}
-        logger.info(
-            "[%s] DONE (match_path=%s customer=%s job=%s fieldpulse_url=%s)",
-            job_id,
-            fp.get("match_path"),
-            fp.get("customer_id"),
-            fp.get("job_id"),
-            fp.get("fieldpulse_url"),
-        )
+        update_job_status(job_id, "processing", result=summary)
 
     except StorageError as exc:
         _fail(job_id, f"R2 download failed: {exc}")
@@ -110,21 +111,33 @@ def process_consultation_job(job_id):
     except ExtractionError as exc:
         _fail(job_id, f"Extraction failed: {exc}")
         raise
-    except ConsultWriterError as exc:
-        # pipeline.run_from_transcript attaches the extraction to the
-        # WriterError, but we don't need it for the failure record — just
-        # a clear message so a human can debug.
-        _fail(job_id, f"FieldPulse write failed: {exc}")
-        raise
     except Exception as exc:  # noqa: BLE001 — job must never stay 'processing'
         _fail(job_id, f"Unexpected {type(exc).__name__}: {exc}")
         raise
     finally:
-        try:
-            os.unlink(tmp_path)
-            logger.info("[%s] cleaned up %s", job_id, tmp_path)
-        except OSError:
-            pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+                logger.info("[%s] cleaned up %s", job_id, tmp_path)
+            except OSError:
+                pass
+
+    # FieldPulse never fails the consultation (sync_consultation doesn't raise;
+    # the guard below is belt and braces).
+    try:
+        sync = sync_consultation(job, extraction)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[%s] sync_consultation raised", job_id)
+        sync = {"status": "failed", "message": "FieldPulse sync hit an internal error. "
+                "The consultation is saved.", "error": f"{type(exc).__name__}", "steps": []}
+    summary["fieldpulse_sync"] = sync
+
+    try:
+        update_job_status(job_id, "done", result=summary)
+    except Exception as exc:  # noqa: BLE001
+        _fail(job_id, f"Could not save the finished job: {type(exc).__name__}: {exc}")
+        raise
+    logger.info("[%s] DONE (fieldpulse_sync=%s)", job_id, sync.get("status"))
 
 
 def _fail(job_id, message):

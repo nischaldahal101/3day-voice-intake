@@ -7,9 +7,9 @@
 
 const PHASES = {
   uploading:  { title: 'Uploading audio…',     sub: 'Sending the recording straight to secure storage.' },
-  submitting: { title: 'Queuing consultation…', sub: 'Upload done — telling the backend to start.' },
+  submitting: { title: 'Queuing consultation…', sub: 'Telling the backend to start.' },
   queued:     { title: 'Queued for processing', sub: 'Waiting for a worker to pick it up (usually a second or two).' },
-  processing: { title: 'Transcribing & analyzing…', sub: "Deepgram is transcribing, then Claude pulls the structured details out." },
+  processing: { title: 'Transcribing & analyzing…', sub: 'Recordings are transcribed first (pasted text skips this), then Claude pulls the structured details out.' },
 }
 
 export default function Processing({ customer, phase, uploadPct, jobId, onLeave }) {

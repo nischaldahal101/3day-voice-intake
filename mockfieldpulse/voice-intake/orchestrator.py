@@ -323,10 +323,9 @@ def test_with_sample():
 def _run_consultation_pipeline(transcript, customer_id, source, transcription_seconds=None):
     """Extract -> write consultation. Returns (response_dict, http_status_code).
 
-    Delegates the actual extract+write work to pipeline.run_from_transcript
-    (which is also what the async worker uses via pipeline.run_from_audio),
-    so there's one source of truth for the consultation flow. This function
-    just maps stage-specific exceptions to HTTP status codes.
+    DEPRECATED sync path only (the live async flow is worker.py +
+    fieldpulse_sync). Delegates to pipeline.run_from_transcript (mock writer)
+    and maps stage-specific exceptions to HTTP status codes.
     """
     start = time.monotonic()
     logger.info(
@@ -389,9 +388,10 @@ def _handle_consultation(transcript, customer_id, source, transcription_seconds=
 
 @app.post("/process-consultation")
 def process_consultation():
-    """DEPRECATED — synchronous consultation endpoint. Kept working until
-    the app is rewired to the async flow below (upload-url / submit /
-    job-status). Prefer the async flow for new callers.
+    """DEPRECATED — synchronous consultation endpoint. The app no longer
+    calls it (paste now goes through /consultation/submit with a
+    `transcript`). Kept server-side until stage 6; it still writes to the
+    MOCK FieldPulse via pipeline.run_from_transcript, never to real FieldPulse.
 
     End-to-end consultation: audio file -> transcribe -> extract -> write.
 
@@ -490,7 +490,8 @@ def test_consultation_sample():
 
 
 # --- Async consultation flow (direct-to-R2 upload) -------------------------
-# Replaces /process-consultation. The app calls these three in order:
+# Replaces /process-consultation. The app calls these in order (paste skips 1-2
+# and sends {"transcript"} to submit):
 #   1. POST /consultation/upload-url   -> get a presigned R2 PUT URL + audio_key
 #   2. (browser PUTs the audio directly to R2 — bypasses the orchestrator)
 #   3. POST /consultation/submit       -> creates the job + enqueues; returns
@@ -563,6 +564,10 @@ def _parse_customer_identity(raw, customer_id):
 
 
 _AUDIO_KEY_RE = re.compile(r"^consultations/[A-Za-z0-9\-]+\.[A-Za-z0-9]{1,10}$")
+# Pasted transcripts (paste path of /consultation/submit). A 2-hour
+# consultation is roughly 120-150k characters; 400k leaves headroom.
+_MIN_TRANSCRIPT_CHARS = 20
+_MAX_TRANSCRIPT_CHARS = 400_000
 
 
 def _is_allowed_content_type(ct):
@@ -623,27 +628,51 @@ def consultation_upload_url():
 
 @app.post("/consultation/submit")
 def consultation_submit():
-    """Step 2 of the async flow. Body:
-        { "audio_key": "consultations/...", "customer_id"?: "...", "source"?: "...",
+    """Step 2 of the async flow. Body, with EXACTLY ONE input:
+        { "audio_key": "consultations/..."      (recorded/uploaded audio in R2)
+          | "transcript": "..."                  (pasted text; worker skips transcription),
+          "customer_id"?: "...", "source"?: "...",
           "customer"?: {id, display_name, first_name, last_name, phone, email} }
 
-    Verifies the R2 object actually exists (means the client PUT succeeded),
+    Audio: verifies the R2 object exists (the client PUT succeeded). Then
     creates a consultation_jobs row, enqueues it for the worker, and returns
-    { "job_id", "status": "queued" } with HTTP 202.
+    { "job_id", "status": "queued" } with HTTP 202. No extraction or
+    FieldPulse work happens here.
     """
     body = request.get_json(silent=True) or {}
-    audio_key = (body.get("audio_key") or "").strip()
+    raw_key = body.get("audio_key")
+    audio_key = raw_key.strip() if isinstance(raw_key, str) else ""
+    raw_transcript = body.get("transcript")
     customer_id, customer_id_error = _parse_customer_id(body.get("customer_id"))
-    source = (body.get("source") or "3day-app").strip() or "3day-app"
+    raw_source = body.get("source")
+    source = (raw_source.strip() if isinstance(raw_source, str) else "")[:64] or "3day-app"
     customer, customer_error = (None, None)
     if not customer_id_error:
         customer, customer_error = _parse_customer_identity(body.get("customer"), customer_id)
 
-    if not audio_key:
-        return _bad_request("'audio_key' is required")
-    if not _AUDIO_KEY_RE.match(audio_key):
+    transcript = None
+    if raw_transcript is not None:
+        if audio_key:
+            return _bad_request("Send either 'audio_key' or 'transcript', not both")
+        if not isinstance(raw_transcript, str) or not raw_transcript.strip():
+            return _bad_request("'transcript' must be a non-empty string")
+        transcript = raw_transcript.strip()
+        if len(transcript) < _MIN_TRANSCRIPT_CHARS:
+            return _bad_request(
+                f"'transcript' is too short ({len(transcript)} characters; "
+                f"need at least {_MIN_TRANSCRIPT_CHARS})"
+            )
+        if len(transcript) > _MAX_TRANSCRIPT_CHARS:
+            return _bad_request(
+                f"'transcript' is too long ({len(transcript):,} characters; "
+                f"max {_MAX_TRANSCRIPT_CHARS:,}, about 4 hours of talk)",
+                code=413,
+            )
+    elif not audio_key:
+        return _bad_request("'audio_key' or 'transcript' is required")
+    elif not _AUDIO_KEY_RE.match(audio_key):
         return _bad_request(
-            f"audio_key '{audio_key}' has invalid format "
+            f"audio_key '{audio_key[:80]}' has invalid format "
             f"(expected consultations/<uuid>.<ext>)"
         )
     if customer_id_error:
@@ -651,26 +680,29 @@ def consultation_submit():
     if customer_error:
         return _bad_request(customer_error)
 
-    try:
-        exists = audio_exists(audio_key)
-    except StorageError as exc:
-        logger.error("Failed to verify R2 key: %s", exc)
-        return jsonify({"error": f"Could not verify R2 upload: {exc}"}), 502
+    if audio_key:
+        try:
+            exists = audio_exists(audio_key)
+        except StorageError as exc:
+            logger.error("Failed to verify R2 key: %s", exc)
+            return jsonify({"error": f"Could not verify R2 upload: {exc}"}), 502
 
-    if not exists:
-        return _bad_request(
-            f"audio_key '{audio_key}' does not exist in R2 — the upload may "
-            f"have failed. Request a fresh upload URL and try again.",
-            code=404,
-        )
+        if not exists:
+            return _bad_request(
+                f"audio_key '{audio_key}' does not exist in R2 — the upload may "
+                f"have failed. Request a fresh upload URL and try again.",
+                code=404,
+            )
 
     job = create_job(
-        audio_key=audio_key, customer_id=customer_id, source=source, customer=customer
+        audio_key=audio_key or None, transcript=transcript,
+        customer_id=customer_id, source=source, customer=customer,
     )
     enqueue_consultation(job["id"])
     logger.info(
-        "Enqueued consultation job %s (audio_key=%s customer_id=%s source=%s)",
-        job["id"], audio_key, customer_id or "—", source,
+        "Enqueued consultation job %s (input=%s customer_id=%s source=%s)",
+        job["id"], "audio" if audio_key else f"paste {len(transcript)} chars",
+        customer_id or "—", source,
     )
     return jsonify({
         "job_id": job["id"],
@@ -743,10 +775,10 @@ if __name__ == "__main__":
     print(f"    GET  /health                    (no auth)")
     print(f"    POST /process-transcript        (Clerk-protected — JSON)")
     print(f"    POST /test-with-sample          (Clerk-protected — smoke test)")
-    print(f"    POST /process-consultation      (Clerk-protected — audio or JSON)")
+    print(f"    POST /process-consultation      (Clerk-protected — DEPRECATED, mock only)")
     print(f"    POST /test-consultation-sample  (Clerk-protected — smoke test)")
     print(f"    POST /consultation/upload-url   (Clerk-protected — presigned R2)")
-    print(f"    POST /consultation/submit       (Clerk-protected — enqueue job)")
+    print(f"    POST /consultation/submit       (Clerk-protected — enqueue audio or paste job)")
     print(f"    GET  /job-status/<job_id>       (Clerk-protected — poll)")
     print(f"    GET  /jobs/recent               (Clerk-protected — history)")
     print(f"    GET  /app/customers             (Clerk-protected — picker list)")
