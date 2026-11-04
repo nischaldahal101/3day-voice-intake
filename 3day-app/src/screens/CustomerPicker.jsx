@@ -1,7 +1,22 @@
 import { useEffect, useMemo, useState } from 'react'
 import { fetchCustomers } from '../lib/api.js'
 
-export default function CustomerPicker({ onBack, onSelect, onAddNew }) {
+const DATE_FORMAT = { month: 'short', day: 'numeric', year: 'numeric' }
+
+// "Added Nov 3, 2026" from the server's created_at; null if missing/bad.
+// A date-only value ("2026-11-03") is a calendar date: build it as a local
+// date so it never shifts a day. A full timestamp is shown in local time.
+function addedLabel(createdAt) {
+  if (typeof createdAt !== 'string' || !createdAt) return null
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(createdAt)
+  const d = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(createdAt)
+  if (Number.isNaN(d.getTime())) return null
+  return `Added ${d.toLocaleDateString(undefined, DATE_FORMAT)}`
+}
+
+// Read-only picker. The list keeps the server's order (newest added first);
+// search only filters it. Customers are created in FieldPulse, not here.
+export default function CustomerPicker({ onBack, onSelect }) {
   const [customers, setCustomers] = useState(null) // null = loading
   const [error, setError] = useState(null)
   const [query, setQuery] = useState('')
@@ -62,14 +77,6 @@ export default function CustomerPicker({ onBack, onSelect, onAddNew }) {
           autoCapitalize="words"
           autoCorrect="off"
         />
-        <button
-          type="button"
-          className="add-customer-cta"
-          onClick={onAddNew}
-        >
-          <span className="add-customer-plus" aria-hidden>+</span>
-          <span>Add new customer</span>
-        </button>
       </div>
       <div className="list-wrap">
         {customers === null && !error && (
@@ -89,22 +96,23 @@ export default function CustomerPicker({ onBack, onSelect, onAddNew }) {
         {customers && filtered.length === 0 && !error && (
           <div className="state empty">
             <p className="empty-msg">
-              No customers match &ldquo;{query}&rdquo;
+              {customers.length === 0
+                ? 'No customers yet.'
+                : <>No customers match &ldquo;{query}&rdquo;.</>}
+              {' '}Customers are added in FieldPulse.
             </p>
-            <button className="btn btn-tertiary" onClick={onAddNew}>
-              + Add a new customer
-            </button>
           </div>
         )}
         {customers && filtered.length > 0 && (
           <ul className="customer-list">
             {filtered.map((c) => {
+              const added = addedLabel(c.created_at)
               const name =
                 c.display_name ||
                 `${c.first_name || ''} ${c.last_name || ''}`.trim() ||
                 '(unnamed)'
               return (
-                <li key={c.id}>
+                <li key={String(c.id)}>
                   <button
                     className="customer-row"
                     onClick={() => onSelect(c)}
@@ -114,6 +122,8 @@ export default function CustomerPicker({ onBack, onSelect, onAddNew }) {
                       {c.phone || '—'}
                       {c.email ? <span className="dot">·</span> : null}
                       {c.email || ''}
+                      {added ? <span className="dot">·</span> : null}
+                      {added || ''}
                     </span>
                   </button>
                 </li>

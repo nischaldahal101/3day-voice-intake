@@ -73,6 +73,7 @@ def process_consultation_job(job_id):
         logger.info("[%s] running pipeline (transcribe + extract + write)", job_id)
         result = run_from_audio(
             tmp_path, customer_id=customer_id, source=source,
+            customer=job.get("customer"),
         )
 
         # Store enough for the app's confirmation: extraction, the fieldpulse

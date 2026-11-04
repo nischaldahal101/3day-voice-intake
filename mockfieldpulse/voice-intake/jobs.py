@@ -82,18 +82,44 @@ CREATE INDEX IF NOT EXISTS idx_consultation_jobs_status
     ON consultation_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_consultation_jobs_created_at
     ON consultation_jobs(created_at DESC);
+-- Additive (prod already has the table): the customer the rep picked, as
+-- {id, display_name, first_name, last_name, phone, email}. NULL for older rows.
+ALTER TABLE consultation_jobs ADD COLUMN IF NOT EXISTS customer JSONB;
+-- External customer id (e.g. a real FieldPulse id from the picker) -> the
+-- mock FieldPulse customer the writer uses for it, so a repeat consultation
+-- reuses the same mock customer and nothing is matched by name.
+CREATE TABLE IF NOT EXISTS customer_links (
+    source            TEXT NOT NULL,
+    external_id       TEXT NOT NULL,
+    mock_customer_id  TEXT NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, external_id)
+);
 """
+
+
+# Fixed key for pg_advisory_xact_lock: serializes schema bootstrap across
+# processes. Without it, the orchestrator and the worker booting at the same
+# moment deadlock (both take ShareLock via CREATE INDEX IF NOT EXISTS, then
+# both want AccessExclusiveLock for the ALTER), even when nothing needs
+# migrating (review-log F-22).
+_SCHEMA_LOCK_KEY = 0x3D_4B_10B5  # arbitrary constant, only used here
 
 
 def _bootstrap():
     """Open the pool and ensure the schema exists. Runs once on import so
     the orchestrator, the RQ worker, and the test script all see the
-    table immediately."""
+    table immediately. The advisory lock is the transaction's FIRST
+    statement, in its own execute, so a process that waits for it runs the
+    DDL only after the other process has committed. It is released
+    automatically on commit/rollback."""
     pool.open()
     pool.wait()
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", [_SCHEMA_LOCK_KEY])
                 cur.execute(_SCHEMA_SQL)
             conn.commit()
     except Exception:
@@ -121,6 +147,7 @@ def _serialize_job(row):
         "id": row["id"],
         "status": row["status"],
         "customer_id": row["customer_id"],
+        "customer": row.get("customer"),
         "audio_key": row["audio_key"],
         "source": row["source"],
         "result": row["result"],
@@ -132,18 +159,23 @@ def _serialize_job(row):
 
 # --- Public API ------------------------------------------------------------
 
-def create_job(audio_key: str, customer_id: str = None, source: str = None) -> dict:
-    """Insert a new job with status='queued'. Returns the serialized record."""
+def create_job(
+    audio_key: str, customer_id: str = None, source: str = None, customer: dict = None
+) -> dict:
+    """Insert a new job with status='queued'. `customer` is the selected
+    customer's identity snapshot (or None). Returns the serialized record."""
     new_id = f"job_{uuid.uuid4().hex[:12]}"
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO consultation_jobs (id, status, customer_id, audio_key, source)
-                VALUES (%s, 'queued', %s, %s, %s)
+                INSERT INTO consultation_jobs
+                    (id, status, customer_id, customer, audio_key, source)
+                VALUES (%s, 'queued', %s, %s, %s, %s)
                 RETURNING *
                 """,
-                [new_id, customer_id, audio_key, source],
+                [new_id, customer_id, Jsonb(customer) if customer is not None else None,
+                 audio_key, source],
             )
             row = cur.fetchone()
         conn.commit()
@@ -239,3 +271,51 @@ def update_job_status(
     job = _serialize_job(row)
     logger.info("Updated job %s: status=%s", job_id, status)
     return job
+
+
+# --- External customer -> mock customer links ------------------------------
+
+def get_customer_link(source: str, external_id: str) -> str | None:
+    """The mock customer id linked to (source, external_id), or None."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT mock_customer_id FROM customer_links "
+            "WHERE source = %s AND external_id = %s",
+            [source, str(external_id)],
+        )
+        row = cur.fetchone()
+    return row["mock_customer_id"] if row else None
+
+
+def save_customer_link(
+    source: str, external_id: str, mock_customer_id: str, replace: str = None
+) -> str:
+    """Link (source, external_id) -> mock_customer_id and return the mock id
+    that is linked afterwards. An existing link is kept (so a concurrent job
+    that linked first wins), unless it equals `replace` (a stale link whose
+    mock customer no longer exists)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO customer_links (source, external_id, mock_customer_id)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (source, external_id) DO UPDATE
+                   SET mock_customer_id = EXCLUDED.mock_customer_id, updated_at = now()
+                 WHERE customer_links.mock_customer_id = %s
+                RETURNING mock_customer_id
+                """,
+                [source, str(external_id), mock_customer_id, replace],
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    "SELECT mock_customer_id FROM customer_links "
+                    "WHERE source = %s AND external_id = %s",
+                    [source, str(external_id)],
+                )
+                row = cur.fetchone()
+        conn.commit()
+    linked = row["mock_customer_id"]
+    logger.info("Customer link %s:%s -> %s", source, external_id, linked)
+    return linked

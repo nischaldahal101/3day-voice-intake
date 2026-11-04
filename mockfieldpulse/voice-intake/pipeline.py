@@ -31,8 +31,11 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def run_from_transcript(transcript, customer_id=None, source=None):
+def run_from_transcript(transcript, customer_id=None, source=None, customer=None):
     """Extract structured consultation data and write it to FieldPulse.
+
+    `customer` is the selected customer's identity snapshot (or None); the
+    writer uses it only to create/link a mock customer for an external id.
 
     Returns {"transcript", "extraction", "fieldpulse"}.
     Raises ExtractionError (from extract_consultation) or WriterError (from
@@ -55,6 +58,7 @@ def run_from_transcript(transcript, customer_id=None, source=None):
             extraction,
             customer_id=customer_id,
             original_transcript=transcript,
+            customer=customer,
         )
     except WriterError as exc:
         # Preserve Claude's output for callers that want to display it on failure.
@@ -74,7 +78,7 @@ def run_from_transcript(transcript, customer_id=None, source=None):
     }
 
 
-def run_from_audio(audio_path, customer_id=None, source=None):
+def run_from_audio(audio_path, customer_id=None, source=None, customer=None):
     """Transcribe audio, then extract + write.
 
     Returns {"transcript", "transcription_seconds", "extraction", "fieldpulse"}.
@@ -92,7 +96,7 @@ def run_from_audio(audio_path, customer_id=None, source=None):
         raise TranscriptionError("Transcription returned an empty transcript")
 
     result = run_from_transcript(
-        transcript, customer_id=customer_id, source=source
+        transcript, customer_id=customer_id, source=source, customer=customer
     )
     result["transcription_seconds"] = duration
     return result

@@ -58,7 +58,14 @@ mock service over HTTPS once deployed.
 | `DEEPGRAM_API_KEY` | Deepgram API key for `transcriber.py`. |
 | `FIELDPULSE_BASE_URL` | **Set this to the deployed mock's Render URL** (e.g. `https://mock-fieldpulse.onrender.com`). Locally it defaults to `http://localhost:5000`. |
 | `FIELDPULSE_API_KEY` | Any non-empty string; the mock just checks for the header's presence. Default `dev-test-key-12345` works. |
+| `FIELDPULSE_READ_BASE_URL` | *Optional.* Real FieldPulse base URL (`https://ywe3crmpll.execute-api.us-east-2.amazonaws.com/stage`, see `docs/FIELDPULSE_API.md` §1). Used **only** by `customer_source.py` to list customers for the picker, GET only. Unset = the picker reads the mock (`FIELDPULSE_BASE_URL`). Set it together with the key below, or the picker returns a 500 config error. **Orchestrator only; never set it on the worker.** Run `probe_fieldpulse_customers.py` once before relying on it. |
+| `FIELDPULSE_READ_API_KEY` | *Optional.* Mike's real FieldPulse API key for the read above. Secret. Never put it in `FIELDPULSE_API_KEY` (that one is for writes to the mock). |
 | `INTAKE_API_KEY` | The shared secret the React app sends as `x-intake-key`. Pick a real value here when going to production; locally defaults to `dev-intake-key`. |
+
+> **Schema (automatic, additive):** on boot, `jobs.py` runs
+> `ALTER TABLE consultation_jobs ADD COLUMN IF NOT EXISTS customer JSONB` and
+> `CREATE TABLE IF NOT EXISTS customer_links (...)` (real FieldPulse id -> mock customer id).
+> Existing rows are untouched (`customer` is NULL for them). No manual migration step.
 
 > **Deploy the mock first**, copy its `https://...onrender.com` URL into the
 > orchestrator's `FIELDPULSE_BASE_URL`, then deploy the orchestrator.

@@ -80,29 +80,54 @@ async function assertOk(resp, opName) {
 
 // -------------------- Customers --------------------
 
+const CUSTOMER_TEXT_FIELDS = ['display_name', 'first_name', 'last_name', 'phone', 'email', 'created_at']
+
+// String or null, so a bad field from the server can never reach React as an
+// object child. Numbers become strings.
+function textOrNull(v) {
+  if (typeof v === 'string') return v.trim() || null
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+  return null
+}
+
+function normalizeCustomer(c) {
+  const ok = c && typeof c === 'object' &&
+    ((typeof c.id === 'string' && c.id.trim()) || (typeof c.id === 'number' && Number.isFinite(c.id)))
+  if (!ok) throw new Error("Couldn't load customers: the server sent a customer without a usable id.")
+  const out = { id: c.id }
+  for (const f of CUSTOMER_TEXT_FIELDS) out[f] = textOrNull(c[f])
+  return out
+}
+
+// Read-only. Returns customers in the order the server sends them (newest
+// added first), each as {id, display_name, first_name, last_name, phone,
+// email, created_at} with every non-id field a string or null. Customers are
+// created in FieldPulse, never from this app.
 export async function fetchCustomers() {
   const resp = await fetch(`${API_BASE}/app/customers`, {
     headers: await authHeaders(),
   })
   await assertOk(resp, "Couldn't load customers")
   const data = await resp.json()
-  return data.customers || []
+  // Don't turn a malformed body into an empty list (review-log D-1).
+  if (!data || !Array.isArray(data.customers)) {
+    throw new Error("Couldn't load customers: the server sent an unexpected response.")
+  }
+  return data.customers.map(normalizeCustomer)
 }
 
-export async function createCustomer({ first_name, last_name, phone, email }) {
-  const resp = await fetch(`${API_BASE}/app/customers`, {
-    method: 'POST',
-    headers: await authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({
-      first_name,
-      last_name,
-      phone,
-      email: email && email.trim() ? email.trim() : null,
-    }),
-  })
-  await assertOk(resp, "Couldn't create customer")
-  const data = await resp.json().catch(() => ({}))
-  return data.customer
+// The selected customer's identity, sent with submit so the worker can
+// create/link a mock customer for a real FieldPulse id (never by name).
+function customerIdentity(customer) {
+  if (!customer || customer.id === undefined || customer.id === null) return null
+  return {
+    id: customer.id,
+    display_name: textOrNull(customer.display_name),
+    first_name: textOrNull(customer.first_name),
+    last_name: textOrNull(customer.last_name),
+    phone: textOrNull(customer.phone),
+    email: textOrNull(customer.email),
+  }
 }
 
 // -------------------- Async consultation flow --------------------
@@ -170,13 +195,16 @@ export function putToR2(uploadUrl, blob, contentType, onProgress) {
   })
 }
 
-export async function submitConsultationJob({ audioKey, customerId, source }) {
+// `customer` is the picker's selected customer object (or null).
+export async function submitConsultationJob({ audioKey, customer, source }) {
+  const identity = customerIdentity(customer)
   const resp = await fetch(`${API_BASE}/consultation/submit`, {
     method: 'POST',
     headers: await authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       audio_key: audioKey,
-      customer_id: customerId || null,
+      customer_id: identity ? identity.id : null,
+      customer: identity,
       source: source || '3day-app',
     }),
   })

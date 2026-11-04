@@ -14,13 +14,13 @@ import tempfile
 import time
 from pathlib import Path
 
-import requests
 from clerk_backend_api import AuthenticateRequestOptions, Clerk
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from consultation_writer import WriterError as ConsultWriterError
+from customer_source import CustomerSourceError, list_customers
 from extractor import ExtractionError, extract_intake
 from fieldpulse_writer import WriterError, write_intake_to_fieldpulse
 from jobs import create_job, get_job, list_recent_jobs
@@ -50,7 +50,7 @@ PORT = int(os.environ.get("PORT", 5100))
 #
 # Endpoints that must have this on:
 #   /consultation/upload-url, /consultation/submit, /job-status/<id>,
-#   /jobs/recent, /app/customers (GET+POST), /process-consultation.
+#   /jobs/recent, /app/customers (GET only), /process-consultation.
 # Public: /health only.
 #
 # We used to require x-intake-key on every request. That's retired here —
@@ -414,7 +414,9 @@ def process_consultation():
                 "status": "bad_request",
                 "error": "multipart request must include 'audio' file",
             }), 400
-        customer_id = (request.form.get("customer_id") or "").strip() or None
+        customer_id, customer_id_error = _parse_customer_id(request.form.get("customer_id"))
+        if customer_id_error:
+            return jsonify({"status": "bad_request", "error": customer_id_error}), 400
         source = (request.form.get("source") or "").strip() or None
 
         # Save to temp, transcribe, then clean up — guaranteed via try/finally.
@@ -463,7 +465,9 @@ def process_consultation():
     else:
         body = request.get_json(silent=True) or {}
         transcript = body.get("transcript")
-        customer_id = (body.get("customer_id") or "").strip() or None if isinstance(body.get("customer_id"), str) else body.get("customer_id")
+        customer_id, customer_id_error = _parse_customer_id(body.get("customer_id"))
+        if customer_id_error:
+            return jsonify({"status": "bad_request", "error": customer_id_error}), 400
         source = body.get("source")
         if not isinstance(transcript, str) or not transcript.strip():
             return jsonify({
@@ -496,7 +500,68 @@ def test_consultation_sample():
 # Anything under audio/* is accepted; `video/webm` is included because
 # browser MediaRecorder often labels audio-only WebM as video/webm.
 _ALLOWED_CONTENT_TYPE_EXTRAS = {"video/webm"}
-_CUSTOMER_ID_RE = re.compile(r"^cust_[A-Za-z0-9]+$")
+# Mock ids look like "cust_ab12cd34"; real FieldPulse ids are integers (they
+# reach us as JSON numbers from the picker, or as digit strings).
+_CUSTOMER_ID_RE = re.compile(r"^(cust_[A-Za-z0-9]+|[0-9]{1,20})$")
+
+
+def _parse_customer_id(raw):
+    """(customer_id_str_or_None, error_message_or_None). Accepts a mock
+    "cust_..." id, a real integer id, or nothing. Stored as TEXT."""
+    if raw is None or raw == "":
+        return None, None
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None, "customer_id must be a string or an integer"
+    value = str(raw).strip()
+    if not value:
+        return None, None
+    if not _CUSTOMER_ID_RE.match(value):
+        return None, (
+            f"customer_id '{value[:40]}' has invalid format "
+            f"(expected cust_... or a numeric FieldPulse id)"
+        )
+    return value, None
+
+
+_IDENTITY_FIELDS = ("display_name", "first_name", "last_name", "phone", "email")
+
+
+def _identity_text(v):
+    """str (trimmed, max 200 chars) or None. Numbers -> str; anything else -> None."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        v = str(v)
+    if not isinstance(v, str):
+        return None
+    v = v.strip()[:200]
+    return v or None
+
+
+def _parse_customer_identity(raw, customer_id):
+    """(identity_dict_or_None, error_message_or_None). The picker's selected
+    customer, stored on the job so the worker can create/link a mock customer
+    for a real FieldPulse id without guessing by name. Its id must be the
+    same customer_id the request sends.
+
+    UNVERIFIED client input (review-log F-24): the id check is a consistency
+    check, not authentication of the names/phone/email. Any signed-in user
+    can submit any fields for an id. Acceptable mid-trial (only Clerk-signed-in
+    Mike/Nischal, and it only shapes the MOCK customer the writer creates).
+    Deferred: server-verified identity and a link-correction path, required
+    before multi-tenant or before writing to real FieldPulse."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "customer must be an object"
+    ident_id, err = _parse_customer_id(raw.get("id"))
+    if err or ident_id is None or ident_id != customer_id:
+        return None, "customer.id must match customer_id"
+    identity = {"id": ident_id}
+    identity.update({f: _identity_text(raw.get(f)) for f in _IDENTITY_FIELDS})
+    return identity, None
+
+
 _AUDIO_KEY_RE = re.compile(r"^consultations/[A-Za-z0-9\-]+\.[A-Za-z0-9]{1,10}$")
 
 
@@ -515,7 +580,7 @@ def _bad_request(message, code=400):
 @app.post("/consultation/upload-url")
 def consultation_upload_url():
     """Step 1 of the async flow. Body:
-        { "filename": "...", "content_type": "audio/...", "customer_id"?: "cust_..." }
+        { "filename": "...", "content_type": "audio/...", "customer_id"?: "cust_..." | 12345 }
 
     Returns { "upload_url", "audio_key" }. The app then PUTs the audio
     directly to `upload_url`, sending the SAME `Content-Type` header it
@@ -525,7 +590,7 @@ def consultation_upload_url():
     body = request.get_json(silent=True) or {}
     filename = (body.get("filename") or "").strip()
     content_type = (body.get("content_type") or "").strip()
-    customer_id = (body.get("customer_id") or "").strip() or None
+    customer_id, customer_id_error = _parse_customer_id(body.get("customer_id"))
 
     if not filename:
         return _bad_request("'filename' is required")
@@ -536,10 +601,8 @@ def consultation_upload_url():
             f"content_type '{content_type}' is not an allowed audio type "
             f"(accepted: audio/*, video/webm)"
         )
-    if customer_id and not _CUSTOMER_ID_RE.match(customer_id):
-        return _bad_request(
-            f"customer_id '{customer_id}' has invalid format (expected cust_...)"
-        )
+    if customer_id_error:
+        return _bad_request(customer_id_error)
 
     try:
         audio_key = generate_consultation_key(filename)
@@ -561,7 +624,8 @@ def consultation_upload_url():
 @app.post("/consultation/submit")
 def consultation_submit():
     """Step 2 of the async flow. Body:
-        { "audio_key": "consultations/...", "customer_id"?: "...", "source"?: "..." }
+        { "audio_key": "consultations/...", "customer_id"?: "...", "source"?: "...",
+          "customer"?: {id, display_name, first_name, last_name, phone, email} }
 
     Verifies the R2 object actually exists (means the client PUT succeeded),
     creates a consultation_jobs row, enqueues it for the worker, and returns
@@ -569,8 +633,11 @@ def consultation_submit():
     """
     body = request.get_json(silent=True) or {}
     audio_key = (body.get("audio_key") or "").strip()
-    customer_id = (body.get("customer_id") or "").strip() or None
+    customer_id, customer_id_error = _parse_customer_id(body.get("customer_id"))
     source = (body.get("source") or "3day-app").strip() or "3day-app"
+    customer, customer_error = (None, None)
+    if not customer_id_error:
+        customer, customer_error = _parse_customer_identity(body.get("customer"), customer_id)
 
     if not audio_key:
         return _bad_request("'audio_key' is required")
@@ -579,10 +646,10 @@ def consultation_submit():
             f"audio_key '{audio_key}' has invalid format "
             f"(expected consultations/<uuid>.<ext>)"
         )
-    if customer_id and not _CUSTOMER_ID_RE.match(customer_id):
-        return _bad_request(
-            f"customer_id '{customer_id}' has invalid format (expected cust_...)"
-        )
+    if customer_id_error:
+        return _bad_request(customer_id_error)
+    if customer_error:
+        return _bad_request(customer_error)
 
     try:
         exists = audio_exists(audio_key)
@@ -598,7 +665,7 @@ def consultation_submit():
         )
 
     job = create_job(
-        audio_key=audio_key, customer_id=customer_id, source=source
+        audio_key=audio_key, customer_id=customer_id, source=source, customer=customer
     )
     enqueue_consultation(job["id"])
     logger.info(
@@ -649,175 +716,19 @@ def consultation_job_status(job_id):
 
 @app.get("/app/customers")
 def app_customers():
-    """Return a simplified customer list for the app's picker UI.
+    """Customer list for the app's picker, newest-added first.
 
-    Proxies GET /customers on the configured FieldPulse instance (using the
-    base URL + API key from .env — same as the writers use) and returns just
-    the fields the picker needs. Pages through results so the app gets all
-    customers in one response.
+    Read-only. customer_source.list_customers() reads real FieldPulse when
+    FIELDPULSE_READ_* is set, otherwise the mock. Customers are created in
+    FieldPulse, never by this app (there is no POST route).
     """
-    base = os.environ.get("FIELDPULSE_BASE_URL", "http://localhost:5000").rstrip("/")
-    key = os.environ.get("FIELDPULSE_API_KEY", "dev-test-key-12345")
-
-    customers = []
-    page = 1
     try:
-        while True:
-            # 60s timeout + single retry on Timeout — handles the Render
-            # free-tier cold-start case where the first call takes 30–60s
-            # to wake the mock service. In practice the retry only fires
-            # on page 1; once the mock is warm, subsequent pages are fast.
-            try:
-                resp = requests.get(
-                    f"{base}/customers",
-                    headers={"x-api-key": key},
-                    params={"page": page, "per_page": 200},
-                    timeout=60,
-                )
-            except requests.Timeout:
-                logger.warning(
-                    "FieldPulse /customers timed out — retrying once after brief sleep"
-                )
-                time.sleep(1)
-                resp = requests.get(
-                    f"{base}/customers",
-                    headers={"x-api-key": key},
-                    params={"page": page, "per_page": 200},
-                    timeout=60,
-                )
-            if resp.status_code != 200:
-                logger.error(
-                    "FieldPulse /customers returned %d: %s",
-                    resp.status_code, resp.text[:200],
-                )
-                return jsonify({
-                    "status": "fieldpulse_error",
-                    "error": f"FieldPulse returned HTTP {resp.status_code}",
-                    "detail": resp.text[:300],
-                }), 502
-            payload = resp.json()
-            batch = payload.get("data") or []
-            customers.extend(batch)
-            meta = payload.get("meta") or {}
-            total_pages = meta.get("total_pages") or 1
-            if page >= total_pages or not batch:
-                break
-            page += 1
-    except requests.RequestException as exc:
-        logger.error("FieldPulse unreachable at %s: %s", base, exc)
-        return jsonify({
-            "status": "fieldpulse_unreachable",
-            "error": f"Could not reach FieldPulse at {base}: {exc}",
-        }), 502
-    except ValueError as exc:
-        logger.error("FieldPulse returned non-JSON: %s", exc)
-        return jsonify({
-            "status": "fieldpulse_error",
-            "error": f"FieldPulse returned non-JSON body: {exc}",
-        }), 502
-
-    simplified = [
-        {
-            "id": c.get("id"),
-            "display_name": c.get("display_name"),
-            "first_name": c.get("first_name"),
-            "last_name": c.get("last_name"),
-            "phone": c.get("phone"),
-            "email": c.get("email"),
-        }
-        for c in customers
-    ]
-    logger.info("/app/customers -> %d customers", len(simplified))
-    return jsonify({"customers": simplified})
-
-
-@app.post("/app/customers")
-def app_create_customer():
-    """Create a customer on the configured FieldPulse instance.
-
-    Accepts JSON {first_name, last_name, phone?, email?}. Builds
-    display_name = "{last_name}, {first_name}" to match how the rest of the
-    system formats names. Returns the simplified customer the same way
-    GET /app/customers does — wrapped under a singular 'customer' key.
-    """
-    body = request.get_json(silent=True) or {}
-    first_name = (body.get("first_name") or "").strip()
-    last_name = (body.get("last_name") or "").strip()
-    phone = (body.get("phone") or "").strip() or None
-    email = (body.get("email") or "").strip() or None
-
-    if not first_name or not last_name:
-        return jsonify({
-            "status": "bad_request",
-            "error": "Request must include non-empty 'first_name' and 'last_name'",
-        }), 400
-
-    display_name = f"{last_name}, {first_name}"
-    base = os.environ.get("FIELDPULSE_BASE_URL", "http://localhost:5000").rstrip("/")
-    key = os.environ.get("FIELDPULSE_API_KEY", "dev-test-key-12345")
-
-    body_out = {
-        "display_name": display_name,
-        "first_name": first_name,
-        "last_name": last_name,
-        "phone": phone,
-        "email": email,
-    }
-
-    try:
-        resp = requests.post(
-            f"{base}/customers",
-            headers={"x-api-key": key},
-            json=body_out,
-            # 60s for cold-start tolerance. No retry on this POST because
-            # the mock could create a customer on the first attempt even
-            # if the response is slow; retrying would risk a duplicate.
-            timeout=60,
-        )
-        if resp.status_code not in (200, 201):
-            logger.error(
-                "FieldPulse POST /customers returned %d: %s",
-                resp.status_code, resp.text[:200],
-            )
-            return jsonify({
-                "status": "fieldpulse_error",
-                "error": f"FieldPulse returned HTTP {resp.status_code}",
-                "detail": resp.text[:300],
-            }), 502
-        payload = resp.json()
-    except requests.RequestException as exc:
-        logger.error("FieldPulse unreachable at %s: %s", base, exc)
-        return jsonify({
-            "status": "fieldpulse_unreachable",
-            "error": f"Could not reach FieldPulse at {base}: {exc}",
-        }), 502
-    except ValueError as exc:
-        logger.error("FieldPulse returned non-JSON: %s", exc)
-        return jsonify({
-            "status": "fieldpulse_error",
-            "error": f"FieldPulse returned non-JSON body: {exc}",
-        }), 502
-
-    cust = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(cust, dict) or not cust.get("id"):
-        logger.error("FieldPulse create-customer response missing data.id: %s", payload)
-        return jsonify({
-            "status": "fieldpulse_error",
-            "error": "FieldPulse response missing data.id",
-        }), 502
-
-    simplified = {
-        "id": cust.get("id"),
-        "display_name": cust.get("display_name"),
-        "first_name": cust.get("first_name"),
-        "last_name": cust.get("last_name"),
-        "phone": cust.get("phone"),
-        "email": cust.get("email"),
-    }
-    logger.info(
-        "created customer %s (%s)", simplified["id"], simplified["display_name"]
-    )
-    return jsonify({"customer": simplified}), 201
+        customers = list_customers()
+    except CustomerSourceError as exc:
+        logger.error("/app/customers failed (%s): %s", exc.status, exc)
+        return jsonify({"status": exc.status, "error": str(exc)}), exc.http_status
+    logger.info("/app/customers -> %d customers", len(customers))
+    return jsonify({"customers": customers})
 
 
 # --- Startup ----------------------------------------------------------------
@@ -839,7 +750,6 @@ if __name__ == "__main__":
     print(f"    GET  /job-status/<job_id>       (Clerk-protected — poll)")
     print(f"    GET  /jobs/recent               (Clerk-protected — history)")
     print(f"    GET  /app/customers             (Clerk-protected — picker list)")
-    print(f"    POST /app/customers             (Clerk-protected — create)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
     print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
     print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")

@@ -5,6 +5,16 @@ customer + job, this one resolves the right existing customer (by provided id,
 phone, email, or name), finds their job, and PATCHes consultation fields onto
 it — so intake data isn't overwritten. Only creates new records when no match
 exists.
+
+Customer ids from the picker come in two namespaces:
+  - Mock ids ("cust_..."): looked up directly; if missing, the old
+    phone -> email -> name search runs, exactly as before.
+  - External ids (a real FieldPulse id when the picker reads real FieldPulse):
+    the mock can't know them, so they are NEVER matched by phone/email/name.
+    The writer reuses the mock customer linked to that id (jobs.customer_links,
+    our Postgres), or creates a NEW mock customer from the selected identity
+    and records the link. This module only ever talks to FIELDPULSE_BASE_URL
+    (the mock / test env), never the picker's read-only credentials.
 """
 
 import logging
@@ -47,6 +57,8 @@ _SOURCE = "consultation_ai"
 # take 30–60s to wake) has time to respond on the first call after idle.
 _TIMEOUT = 60
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Namespace for picker ids that aren't mock ids (see module docstring).
+_EXTERNAL_SOURCE = "fieldpulse"
 
 
 # --- HTTP helpers -----------------------------------------------------------
@@ -160,21 +172,28 @@ def _match_customer(customers, client):
     return None, []
 
 
-def _create_customer_from_client(client):
-    """Mirror the intake writer's name-split + display_name conventions."""
+def _create_customer_from_client(client, identity=None):
+    """Mirror the intake writer's name-split + display_name conventions.
+    `identity` (the customer the rep selected) wins over extracted values."""
+    identity = identity or {}
     name = (client.get("name") or "").strip()
     if " " in name:
         first, last = name.rsplit(" ", 1)
     else:
         first, last = name, ""
-    display = f"{last}, {first}" if last else (first or "New Customer")
+    if identity.get("first_name") or identity.get("last_name"):
+        first = identity.get("first_name") or ""
+        last = identity.get("last_name") or ""
+    display = identity.get("display_name") or (
+        f"{last}, {first}" if last else (first or "New Customer")
+    )
     address = client.get("address") or {}
     body = {
         "display_name": display,
         "first_name": first,
         "last_name": last,
-        "email": client.get("email"),
-        "phone": client.get("phone"),
+        "email": identity.get("email") or client.get("email"),
+        "phone": identity.get("phone") or client.get("phone"),
         "address": {
             "street": address.get("street") or client.get("street_address"),
             "city": address.get("city") or client.get("city") or client.get("city_or_part_of_town"),
@@ -307,36 +326,110 @@ def _build_return_appointment_subtask(return_appointment):
 
 # --- Public API -------------------------------------------------------------
 
+def _is_mock_id(customer_id):
+    return str(customer_id).startswith("cust_")
+
+
+def _get_mock_customer(customer_id):
+    payload = _get(f"/customers/{customer_id}", allow_404=True)
+    if payload and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return None
+
+
+def _link_store():
+    """(get_customer_link, save_customer_link) from jobs.py. Imported lazily
+    so mock-id flows (and scripts that only import this module) never need
+    Postgres."""
+    try:
+        from jobs import get_customer_link, save_customer_link
+    except Exception as exc:  # noqa: BLE001 — surface as a writer failure
+        raise WriterError(f"customer link store unavailable: {type(exc).__name__}")
+    return get_customer_link, save_customer_link
+
+
+def _resolve_external_customer(external_id, client, identity, flags):
+    """Mock customer for a non-mock (external) id: the linked one if it still
+    exists, else a NEW mock customer from the selected identity, linked.
+    Never searches by phone/email/name. Returns (customer, match_path).
+    `identity` is unverified client input (see orchestrator
+    _parse_customer_identity, F-24): the FIRST snapshot for an id shapes the
+    linked mock customer and later snapshots do not correct it (deferred)."""
+    get_link, save_link = _link_store()
+    try:
+        linked_id = get_link(_EXTERNAL_SOURCE, str(external_id))
+    except Exception as exc:  # noqa: BLE001
+        raise WriterError(f"customer link lookup failed: {type(exc).__name__}")
+    stale = None
+    if linked_id:
+        customer = _get_mock_customer(linked_id)
+        if customer is not None:
+            flags.append(f"matched mock customer {linked_id} linked to selected id {external_id}")
+            logger.info("External id %s -> linked mock customer %s", external_id, linked_id)
+            return customer, "matched_by_link"
+        stale = linked_id
+        flags.append(f"linked mock customer {linked_id} no longer exists — creating a new one")
+
+    if not identity:
+        flags.append("selected customer's details were not sent — new mock customer "
+                     "built from the extraction")
+    customer = _create_customer_from_client(client, identity)
+    try:
+        winner = save_link(_EXTERNAL_SOURCE, str(external_id), customer["id"], replace=stale)
+    except Exception as exc:  # noqa: BLE001
+        raise WriterError(f"customer link save failed: {type(exc).__name__}")
+    if winner != customer["id"]:
+        # A concurrent job linked this id first; use its customer so both
+        # consultations land in one place. Ours stays as an orphan in the mock.
+        other = _get_mock_customer(winner)
+        if other is None:
+            raise WriterError(f"linked mock customer {winner} not found")
+        flags.append(f"another job linked selected id {external_id} first; used {winner} "
+                     f"(orphan mock customer {customer['id']})")
+        return other, "matched_by_link"
+    flags.append(f"created new mock customer for selected id {external_id}")
+    logger.info("External id %s -> new mock customer %s", external_id, customer["id"])
+    return customer, "created_new_for_selected"
+
+
 def write_consultation_to_fieldpulse(
     extraction: dict,
     customer_id: str = None,
     original_transcript: str = None,
+    customer: dict = None,
 ) -> dict:
     """Find or create the right customer + job, then write consultation data to it.
 
-    See module docstring. Raises WriterError only on fatal failures (customer
-    resolution or job PATCH). Note/subtask failures are non-fatal: they go into
+    `customer` is the identity the rep selected in the picker ({id,
+    display_name, first_name, last_name, phone, email}) or None. See module
+    docstring. Raises WriterError only on fatal failures (customer resolution
+    or job PATCH). Note/subtask failures are non-fatal: they go into
     partial_failure and the function returns normally.
     """
     client = extraction.get("client") or {}
+    identity = customer if isinstance(customer, dict) else None
     flags = []
     ambiguous_candidates = None
     match_path = None
     customer = None
 
-    # Step 1 — explicit customer_id (falls through if the id isn't found).
+    # Step 1 — explicit customer_id. A mock id falls through to search if not
+    # found; an external id resolves through the link table, never by search.
     if customer_id:
-        payload = _get(f"/customers/{customer_id}", allow_404=True)
-        if payload and isinstance(payload.get("data"), dict):
-            customer = payload["data"]
+        customer = _get_mock_customer(customer_id)
+        if customer is not None:
             match_path = "matched_by_id"
             flags.append(f"matched existing customer by provided id ({customer_id})")
             logger.info("Customer matched by provided id: %s", customer_id)
+        elif not _is_mock_id(customer_id):
+            customer, match_path = _resolve_external_customer(
+                customer_id, client, identity, flags
+            )
         else:
             flags.append(f"provided customer_id {customer_id} not found — falling back to search")
             logger.warning("Provided customer_id %s not found; falling back to search", customer_id)
 
-    # Step 2 — phone / email / name search.
+    # Step 2 — phone / email / name search (no id, or a mock id not found).
     if customer is None:
         all_customers = _list_all_customers()
         criterion, hits = _match_customer(all_customers, client)
@@ -391,8 +484,13 @@ def write_consultation_to_fieldpulse(
         )
         logger.info("Multiple jobs (%d); using most recent: %s", len(existing_jobs), job["id"])
     else:
+        title_client = client
+        if identity and not (client.get("name") or "").strip():
+            title_client = {"name": " ".join(
+                p for p in (identity.get("first_name"), identity.get("last_name")) if p
+            ) or (identity.get("display_name") or "")}
         try:
-            job = _create_job_for_consultation(cid, client, extraction)
+            job = _create_job_for_consultation(cid, title_client, extraction)
         except WriterError as exc:
             logger.error("Job creation failed for customer %s: %s", cid, exc)
             raise

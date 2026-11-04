@@ -11,7 +11,6 @@ import {
 import { clearActiveJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
 import Home from './screens/Home.jsx'
 import CustomerPicker from './screens/CustomerPicker.jsx'
-import NewCustomer from './screens/NewCustomer.jsx'
 import Capture from './screens/Capture.jsx'
 import Processing from './screens/Processing.jsx'
 import Confirmation from './screens/Confirmation.jsx'
@@ -182,7 +181,7 @@ export default function App() {
       setPhase('submitting')
       const submitted = await submitConsultationJob({
         audioKey: audio_key,
-        customerId: customer && customer.id,
+        customer,
         source: '3day-app',
       })
       const active = {
@@ -291,16 +290,6 @@ export default function App() {
         <CustomerPicker
           onBack={() => setScreen('home')}
           onSelect={(c) => {
-            setCustomer(c)
-            setScreen('capture')
-          }}
-          onAddNew={() => setScreen('new-customer')}
-        />
-      )}
-      {screen === 'new-customer' && (
-        <NewCustomer
-          onBack={() => setScreen('pick')}
-          onCreated={(c) => {
             setCustomer(c)
             setScreen('capture')
           }}
