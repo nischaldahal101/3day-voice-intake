@@ -56,6 +56,7 @@ if "jobs" not in sys.modules:
     _jobs.save_customer_link = lambda *a, **k: None
     _jobs.list_recent_jobs = lambda *a: []
     _jobs.update_job_status = lambda *a, **k: None
+    _jobs.save_manual_send = lambda *a, **k: True
     _jobs.JobError = Exception
     sys.modules["jobs"] = _jobs
 if "queue_setup" not in sys.modules:
@@ -323,7 +324,7 @@ class TestCommentText(Base):
         t = self.text(ex)
         self.assertLessEqual(len(t), fs.MAX_COMMENT_CHARS)
         self.assertTrue(t.endswith("Full transcript and details: "
-                                   "https://admin.example.com/jobs/job_abc"))
+                                   "https://admin.example.com/#admin/job_abc"))
         ex["scope"]["project_vision"] = "v" * 50000
         ex["readiness"]["time_frame"] = "\n".join(["t" * 500] * 50)
         t = self.text(ex)

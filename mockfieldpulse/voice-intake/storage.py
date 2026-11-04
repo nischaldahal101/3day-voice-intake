@@ -208,3 +208,23 @@ def audio_exists(key: str) -> bool:
         raise StorageError(
             f"Failed to check r2://{R2_BUCKET_NAME}/{key}: {exc}"
         )
+
+
+def generate_download_url(key: str, expires_in: int = 900) -> str:
+    """Return a short-lived presigned GET URL for one consultation recording
+    (admin panel "Play / download audio"). Read-only, expires in 15 minutes by
+    default (capped at 1 hour). Only `consultations/...` keys are signed.
+    Signing is local (no network call)."""
+    _ensure_configured()
+    if not isinstance(key, str) or not key.startswith("consultations/") or ".." in key:
+        raise StorageError("Not a consultation recording key")
+    expires_in = max(60, min(int(expires_in), 3600))
+    try:
+        return _client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": R2_BUCKET_NAME, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.error("Failed to generate download URL: %s", exc)
+        raise StorageError(f"Failed to generate download URL for {key}: {exc}")

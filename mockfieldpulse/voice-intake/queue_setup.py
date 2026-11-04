@@ -48,3 +48,16 @@ def enqueue_consultation(job_id: str):
     rq_job = consultation_queue.enqueue("worker.process_consultation_job", job_id)
     logger.info("Enqueued job %s (rq id=%s)", job_id, rq_job.id)
     return rq_job
+
+
+def enqueue_manual_send(job_id: str, request_id: str):
+    """Queue an admin "Send to FieldPulse" for a finished job. The worker runs
+    worker.send_consultation_to_fieldpulse; the request handler never talks to
+    FieldPulse itself. Same queue as consultations (same worker service)."""
+    rq_job = consultation_queue.enqueue(
+        "worker.send_consultation_to_fieldpulse", job_id, request_id,
+        job_timeout=300,
+    )
+    logger.info("Enqueued manual FieldPulse send for %s (request %s, rq id=%s)",
+                job_id, request_id, rq_job.id)
+    return rq_job

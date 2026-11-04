@@ -17,6 +17,9 @@ For each job on the `consultations` queue:
      error, then re-raise so RQ also records it. Job never stays 'processing'.
   8. Always clean up the temp audio file.
 
+Also runs the admin panel's manual "Send to FieldPulse" for a finished job
+(send_consultation_to_fieldpulse, queued by admin_panel.request_manual_send).
+
 The worker no longer calls the mock writer (consultation_writer); that module
 stays only for the deprecated sync route until stage 6 removes the mock.
 
@@ -33,7 +36,7 @@ import tempfile
 
 from extractor import ExtractionError, extract_consultation
 from fieldpulse_sync import consultation_reference, sync_consultation
-from jobs import JobError, get_job, update_job_status
+from jobs import JobError, get_job, save_manual_send, update_job_status
 from pipeline import transcribe
 from storage import StorageError, download_audio
 from transcriber import TranscriptionError
@@ -138,6 +141,48 @@ def process_consultation_job(job_id):
         _fail(job_id, f"Could not save the finished job: {type(exc).__name__}: {exc}")
         raise
     logger.info("[%s] DONE (fieldpulse_sync=%s)", job_id, sync.get("status"))
+
+
+def send_consultation_to_fieldpulse(job_id, request_id):
+    """Admin "Send to FieldPulse" / "Retry" (queued by admin_panel). Runs
+    fieldpulse_sync for the saved extraction as an explicit MANUAL send: the
+    worker's FIELDPULSE_WRITE_MODE still decides whether anything goes out.
+    Records the outcome on the request's entry in result.fieldpulse_manual_sends
+    and the new summary as result.fieldpulse_sync. Never raises (a crash is
+    recorded on the entry), so RQ never retries it on its own."""
+    from datetime import datetime, timezone
+
+    def now():
+        return datetime.now(timezone.utc).isoformat()
+
+    entry = {"id": request_id, "started_at": now()}
+    try:
+        job = get_job(job_id)
+        if job is None:
+            logger.error("[%s] manual send: job not found", job_id)
+            return
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        extraction = result.get("extraction")
+        if job.get("status") != "done" or not isinstance(extraction, dict):
+            save_manual_send(job_id, {**entry, "status": "error", "finished_at": now(),
+                                      "message": "Not sent: this consultation has no finished "
+                                                 "extraction to send."})
+            return
+        logger.info("[%s] manual FieldPulse send (request %s)", job_id, request_id)
+        sync = sync_consultation(job, extraction, manual=True)
+        save_manual_send(job_id, {**entry, "status": "finished", "finished_at": now(),
+                                  "outcome": sync.get("status"), "mode": sync.get("mode"),
+                                  "message": sync.get("message")}, sync=sync)
+        logger.info("[%s] manual send done: %s", job_id, sync.get("status"))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[%s] manual send crashed", job_id)
+        try:
+            save_manual_send(job_id, {**entry, "status": "error", "finished_at": now(),
+                                      "message": f"The send hit an internal error "
+                                                 f"({type(exc).__name__}). Check the "
+                                                 f"FieldPulse steps below before retrying."})
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s] could not record the manual send error", job_id)
 
 
 def _fail(job_id, message):

@@ -2,7 +2,7 @@
 
 One entry point:
 
-    sync_consultation(job, extraction) -> summary dict   (never raises)
+    sync_consultation(job, extraction, manual=False) -> summary dict   (never raises)
 
 The worker calls it after the transcript + extraction are already saved on the
 job row (docs/FIELDPULSE_API.md §11 "save first"). Everything else is hidden
@@ -39,8 +39,15 @@ created it and its list filters are ignored (we can't check by reading back).
 Only `planned` and `failed` steps are (re)tried, up to _MAX_ATTEMPTS.
 A step first recorded in dry_run (row mode = "dry_run") is NEVER sent or
 rewritten automatically after the mode changes (reported as "held"); only an
-explicit manual send (stage 3 admin, not built yet) may release it. jobs.py
-enforces the same rule in SQL.
+explicit manual send may release it. jobs.py enforces the same rule in SQL.
+
+Manual send (stage 3 admin "Send to FieldPulse"; the worker calls
+sync_consultation(..., manual=True)): the SAME mode gate decides. Not allowed
+(dry_run / off / test_customer_only for another customer / no write config)
+-> nothing is sent and the message says "Not sent: <why>". Allowed -> held
+dry-run rows are released (jobs.release_held_fieldpulse_writes) and the plan
+is recorded + sent like a normal run, with a higher attempt cap for failed
+steps. `succeeded` and `sent` steps are never re-sent, manual or not.
 
 Return appointment: the worker tells the extractor the consultation date
 (consultation_reference), so the AI can fill resolved_date / resolved_time.
@@ -86,6 +93,7 @@ DEFAULT_COMMENTABLE_TYPE = "customer"   # UNVERIFIED, see module docstring
 MAX_COMMENT_CHARS = 6000
 _FIELD_CHARS = 600            # one extracted text field inside the comment
 _MAX_ATTEMPTS = 3
+_MANUAL_MAX_ATTEMPTS = 10     # manual "Retry" may go past the automatic cap
 _RESPONSE_CHARS = 4000        # stored response body cap
 _CONNECT_TIMEOUT = 5
 _READ_TIMEOUT = 15
@@ -720,7 +728,7 @@ def build_comment_text(job, extraction, task_window, task_reason, cfg):
 
     footer = ["", "Written by AI from the consultation. Please double-check before acting on it."]
     if cfg["admin_base_url"]:
-        footer.append(f"Full transcript and details: {cfg['admin_base_url']}/jobs/{job.get('id')}")
+        footer.append(f"Full transcript and details: {cfg['admin_base_url']}/#admin/{job.get('id')}")
     footer_text = "\n" + "\n".join(footer)        # blank line before the footer
 
     body = "\n".join(lines)
@@ -882,21 +890,33 @@ def _store():
 
 # --- Entry point ----------------------------------------------------------------------------
 
-def sync_consultation(job, extraction):
+def sync_consultation(job, extraction, manual=False):
     """Plan, record, and (only when the env allows) send this consultation's
     FieldPulse writes. NEVER raises: any problem becomes status "failed" in the
-    returned summary, and the consultation itself stays saved."""
+    returned summary, and the consultation itself stays saved. `manual=True`
+    is the admin's explicit send: it may release held dry-run steps, but only
+    if the mode gate allows sending (see module docstring)."""
     try:
-        return _sync(job, extraction)
+        out = _sync(job, extraction, manual)
     except Exception as exc:  # noqa: BLE001 — the write must never fail the job
         logger.exception("[%s] FieldPulse sync crashed", job.get("id"))
-        return {"status": "failed", "mode": None,
+        out = {"status": "failed", "mode": None,
                 "message": "FieldPulse sync hit an internal error. Nothing more was sent. "
                            "The consultation is saved.",
                 "error": f"{type(exc).__name__}: {str(exc)[:300]}", "steps": []}
+    if manual:
+        out["manual"] = True
+    return out
 
 
-def _sync(job, extraction):
+def _not_sent_reason(cfg, why):
+    """Plain reason for a manual send that the gate refused."""
+    if cfg["mode"] not in SEND_MODES:
+        return f"write mode is {cfg['mode']}"
+    return why
+
+
+def _sync(job, extraction, manual=False):
     cfg = _config()
     job_id = job["id"]
     name = customer_name(job)
@@ -907,7 +927,9 @@ def _sync(job, extraction):
     if cfg["mode"] == "off":
         logger.info("[%s] FieldPulse sync off", job_id)
         return {**base, "status": "off", "steps": [],
-                "message": "FieldPulse sync is off. Nothing was sent to FieldPulse."}
+                "message": ("Not sent: write mode is off. Nothing was sent to FieldPulse."
+                            if manual else
+                            "FieldPulse sync is off. Nothing was sent to FieldPulse.")}
 
     cid = base["customer_id"]
     if cid is None:
@@ -920,6 +942,10 @@ def _sync(job, extraction):
     plan = build_plan(job, extraction, cfg)
     allowed, why = _send_gate(cfg, cid)
     store = _store()
+    if manual and allowed:
+        # The explicit manual action: held dry-run steps may now be sent.
+        store.release_held_fieldpulse_writes(job_id, cfg["mode"])
+    max_attempts = _MANUAL_MAX_ATTEMPTS if manual else _MAX_ATTEMPTS
     existing = {r["step"]: r for r in store.list_fieldpulse_writes(job_id)}
 
     for step in plan:
@@ -944,7 +970,7 @@ def _sync(job, extraction):
             continue
         store.record_fieldpulse_write(job_id, name_, "planned", cfg["mode"],
                                       request=step["request"], error=None)
-        if not store.claim_fieldpulse_write(job_id, name_, _MAX_ATTEMPTS):
+        if not store.claim_fieldpulse_write(job_id, name_, max_attempts):
             continue                                 # someone else has it / out of attempts
         try:
             status_code, payload = _send(step["request"], cfg)
@@ -968,7 +994,11 @@ def _sync(job, extraction):
                     "ok" if ok else "failed")
 
     rows = {r["step"]: r for r in store.list_fieldpulse_writes(job_id)}
-    return _summarize(base, cfg, plan, rows, allowed, why)
+    out = _summarize(base, cfg, plan, rows, allowed, why)
+    if manual and not allowed:
+        out["message"] = (f"Not sent: {_not_sent_reason(cfg, why)}. "
+                          "Nothing was sent to FieldPulse.")
+    return out
 
 
 def _summarize(base, cfg, plan, rows, allowed, why):

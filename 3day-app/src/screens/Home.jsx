@@ -1,6 +1,6 @@
 import { UserButton } from '@clerk/clerk-react'
 
-export default function Home({ onStart, onRecent }) {
+export default function Home({ onStart, onRecent, onAdmin }) {
   return (
     <section className="screen screen-home">
       {/* Clerk's UserButton — shows the signed-in user's avatar and opens a
@@ -34,6 +34,11 @@ export default function Home({ onStart, onRecent }) {
         {onRecent && (
           <button className="btn btn-secondary" onClick={onRecent}>
             Recent consultations
+          </button>
+        )}
+        {onAdmin && (
+          <button className="btn btn-tertiary" onClick={onAdmin}>
+            Admin: all consultations
           </button>
         )}
         <p className="footer-hint">

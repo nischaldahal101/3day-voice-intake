@@ -66,6 +66,7 @@ _jobs.get_customer_link = lambda source, external_id: _links.get((source, extern
 _jobs.save_customer_link = _save_link
 _jobs.list_recent_jobs = lambda *a: []
 _jobs.update_job_status = lambda *a, **k: None
+_jobs.save_manual_send = lambda *a, **k: True
 _jobs.JobError = Exception
 sys.modules["jobs"] = _jobs
 _queue = types.ModuleType("queue_setup")
@@ -1206,11 +1207,13 @@ class TestRound2Identity(Base):
     def test_identity_is_normalised_and_stored(self):
         r = self.submit(customer_id=18809123, customer={
             "id": 18809123, "display_name": " Doe, Jane ", "first_name": "Jane",
-            "last_name": {"bad": 1}, "phone": 6185550100, "email": None, "extra": "dropped"})
+            "last_name": {"bad": 1}, "phone": 6185550100, "email": None, "extra": "dropped",
+            "address": " 1 Main St, O'Fallon, IL ", "company_name": ["bad"]})
         self.assertEqual(r.status_code, 202, r.get_json())
         self.assertEqual(_created_jobs[-1]["customer"], {
             "id": "18809123", "display_name": "Doe, Jane", "first_name": "Jane",
-            "last_name": None, "phone": "6185550100", "email": None})
+            "last_name": None, "phone": "6185550100", "email": None,
+            "company_name": None, "address": "1 Main St, O'Fallon, IL"})
         self.assertEqual(_created_jobs[-1]["customer_id"], "18809123")
 
     def test_no_identity_is_still_accepted(self):

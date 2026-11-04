@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+import admin_panel
 from consultation_writer import WriterError as ConsultWriterError
 from customer_source import CustomerSourceError, list_customers
 from extractor import ExtractionError, extract_intake
@@ -50,7 +51,8 @@ PORT = int(os.environ.get("PORT", 5100))
 #
 # Endpoints that must have this on:
 #   /consultation/upload-url, /consultation/submit, /job-status/<id>,
-#   /jobs/recent, /app/customers (GET only), /process-consultation.
+#   /jobs/recent, /app/customers (GET only), /process-consultation,
+#   /admin/* (admin panel: every signed-in user, deliberately, for now).
 # Public: /health only.
 #
 # We used to require x-intake-key on every request. That's retired here —
@@ -524,7 +526,8 @@ def _parse_customer_id(raw):
     return value, None
 
 
-_IDENTITY_FIELDS = ("display_name", "first_name", "last_name", "phone", "email")
+_IDENTITY_FIELDS = ("display_name", "first_name", "last_name", "phone", "email",
+                    "company_name", "address")   # display only (admin header)
 
 
 def _identity_text(v):
@@ -763,6 +766,42 @@ def app_customers():
     return jsonify({"customers": customers})
 
 
+# --- Admin panel (stage 3) ---------------------------------------------------
+#
+# Thin routes over admin_panel.py; protected by _require_clerk_session like
+# everything else. Reads only our Postgres; the send action only enqueues.
+
+@app.get("/admin/consultations")
+def admin_consultations():
+    a = request.args
+    code, body = admin_panel.list_consultations(
+        search=a.get("q", ""), fp_filter=a.get("fp", ""),
+        offset=a.get("offset", 0), limit=a.get("limit", admin_panel.DEFAULT_PAGE))
+    return jsonify(body), code
+
+
+@app.get("/admin/consultations/<job_id>")
+def admin_consultation_detail(job_id):
+    code, body = admin_panel.consultation_detail(job_id)
+    return jsonify(body), code
+
+
+@app.get("/admin/consultations/<job_id>/audio-url")
+def admin_consultation_audio(job_id):
+    code, body = admin_panel.audio_url(job_id)
+    return jsonify(body), code
+
+
+@app.post("/admin/consultations/<job_id>/send")
+def admin_consultation_send(job_id):
+    from flask import g
+    body = request.get_json(silent=True) or {}
+    name = body.get("requested_by") if isinstance(body, dict) else None
+    code, out = admin_panel.request_manual_send(
+        job_id, user_id=getattr(g, "clerk_user_id", None), user_name=name)
+    return jsonify(out), code
+
+
 # --- Startup ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -782,6 +821,7 @@ if __name__ == "__main__":
     print(f"    GET  /job-status/<job_id>       (Clerk-protected — poll)")
     print(f"    GET  /jobs/recent               (Clerk-protected — history)")
     print(f"    GET  /app/customers             (Clerk-protected — picker list)")
+    print(f"    GET  /admin/consultations[/<id>[/audio-url]], POST .../<id>/send  (Clerk-protected — admin)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
     print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
     print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")

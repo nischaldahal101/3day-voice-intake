@@ -8,6 +8,7 @@ import {
   submitConsultationJob,
 } from './lib/api.js'
 import { clearActiveJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
+import { parseAdminHash } from './lib/admin.js'
 import Home from './screens/Home.jsx'
 import CustomerPicker from './screens/CustomerPicker.jsx'
 import Capture from './screens/Capture.jsx'
@@ -15,6 +16,22 @@ import Processing from './screens/Processing.jsx'
 import Confirmation from './screens/Confirmation.jsx'
 import ErrorScreen from './screens/ErrorScreen.jsx'
 import RecentJobs from './screens/RecentJobs.jsx'
+import AdminList from './screens/AdminList.jsx'
+import AdminDetail from './screens/AdminDetail.jsx'
+
+const isAdminScreen = (s) => s === 'admin' || s === 'admin-detail'
+
+// Admin screens have their own URL (#admin, #admin/<job_id>) so Mike can
+// bookmark them and the FieldPulse comment can link straight to one. A hash
+// needs no server rewrite rules and survives the Clerk sign-in screen.
+function setAdminHash(hash) {
+  if (window.location.hash !== hash) window.location.hash = hash // fires hashchange
+}
+function clearAdminHash() {
+  if (parseAdminHash(window.location.hash)) {
+    window.history.pushState(null, '', window.location.pathname + window.location.search)
+  }
+}
 
 // Take a done /job-status response and shape it for the existing Confirmation
 // component (which was written against the old sync response). `elapsed_seconds`
@@ -47,8 +64,12 @@ export default function App() {
   const [jobResult, setJobResult] = useState(null)
   const [errorState, setErrorState] = useState(null)
   const [lastPayload, setLastPayload] = useState(null)
+  const [adminJobId, setAdminJobId] = useState(null)
+  const [adminListState, setAdminListState] = useState(null) // search/filter/page to restore
 
   const pollTimerRef = useRef(null)
+  const screenRef = useRef(screen)
+  screenRef.current = screen
 
   // ---- polling helpers -------------------------------------------------
 
@@ -67,12 +88,15 @@ export default function App() {
         clearActiveJob()
         setJobResult(shapeJobResult(data))
         setPhase('done')
-        setScreen('confirmation')
+        // A background job finishing never pulls the user out of the admin
+        // panel; it is in Recent and the admin list.
+        if (!isAdminScreen(screenRef.current)) setScreen('confirmation')
         return
       }
       if (data.status === 'failed') {
         stopPolling()
         clearActiveJob()
+        if (isAdminScreen(screenRef.current)) return
         setErrorState({
           title: 'The consultation failed',
           message: data.error || 'The pipeline reported an error.',
@@ -94,18 +118,58 @@ export default function App() {
     pollTimerRef.current = setTimeout(() => pollOnce(jobId), 500)
   }, [pollOnce, stopPolling])
 
-  // On mount, resume any in-flight job stored in localStorage.
+  // On mount: an admin URL (#admin, #admin/<id>) opens the admin panel;
+  // otherwise resume any in-flight job stored in localStorage (also resumed
+  // when an admin URL is open, just without switching screens).
   useEffect(() => {
+    const route = parseAdminHash(window.location.hash)
+    if (route) {
+      setAdminJobId(route.view === 'detail' ? route.jobId : null)
+      setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
+    }
     const active = getActiveJob()
     if (active && active.job_id) {
       if (active.customer) setCustomer(active.customer)
       setActiveJobId(active.job_id)
       setPhase('queued')
-      setScreen('processing')
+      if (!route) setScreen('processing')
       startPolling(active.job_id)
     }
     return stopPolling
   }, [startPolling, stopPolling])
+
+  // Browser back/forward and typed URLs between admin screens and the app.
+  useEffect(() => {
+    const onHash = () => {
+      const route = parseAdminHash(window.location.hash)
+      if (route) {
+        setAdminJobId(route.view === 'detail' ? route.jobId : null)
+        setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
+      } else if (isAdminScreen(screenRef.current)) {
+        setScreen('home')
+      }
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  const openAdmin = useCallback(() => {
+    setAdminJobId(null)
+    setScreen('admin')
+    setAdminHash('#admin')
+  }, [])
+
+  const openAdminDetail = useCallback((jobId, listState) => {
+    if (listState) setAdminListState(listState)
+    setAdminJobId(jobId)
+    setScreen('admin-detail')
+    setAdminHash(`#admin/${jobId}`)
+  }, [])
+
+  const leaveAdmin = useCallback(() => {
+    clearAdminHash()
+    setScreen('home')
+  }, [])
 
   // ---- reset / navigation ---------------------------------------------
 
@@ -154,7 +218,8 @@ export default function App() {
       const submitted = await submitConsultationJob({
         ...input,
         customer,
-        source: audioBlob ? '3day-app' : '3day-app-paste',
+        // Capture tags uploads ('3day-app-upload'); recordings and pastes here.
+        source: payload.source || (audioBlob ? '3day-app-record' : '3day-app-paste'),
       })
       const active = {
         job_id: submitted.job_id,
@@ -226,11 +291,12 @@ export default function App() {
   }, [startPolling, stopPolling])
 
   return (
-    <div className="app">
+    <div className={isAdminScreen(screen) ? 'app app-wide' : 'app'}>
       {screen === 'home' && (
         <Home
           onStart={() => setScreen('pick')}
           onRecent={() => setScreen('recent-jobs')}
+          onAdmin={openAdmin}
         />
       )}
       {screen === 'pick' && (
@@ -269,6 +335,12 @@ export default function App() {
           onBack={() => setScreen('home')}
           onOpen={openRecentJob}
         />
+      )}
+      {screen === 'admin' && (
+        <AdminList onBack={leaveAdmin} onOpen={openAdminDetail} initial={adminListState} />
+      )}
+      {screen === 'admin-detail' && adminJobId && (
+        <AdminDetail key={adminJobId} jobId={adminJobId} onBack={openAdmin} />
       )}
     </div>
   )

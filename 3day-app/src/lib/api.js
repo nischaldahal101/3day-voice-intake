@@ -104,7 +104,8 @@ function normalizeCustomer(c) {
 // Read-only. Returns customers in the order the server sends them (newest
 // added first), each as {id, display_name, first_name, last_name, phone,
 // email, company_name, address, created_at} with every non-id field a string
-// or null. company_name/address are display-only (not in customerIdentity).
+// or null. company_name/address are display-only (stored on the job for the
+// admin panel header; never sent to FieldPulse).
 // Customers are created in FieldPulse, never from this app.
 export async function fetchCustomers() {
   const resp = await fetch(`${API_BASE}/app/customers`, {
@@ -131,6 +132,8 @@ function customerIdentity(customer) {
     last_name: textOrNull(customer.last_name),
     phone: textOrNull(customer.phone),
     email: textOrNull(customer.email),
+    company_name: textOrNull(customer.company_name), // display only (admin panel header)
+    address: textOrNull(customer.address),           // display only (admin panel header)
   }
 }
 
@@ -236,4 +239,62 @@ export async function fetchRecentJobs(limit = 20) {
   await assertOk(resp, 'recent jobs')
   const data = await resp.json()
   return data.jobs || []
+}
+
+// -------------------- Admin panel (stage 3) --------------------
+// All read from our own database (never FieldPulse). The only action,
+// requestAdminSend, just queues a worker job; the worker's write mode decides
+// whether anything actually reaches FieldPulse.
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+// { items, total, offset, limit, counts, labels, truncated }
+export async function fetchAdminConsultations({ q = '', fp = '', offset = 0, limit = 50 } = {}) {
+  const params = new URLSearchParams({ q, fp, offset: String(offset), limit: String(limit) })
+  const resp = await fetch(`${API_BASE}/admin/consultations?${params}`, {
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, "Couldn't load consultations")
+  const data = await resp.json()
+  if (!isPlainObject(data) || !Array.isArray(data.items)) {
+    throw new Error("Couldn't load consultations: the server sent an unexpected response.")
+  }
+  return data
+}
+
+export async function fetchAdminConsultation(jobId) {
+  const resp = await fetch(`${API_BASE}/admin/consultations/${encodeURIComponent(jobId)}`, {
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, "Couldn't load the consultation")
+  const data = await resp.json()
+  if (!isPlainObject(data) || typeof data.id !== 'string') {
+    throw new Error("Couldn't load the consultation: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// Queue an explicit manual send. Returns { request_id, status, already_queued? }.
+export async function requestAdminSend(jobId, requestedBy) {
+  const resp = await fetch(`${API_BASE}/admin/consultations/${encodeURIComponent(jobId)}/send`, {
+    method: 'POST',
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ requested_by: requestedBy || null }),
+  })
+  await assertOk(resp, 'Send to FieldPulse')
+  return resp.json()
+}
+
+// Short-lived (15 min) link to the recording. Returns the URL string.
+export async function fetchAdminAudioUrl(jobId) {
+  const resp = await fetch(
+    `${API_BASE}/admin/consultations/${encodeURIComponent(jobId)}/audio-url`,
+    { headers: await authHeaders() },
+  )
+  await assertOk(resp, "Couldn't get the audio link")
+  const data = await resp.json()
+  if (!data || typeof data.url !== 'string') throw new Error("Couldn't get the audio link.")
+  return data.url
 }

@@ -370,8 +370,9 @@ def save_customer_link(
 # known yet, or never answered) | succeeded | failed | skipped. 'succeeded'
 # and 'sent' rows are terminal for automation: nothing here overwrites them.
 # Rows recorded with mode 'dry_run' are never claimed (sent) and never
-# rewritten by a non-dry_run record: only a future explicit manual send
-# (stage 3 admin) may release them.
+# rewritten by a non-dry_run record: only the explicit admin manual send
+# (release_held_fieldpulse_writes, called by fieldpulse_sync manual=True after
+# its send gate allowed it) may release them.
 
 def _serialize_write(row):
     return {
@@ -471,3 +472,127 @@ def finish_fieldpulse_write(
                  record_id, error, job_id, step],
             )
         conn.commit()
+
+
+def release_held_fieldpulse_writes(job_id: str, mode: str) -> int:
+    """EXPLICIT MANUAL SEND ONLY (admin "Send to FieldPulse", via
+    fieldpulse_sync.sync_consultation(manual=True), after its send gate has
+    allowed `mode`). Re-labels this job's dry-run rows that were never sent
+    (planned / failed / skipped) with the current send mode, so the normal
+    record -> claim -> send path may process them. 'succeeded' and 'sent' rows
+    are never touched. Returns the number of rows released."""
+    if mode not in ("test_customer_only", "live"):
+        raise JobError(f"release_held_fieldpulse_writes: {mode!r} is not a send mode")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE fieldpulse_writes SET mode = %s, updated_at = now()
+                 WHERE job_id = %s AND mode = 'dry_run'
+                   AND status IN ('planned', 'failed', 'skipped')
+                """,
+                [mode, job_id],
+            )
+            n = cur.rowcount
+        conn.commit()
+    if n:
+        logger.info("Released %d held dry-run write(s) for job %s (mode %s)", n, job_id, mode)
+    return n
+
+
+# --- Admin panel reads / manual-send log (admin_panel.py) -------------------
+
+def list_jobs_for_admin(scan_limit: int = 2000) -> list:
+    """Light rows for the admin list, newest first: no transcript, no comment
+    text, no full extraction. Each row: id, status, customer_id, customer,
+    source, has_audio, has_paste, error (first 300 chars), created_at,
+    updated_at, input, project_type, client_name, close_score, sync
+    ({status, mode, steps:[{step,status}]} or None), legacy_mock (bool),
+    writes ([{step, status, mode}]), last_manual_send (dict or None).
+    Every JSON path is guarded so a malformed `result` can't break the list."""
+    scan_limit = max(1, min(int(scan_limit), 5000))
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT j.id, j.status, j.customer_id,
+                   CASE WHEN jsonb_typeof(j.customer) = 'object' THEN j.customer END AS customer,
+                   j.source, (j.audio_key IS NOT NULL) AS has_audio,
+                   (j.transcript IS NOT NULL) AS has_paste, left(j.error, 300) AS error,
+                   j.created_at, j.updated_at,
+                   CASE WHEN jsonb_typeof(j.result) = 'object' THEN j.result->>'input' END AS input,
+                   CASE WHEN jsonb_typeof(j.result->'extraction') = 'object'
+                        THEN j.result->'extraction'->>'project_type' END AS project_type,
+                   CASE WHEN jsonb_typeof(j.result->'extraction'->'client') = 'object'
+                        THEN j.result->'extraction'->'client'->>'name' END AS client_name,
+                   CASE WHEN jsonb_typeof(j.result->'extraction'->'sales') = 'object'
+                        THEN j.result->'extraction'->'sales'->'close_score_1_10' END AS close_score,
+                   CASE WHEN jsonb_typeof(j.result->'fieldpulse_sync') = 'object'
+                        THEN jsonb_build_object(
+                               'status', j.result->'fieldpulse_sync'->'status',
+                               'mode', j.result->'fieldpulse_sync'->'mode',
+                               'steps', CASE WHEN jsonb_typeof(j.result->'fieldpulse_sync'->'steps') = 'array'
+                                             THEN (SELECT coalesce(jsonb_agg(jsonb_build_object(
+                                                          'step', s->'step', 'status', s->'status')), '[]')
+                                                     FROM jsonb_array_elements(j.result->'fieldpulse_sync'->'steps') s
+                                                    WHERE jsonb_typeof(s) = 'object')
+                                             ELSE '[]'::jsonb END)
+                   END AS sync,
+                   coalesce(jsonb_typeof(j.result->'fieldpulse') = 'object', false) AS legacy_mock,
+                   CASE WHEN jsonb_typeof(j.result->'fieldpulse_manual_sends') = 'array'
+                        THEN j.result->'fieldpulse_manual_sends'-> -1 END AS last_manual_send,
+                   coalesce(w.writes, '[]'::jsonb) AS writes
+              FROM consultation_jobs j
+              LEFT JOIN (
+                    SELECT job_id, jsonb_agg(jsonb_build_object(
+                               'step', step, 'status', status, 'mode', mode) ORDER BY step) AS writes
+                      FROM fieldpulse_writes GROUP BY job_id
+                   ) w ON w.job_id = j.id
+             ORDER BY j.created_at DESC, j.id
+             LIMIT %s
+            """,
+            [scan_limit],
+        )
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["created_at"] = _iso(r["created_at"])
+        item["updated_at"] = _iso(r["updated_at"])
+        out.append(item)
+    return out
+
+
+_MANUAL_SENDS_KEPT = 20
+
+
+def save_manual_send(job_id: str, entry: dict, sync: dict = None) -> bool:
+    """Add or update (matched by entry["id"]) one entry in the job's
+    result.fieldpulse_manual_sends log (last 20 kept), and, when `sync` is
+    given, replace result.fieldpulse_sync with it (so Recent/Confirmation show
+    the latest outcome). Row lock, so concurrent saves never lose an entry.
+    Does not touch status or updated_at. False if the job doesn't exist."""
+    if not isinstance(entry, dict) or not entry.get("id"):
+        raise JobError("save_manual_send needs an entry with an 'id'")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT result FROM consultation_jobs WHERE id = %s FOR UPDATE", [job_id])
+            row = cur.fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            result = row["result"] if isinstance(row["result"], dict) else {}
+            sends = result.get("fieldpulse_manual_sends")
+            sends = [s for s in sends if isinstance(s, dict)] if isinstance(sends, list) else []
+            for s in sends:
+                if s.get("id") == entry["id"]:
+                    s.update(entry)
+                    break
+            else:
+                sends.append(dict(entry))
+            result["fieldpulse_manual_sends"] = sends[-_MANUAL_SENDS_KEPT:]
+            if sync is not None:
+                result["fieldpulse_sync"] = sync
+            cur.execute("UPDATE consultation_jobs SET result = %s WHERE id = %s",
+                        [Jsonb(result), job_id])
+        conn.commit()
+    return True

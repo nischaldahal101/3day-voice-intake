@@ -94,7 +94,20 @@ Only the worker calls `fieldpulse_sync.py`. **Do not put any of these on the orc
 | `FIELDPULSE_TIMEZONE` | Optional, default `America/Chicago`. Used for task times. |
 | `FIELDPULSE_COMMENT_COMMENTABLE_TYPE` | Optional, default `customer`. **UNVERIFIED**; stage 4 confirms. |
 | `FIELDPULSE_AI_JOB_TAG_ID` | Optional job tag id for tasks. Unset = no tag. |
-| `ADMIN_BASE_URL` | Optional. Adds an admin-panel link to each comment (stage 3 serves `/jobs/<job_id>`). |
+| `ADMIN_BASE_URL` | Optional. The React app's public URL (e.g. `https://<app>.onrender.com`, no trailing slash). Adds `Full transcript and details: <url>/#admin/<job_id>` to each comment (the admin panel, stage 3). Unset = no link. |
+
+### Admin panel (stage 3): nothing new to configure
+
+The admin panel lives in the React app (Home → "Admin: all consultations", or `<app url>/#admin`,
+`<app url>/#admin/<job_id>`), behind the same Clerk sign-in, and reads only our Postgres through
+`GET /admin/consultations[...]` on the orchestrator. No new env vars, no schema change (the manual-send log
+is stored inside `consultation_jobs.result`), and no static-site rewrite rule (it uses a `#` URL).
+"Send to FieldPulse" only enqueues `worker.send_consultation_to_fieldpulse` on the same `consultations`
+queue; **deploy the worker together with the orchestrator** so the worker has that function (an old worker
+would fail the queued job and nothing would be sent). The worker's `FIELDPULSE_WRITE_MODE` still decides
+everything: in `dry_run` a manual send records "Not sent: write mode is dry_run". "Play / download audio"
+uses a 15-minute presigned R2 GET (`storage.generate_download_url`); a browser plays it by navigation, so the
+R2 CORS lockdown doesn't affect it.
 
 The worker keeps `FIELDPULSE_BASE_URL` only because the deprecated mock code still imports it; the live
 flow no longer writes to the mock (stage 6 removes it).
