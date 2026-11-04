@@ -325,6 +325,80 @@ export function groupExtraction(ex) {
   return { groups, quotes, flags }
 }
 
+// ---- plain summary for the top of the detail screen ------------------------
+
+export const JOB_STATUS_LABEL = {
+  queued: 'Waiting to start',
+  processing: 'Processing',
+  done: 'Done',
+  failed: 'Failed',
+}
+
+// Same set as the backend's admin_panel.ATTENTION (FieldPulse side only; a
+// failed job is shown by its job status, not as a FieldPulse problem).
+const FP_ATTENTION = new Set(['failed', 'partial', 'held', 'sent'])
+
+// One plain line: { kind: 'sent'|'attention'|'pending'|'not_sent', text, detail }.
+export function fieldPulsePlain(d) {
+  const fp = isObj(d) ? d.fieldpulse_status : null
+  const label = (isObj(d) && str(d.fieldpulse_label)) || FP_LABEL[fp] || null
+  if (FP_ATTENTION.has(fp)) return { kind: 'attention', text: 'Needs attention', detail: label }
+  if (fp === 'succeeded') return { kind: 'sent', text: 'Sent', detail: null }
+  if (fp === 'pending') return { kind: 'pending', text: 'Not sent yet', detail: 'Still processing' }
+  return { kind: 'not_sent', text: 'Not sent', detail: fp === 'not_sent' ? null : label }
+}
+
+function budget(sales) {
+  const lo = isMissing(sales.budget_low) ? null : money(sales.budget_low)
+  const hi = isMissing(sales.budget_high) ? null : money(sales.budget_high)
+  if (lo && hi) return lo === hi ? lo : `${lo} to ${hi}`
+  if (lo) return `From ${lo}`
+  if (hi) return `Up to ${hi}`
+  return isMissing(sales.budget_raw) ? null : display(sales.budget_raw)
+}
+
+function returnAppointment(ra) {
+  const said = isMissing(ra.details) ? null : display(ra.details)
+  if (!isMissing(ra.resolved_date)) {
+    const when = [isoDay(ra.resolved_date), isMissing(ra.resolved_time) ? null : hhmm(ra.resolved_time)]
+      .filter(Boolean).join(' at ')
+    return said ? `${when} (said: "${said}")` : when
+  }
+  const sch = String(ra.scheduled).trim().toLowerCase()
+  if (said) return said
+  if (ra.scheduled === true || sch === 'true' || sch === 'yes') return 'Scheduled, no date or time captured'
+  if (ra.scheduled === false || sch === 'false' || sch === 'no') return 'Not scheduled'
+  return null
+}
+
+// The few results Mike reads first. Each: { key, label, value } with value
+// null = "Not mentioned" (never filled in). The full list stays in
+// groupExtraction for the troubleshooting section.
+export function keyResults(ex) {
+  if (!isObj(ex)) return null
+  const sales = isObj(ex.sales) ? ex.sales : {}
+  const scope = isObj(ex.scope) ? ex.scope : {}
+  const ready = isObj(ex.readiness) ? ex.readiness : {}
+  const ra = isObj(ex.return_appointment) ? ex.return_appointment : {}
+  const v = (x, f) => (isMissing(x) ? null : (f(x) ?? display(x)))
+  return {
+    stats: [
+      { key: 'close', label: 'Close score', value: v(sales.close_score_1_10, fmt.score) },
+      { key: 'likelihood', label: 'Likelihood', value: v(sales.likelihood_percent, fmt.percent) },
+      { key: 'budget', label: 'Budget', value: budget(sales) },
+    ],
+    rows: [
+      { key: 'summary', label: 'Summary', value: v(ex.notes_summary, fmt.text) },
+      { key: 'project', label: 'Project', value: v(ex.project_type, fmt.project) },
+      { key: 'vision', label: 'Project vision', value: v(scope.project_vision, fmt.text) },
+      { key: 'timeline', label: 'Timeline', value: v(ready.time_frame, fmt.text) },
+      { key: 'return', label: 'Return appointment', value: returnAppointment(ra) },
+      { key: 'concerns', label: 'Concerns', value: v(sales.concerns, fmt.text) },
+      { key: 'financing', label: 'Financing', value: v(sales.financing_details, fmt.text) },
+    ],
+  }
+}
+
 // Copy to clipboard; falls back to a hidden textarea (older iOS / http).
 export async function copyText(text) {
   if (typeof text !== 'string') return false
@@ -353,10 +427,12 @@ export async function copyText(text) {
 // Admin URL helpers: #admin (list) and #admin/<job_id> (detail). A hash works on
 // any static host without rewrite rules, survives Clerk sign-in, and matches
 // the link in the FieldPulse comment footer (ADMIN_BASE_URL/#admin/<id>).
+// #consultations[/<id>] is accepted as a friendlier alias; the app itself
+// keeps writing #admin so old bookmarks and FieldPulse links stay identical.
 export function parseAdminHash(hash) {
   const h = typeof hash === 'string' ? hash.replace(/^#\/?/, '') : ''
-  if (h === 'admin' || h === 'admin/') return { view: 'list' }
-  const m = /^admin\/([A-Za-z0-9_-]{1,64})$/.exec(h)
+  if (/^(admin|consultations)\/?$/.test(h)) return { view: 'list' }
+  const m = /^(?:admin|consultations)\/([A-Za-z0-9_-]{1,64})$/.exec(h)
   if (m) return { view: 'detail', jobId: m[1] }
   return null
 }

@@ -13,7 +13,7 @@ function cssToken(s) {
   return String(s || '').replace(/[^a-z_]/g, '')
 }
 
-// Every consultation, newest first (admin panel list). Search by customer
+// Every consultation, newest first (the one "Consultations" list). Search by customer
 // name, filter by FieldPulse status; 50 per page.
 export default function AdminList({ onBack, onOpen, initial }) {
   const [q, setQ] = useState((initial && initial.q) || '')
@@ -60,8 +60,8 @@ export default function AdminList({ onBack, onOpen, initial }) {
       <header className="topbar">
         <button className="topbar-back" onClick={onBack} aria-label="Back">←</button>
         <div className="topbar-text">
-          <span className="topbar-eyebrow">Admin</span>
-          <h2 className="topbar-title">All consultations</h2>
+          <span className="topbar-eyebrow">Newest first</span>
+          <h2 className="topbar-title">Consultations</h2>
         </div>
       </header>
 

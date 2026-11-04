@@ -4,8 +4,9 @@ import {
   deleteAdminConsultation, fetchAdminAudioUrl, fetchAdminConsultation, requestAdminSend,
 } from '../lib/api.js'
 import {
-  FP_LABEL, MODE_LABEL, SOURCE_LABEL, STEP_NAME, WRITE_STATUS_LABEL,
-  copyText, display, fmtDateTime, fmtEpoch, groupExtraction, isObj, pretty, str,
+  FP_LABEL, JOB_STATUS_LABEL, MODE_LABEL, SOURCE_LABEL, STEP_NAME, WRITE_STATUS_LABEL,
+  copyText, display, fieldPulsePlain, fmtDateTime, fmtEpoch, groupExtraction, isObj,
+  keyResults, pretty, str,
 } from '../lib/admin.js'
 
 const POLL_MS = 3000
@@ -51,28 +52,39 @@ function Field({ label, children }) {
   )
 }
 
-// ---- 1. Header ------------------------------------------------------------
+// ---- 1. Summary (what Mike reads first) -----------------------------------
 
-function Header({ d }) {
+const NOT_MENTIONED = <em className="muted">Not mentioned</em>
+
+function Summary({ d }) {
   const c = isObj(d.customer) ? d.customer : {}
   const phone = str(c.phone)
   const email = str(c.email)
+  const fp = fieldPulsePlain(d)
+  const sync = isObj(d.fieldpulse_sync) ? d.fieldpulse_sync : null
   return (
-    <div className="admin-card">
-      <h3 className="admin-card-title">Consultation</h3>
+    <div className="admin-card admin-summary">
+      <h3 className="admin-card-title">Customer</h3>
       <dl className="admin-fields">
-        <Field label="Customer">{str(d.customer_name) || <em className="muted">No customer linked</em>}</Field>
+        <Field label="Name">{str(d.customer_name) || <em className="muted">No customer linked</em>}</Field>
         <Field label="Phone">{phone ? <a href={`tel:${phone}`}>{phone}</a> : <em className="muted">Not on file</em>}</Field>
-        <Field label="Email">{email ? <a href={`mailto:${email}`}>{email}</a> : <em className="muted">Not on file</em>}</Field>
+        {email && <Field label="Email"><a href={`mailto:${email}`}>{email}</a></Field>}
         <Field label="Address">{str(c.address) || <em className="muted">Not on file</em>}</Field>
-        <Field label="FieldPulse customer id">{display(d.customer_id) || <em className="muted">None</em>}</Field>
         <Field label="Date">{fmtDateTime(d.created_at) || '—'}</Field>
-        <Field label="Source">{SOURCE_LABEL[d.source] || str(d.source) || '—'}</Field>
-        <Field label="Job status">
-          <span className={`pill job-status status-${cssToken(d.status)}`}>{str(d.status) || '?'}</span>
+        <Field label="Status">
+          <span className={`pill job-status status-${cssToken(d.status)}`}>
+            {JOB_STATUS_LABEL[d.status] || str(d.status) || '?'}
+          </span>
         </Field>
-        <Field label="Consultation id"><code>{d.id}</code></Field>
       </dl>
+      <p className={`admin-fp-line fp-line-${fp.kind}`}>
+        <strong>FieldPulse: {fp.text}</strong>
+        {fp.detail ? <span className="admin-sub"> · {fp.detail}</span> : null}
+      </p>
+      {sync && str(sync.message) && <p className="admin-note">{sync.message}</p>}
+      {fp.kind === 'attention' && (
+        <p className="admin-note">Open &ldquo;Details for troubleshooting&rdquo; below to see each step or retry.</p>
+      )}
       {str(d.error) && (
         <div className="admin-alert">
           <strong>Error:</strong> {d.error}
@@ -82,7 +94,57 @@ function Header({ d }) {
   )
 }
 
-// ---- 2. FieldPulse -----------------------------------------------------------
+function KeyResults({ extraction }) {
+  const k = keyResults(extraction)
+  return (
+    <div className="admin-card admin-results">
+      <h3 className="admin-card-title">Consultation results</h3>
+      {!k ? (
+        <p className="admin-note">No extracted details (the job did not finish extraction).</p>
+      ) : (
+        <>
+          <div className="admin-stats">
+            {k.stats.map((s) => (
+              <div className="admin-stat" key={s.key}>
+                <span className="admin-stat-label">{s.label}</span>
+                <span className={`admin-stat-value${s.value ? '' : ' is-missing'}`}>
+                  {s.value || 'Not mentioned'}
+                </span>
+              </div>
+            ))}
+          </div>
+          <dl className="admin-fields admin-fields-stack">
+            {k.rows.map((r) => (
+              <Field key={r.key} label={r.label}>
+                {r.value ? <span className="admin-pre">{r.value}</span> : NOT_MENTIONED}
+              </Field>
+            ))}
+          </dl>
+        </>
+      )}
+    </div>
+  )
+}
+
+// Record-level ids for troubleshooting (moved from the old header card).
+function RecordInfo({ d }) {
+  return (
+    <div className="admin-card">
+      <h3 className="admin-card-title">Record</h3>
+      <dl className="admin-fields">
+        <Field label="FieldPulse customer id">{display(d.customer_id) || <em className="muted">None</em>}</Field>
+        <Field label="Source">{SOURCE_LABEL[d.source] || str(d.source) || '—'}</Field>
+        <Field label="Job status">
+          <span className={`pill job-status status-${cssToken(d.status)}`}>{str(d.status) || '?'}</span>
+        </Field>
+        <Field label="Last update">{fmtDateTime(d.updated_at) || '—'}</Field>
+        <Field label="Consultation id"><code>{d.id}</code></Field>
+      </dl>
+    </div>
+  )
+}
+
+// ---- 2. FieldPulse (troubleshooting) -----------------------------------------------------------
 
 function TaskBody({ body }) {
   if (!isObj(body)) return null
@@ -243,7 +305,7 @@ function FieldPulseSection({ d, onSend, sending, sendNote }) {
   )
 }
 
-// ---- 3. Extracted details ---------------------------------------------------------
+// ---- 3. Extracted details (troubleshooting: every field + AI flags) ---------------------------------------------------------
 
 function ExtractionSection({ extraction, taskReason }) {
   if (!isObj(extraction)) {
@@ -318,11 +380,11 @@ function TranscriptSection({ d }) {
     }
   }
   return (
-    <div className="admin-card">
-      <h3 className="admin-card-title">
-        Transcript
+    <details className="admin-card admin-fold">
+      <summary className="admin-card-title">
+        Transcript and recording
         {text && <span className="admin-sub">{text.length.toLocaleString()} characters</span>}
-      </h3>
+      </summary>
       <div className="admin-transcript-actions">
         <CopyButton text={text} label="Copy transcript" />
         {d.has_audio && audio !== 'loading' && !(audio && audio.url) && (
@@ -341,7 +403,7 @@ function TranscriptSection({ d }) {
       {text
         ? <pre className="admin-transcript">{text}</pre>
         : <p className="admin-note">No transcript saved.</p>}
-    </div>
+    </details>
   )
 }
 
@@ -373,32 +435,48 @@ function DeleteSection({ d, onDelete, deleting, deleteNote, sending }) {
   )
 }
 
-// ---- Body (all five sections; exported so it can be rendered with fixture data) ----
+// ---- Body (exported so it can be rendered with fixture data) ----------------------
+// Top: a clean summary for Mike. Below: transcript/recording (folded) and
+// "Details for troubleshooting" (folded): every FieldPulse step with the exact
+// request/response, Send/Retry, all extracted fields with AI flags, raw row, Delete.
 
 export function AdminDetailBody({ d, onSend, sending, sendNote, onDelete, deleting, deleteNote }) {
   return (
     <div className="admin-detail">
       <div className="admin-col">
-        <Header d={d} />
-        <FieldPulseSection d={d} onSend={onSend} sending={sending} sendNote={sendNote} />
+        <Summary d={d} />
       </div>
       <div className="admin-col">
-        <ExtractionSection
-          extraction={d.extraction}
-          taskReason={isObj(d.fieldpulse_sync) ? d.fieldpulse_sync.task_skipped_reason : null}
-        />
+        <KeyResults extraction={d.extraction} />
       </div>
       <div className="admin-col admin-col-full">
         <TranscriptSection d={d} />
-        <div className="admin-card">
-          <h3 className="admin-card-title">Raw record</h3>
-          <p className="admin-note">Everything stored for this consultation, as a last resort.</p>
-          <RawJson value={d.raw} label="Whole job row (raw JSON)" />
-        </div>
-        {onDelete && (
-          <DeleteSection d={d} onDelete={onDelete} deleting={deleting}
-            deleteNote={deleteNote} sending={sending} />
-        )}
+        <details className="admin-trouble">
+          <summary>Details for troubleshooting</summary>
+          <div className="admin-detail">
+            <div className="admin-col">
+              <RecordInfo d={d} />
+              <FieldPulseSection d={d} onSend={onSend} sending={sending} sendNote={sendNote} />
+            </div>
+            <div className="admin-col">
+              <ExtractionSection
+                extraction={d.extraction}
+                taskReason={isObj(d.fieldpulse_sync) ? d.fieldpulse_sync.task_skipped_reason : null}
+              />
+            </div>
+            <div className="admin-col admin-col-full">
+              <div className="admin-card">
+                <h3 className="admin-card-title">Raw record</h3>
+                <p className="admin-note">Everything stored for this consultation, as a last resort.</p>
+                <RawJson value={d.raw} label="Whole job row (raw JSON)" />
+              </div>
+              {onDelete && (
+                <DeleteSection d={d} onDelete={onDelete} deleting={deleting}
+                  deleteNote={deleteNote} sending={sending} />
+              )}
+            </div>
+          </div>
+        </details>
       </div>
     </div>
   )
@@ -434,6 +512,24 @@ export default function AdminDetail({ jobId, onBack, onDeleted }) {
       clearTimeout(pollRef.current)
     }
   }, [load])
+
+  // Still queued/processing: refresh every 5 s until it finishes (this is what
+  // opening an in-progress job from the old Recent list used to do).
+  // A transient failure bumps `retryTick` so the next attempt is scheduled
+  // (otherwise nothing in the deps changes and refreshing would stop).
+  const busy = !!d && BUSY.has(d.status)
+  const [retryTick, setRetryTick] = useState(0)
+  useEffect(() => {
+    if (!busy || sending || deleting) return undefined
+    const t = setTimeout(() => {
+      load().catch((e) => {
+        if (!mounted.current) return
+        if (e && e.status === 404) setError((e && e.message) || String(e))
+        else setRetryTick((n) => n + 1)
+      })
+    }, 5000)
+    return () => clearTimeout(t)
+  }, [busy, d, sending, deleting, load, retryTick])
 
   const waitFor = useCallback((requestId, tries) => {
     pollRef.current = setTimeout(async () => {
@@ -512,7 +608,7 @@ export default function AdminDetail({ jobId, onBack, onDeleted }) {
       <header className="topbar">
         <button className="topbar-back" onClick={onBack} aria-label="Back">←</button>
         <div className="topbar-text">
-          <span className="topbar-eyebrow">Admin · consultation</span>
+          <span className="topbar-eyebrow">Consultation</span>
           <h2 className="topbar-title">{(d && str(d.customer_name)) || 'Consultation'}</h2>
         </div>
       </header>

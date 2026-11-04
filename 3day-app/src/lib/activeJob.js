@@ -4,7 +4,7 @@
 // status view.
 //
 // Once a job reaches a terminal state (done/failed) we clear this key —
-// past jobs live in the Recent list (fetched from the backend), not here.
+// past jobs live in the Consultations list (fetched from the backend), not here.
 
 const KEY = 'voiceIntake.activeJob'
 
@@ -29,7 +29,7 @@ export function clearActiveJob() {
 }
 
 // Forget `jobId` if it is the stored in-flight job (e.g. it was deleted in
-// the admin panel), so a reload doesn't try to resume a job that is gone.
+// Consultations), so a reload doesn't try to resume a job that is gone.
 export function forgetJob(jobId) {
   const active = getActiveJob()
   if (active && jobId && active.job_id === jobId) clearActiveJob()

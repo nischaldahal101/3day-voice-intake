@@ -15,13 +15,13 @@ import Capture from './screens/Capture.jsx'
 import Processing from './screens/Processing.jsx'
 import Confirmation from './screens/Confirmation.jsx'
 import ErrorScreen from './screens/ErrorScreen.jsx'
-import RecentJobs from './screens/RecentJobs.jsx'
 import AdminList from './screens/AdminList.jsx'
 import AdminDetail from './screens/AdminDetail.jsx'
 
 const isAdminScreen = (s) => s === 'admin' || s === 'admin-detail'
 
-// Admin screens have their own URL (#admin, #admin/<job_id>) so Mike can
+// The Consultations screens (internally 'admin' / 'admin-detail') have their
+// own URL (#admin, #admin/<job_id>; #consultations[/<id>] also accepted) so Mike can
 // bookmark them and the FieldPulse comment can link straight to one. A hash
 // needs no server rewrite rules and survives the Clerk sign-in screen.
 function setAdminHash(hash) {
@@ -40,7 +40,7 @@ function clearAdminHash() {
 
 const GONE = {
   title: 'That consultation no longer exists',
-  message: 'It was deleted from the admin panel. Anything already sent to FieldPulse is still there.',
+  message: 'It was deleted from Consultations. Anything already sent to FieldPulse is still there.',
 }
 
 // Take a done /job-status response and shape it for the existing Confirmation
@@ -98,8 +98,8 @@ export default function App() {
         clearActiveJob()
         setJobResult(shapeJobResult(data))
         setPhase('done')
-        // A background job finishing never pulls the user out of the admin
-        // panel; it is in Recent and the admin list.
+        // A background job finishing never pulls the user out of the
+        // Consultations screens; it shows up in that list.
         if (!isAdminScreen(screenRef.current)) setScreen('confirmation')
         return
       }
@@ -287,54 +287,12 @@ export default function App() {
     setScreen('capture')
   }, [lastPayload, handleSubmit])
 
-  // ---- opening a job from the Recent list -----------------------------
-
-  const openRecentJob = useCallback((job) => {
-    stopPolling()
-    // The picker snapshot stored on the job, for the name on Confirmation /
-    // Processing (display only; null for old jobs). Failed jobs keep the old
-    // behaviour (no customer), so Retry from there still starts clean.
-    const c = job && job.customer
-    const snapshot = c && typeof c === 'object' && !Array.isArray(c) ? c : null
-    setCustomer(job.status === 'failed' ? null : snapshot)
-    setActiveJobId(job.id)
-    if (job.status === 'done') {
-      // Fetch full result for the confirmation screen.
-      fetchJobStatus(job.id)
-        .then((data) => {
-          setJobResult(shapeJobResult(data))
-          setPhase('done')
-          setScreen('confirmation')
-        })
-        .catch((e) => {
-          setErrorState(e && e.status === 404
-            ? GONE
-            : { title: "Couldn't load that consultation", message: e.message })
-          setScreen('error')
-        })
-      return
-    }
-    if (job.status === 'failed') {
-      setErrorState({
-        title: 'That consultation failed',
-        message: job.error || 'The pipeline reported an error.',
-      })
-      setScreen('error')
-      return
-    }
-    // queued or processing — resume polling
-    setPhase(job.status)
-    setScreen('processing')
-    startPolling(job.id)
-  }, [startPolling, stopPolling])
-
   return (
     <div className={isAdminScreen(screen) ? 'app app-wide' : 'app'}>
       {screen === 'home' && (
         <Home
           onStart={() => setScreen('pick')}
-          onRecent={() => setScreen('recent-jobs')}
-          onAdmin={openAdmin}
+          onConsultations={openAdmin}
         />
       )}
       {screen === 'pick' && (
@@ -367,12 +325,6 @@ export default function App() {
       )}
       {screen === 'error' && (
         <ErrorScreen error={errorState} onRetry={retry} onHome={reset} />
-      )}
-      {screen === 'recent-jobs' && (
-        <RecentJobs
-          onBack={() => setScreen('home')}
-          onOpen={openRecentJob}
-        />
       )}
       {screen === 'admin' && (
         <AdminList onBack={leaveAdmin} onOpen={openAdminDetail} initial={adminListState} />

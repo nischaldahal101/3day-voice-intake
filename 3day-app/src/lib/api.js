@@ -121,7 +121,7 @@ export async function fetchCustomers() {
 }
 
 // The selected customer's identity, sent with submit and stored on the job
-// (display only: names in Recent/Confirmation). The FieldPulse write uses
+// (display only: names in Processing/Confirmation). The FieldPulse write uses
 // only the id.
 function customerIdentity(customer) {
   if (!customer || customer.id === undefined || customer.id === null) return null
@@ -229,16 +229,6 @@ export async function fetchJobStatus(jobId) {
   )
   await assertOk(resp, 'job-status')
   return resp.json()
-}
-
-export async function fetchRecentJobs(limit = 20) {
-  const resp = await fetch(
-    `${API_BASE}/jobs/recent?limit=${encodeURIComponent(limit)}`,
-    { headers: await authHeaders() },
-  )
-  await assertOk(resp, 'recent jobs')
-  const data = await resp.json()
-  return data.jobs || []
 }
 
 // -------------------- Admin panel (stage 3) --------------------
