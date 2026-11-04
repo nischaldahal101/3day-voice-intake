@@ -595,7 +595,11 @@ def consultation_upload_url():
     passed here (the value is baked into the SigV4 signature; R2 will
     reject the PUT otherwise).
     """
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return _bad_request("Request body must be a JSON object")
     filename = (body.get("filename") or "").strip()
     content_type = (body.get("content_type") or "").strip()
     customer_id, customer_id_error = _parse_customer_id(body.get("customer_id"))
@@ -642,7 +646,11 @@ def consultation_submit():
     { "job_id", "status": "queued" } with HTTP 202. No extraction or
     FieldPulse work happens here.
     """
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return _bad_request("Request body must be a JSON object")
     raw_key = body.get("audio_key")
     audio_key = raw_key.strip() if isinstance(raw_key, str) else ""
     raw_transcript = body.get("transcript")
