@@ -37,6 +37,7 @@ import tempfile
 from extractor import ExtractionError, extract_consultation
 from fieldpulse_sync import consultation_reference, sync_consultation
 from jobs import JobError, get_job, save_manual_send, update_job_status
+from observability import init_sentry, report, traced_job
 from pipeline import transcribe
 from storage import StorageError, download_audio
 from transcriber import TranscriptionError
@@ -50,7 +51,13 @@ if not logger.handlers:
     logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
 
+# Sentry: no-op unless SENTRY_DSN is set. RQ imports this module inside the
+# forked work-horse, so this runs per job; traced_job flushes before the horse
+# exits (see observability.py). No start-command change needed.
+init_sentry("worker")
 
+
+@traced_job
 def process_consultation_job(job_id):
     """Full pipeline for one queued consultation job."""
     logger.info("[%s] picking up job", job_id)
@@ -131,6 +138,7 @@ def process_consultation_job(job_id):
         sync = sync_consultation(job, extraction)
     except Exception as exc:  # noqa: BLE001
         logger.exception("[%s] sync_consultation raised", job_id)
+        report(exc, "sync_consultation raised", job_id=job_id)
         sync = {"status": "failed", "message": "FieldPulse sync hit an internal error. "
                 "The consultation is saved.", "error": f"{type(exc).__name__}", "steps": []}
     summary["fieldpulse_sync"] = sync
@@ -143,6 +151,7 @@ def process_consultation_job(job_id):
     logger.info("[%s] DONE (fieldpulse_sync=%s)", job_id, sync.get("status"))
 
 
+@traced_job
 def send_consultation_to_fieldpulse(job_id, request_id):
     """Admin "Send to FieldPulse" / "Retry" (queued by admin_panel). Runs
     fieldpulse_sync for the saved extraction as an explicit MANUAL send: the
@@ -182,13 +191,15 @@ def send_consultation_to_fieldpulse(job_id, request_id):
         logger.info("[%s] manual send done: %s", job_id, sync.get("status"))
     except Exception as exc:  # noqa: BLE001
         logger.exception("[%s] manual send crashed", job_id)
+        report(exc, "Manual FieldPulse send crashed", job_id=job_id)
         try:
             save_manual_send(job_id, {**entry, "status": "error", "finished_at": now(),
                                       "message": f"The send hit an internal error "
                                                  f"({type(exc).__name__}). Check the "
                                                  f"FieldPulse steps below before retrying."})
-        except Exception:  # noqa: BLE001
+        except Exception as exc2:  # noqa: BLE001
             logger.exception("[%s] could not record the manual send error", job_id)
+            report(exc2, "Could not record manual send error", job_id=job_id)
 
 
 def _fail(job_id, message):
@@ -198,3 +209,5 @@ def _fail(job_id, message):
         update_job_status(job_id, "failed", error=message)
     except Exception as exc:  # noqa: BLE001
         logger.error("[%s] additionally failed to record failure: %s", job_id, exc)
+        # The row may now be stuck in 'processing': worth an alert of its own.
+        report(exc, "Could not mark job failed", job_id=job_id)

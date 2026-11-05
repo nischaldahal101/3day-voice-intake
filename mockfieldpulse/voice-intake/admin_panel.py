@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 import jobs
 import queue_setup
 import storage
+from observability import report
 
 logger = logging.getLogger("voice_intake.admin_panel")
 if not logger.handlers:
@@ -325,6 +326,7 @@ def request_manual_send(job_id, user_id=None, user_name=None):
         queue_setup.enqueue_manual_send(job_id, entry["id"])
     except Exception as exc:  # noqa: BLE001 — Redis down etc.
         logger.error("[%s] could not queue manual send: %s", job_id, exc)
+        report(exc, "Could not queue manual FieldPulse send", job_id=job_id)
         jobs.save_manual_send(job_id, {"id": entry["id"], "status": "error",
                                        "finished_at": datetime.now(timezone.utc).isoformat(),
                                        "message": "Could not queue the send (the job queue is "
@@ -347,6 +349,7 @@ def audio_url(job_id):
         url = storage.generate_download_url(key, expires_in=900)
     except storage.StorageError as exc:
         logger.error("[%s] audio url failed: %s", job_id, exc)
+        report(exc, "Admin audio URL failed", job_id=job_id)
         return 502, {"error": "Could not create an audio link right now."}
     return 200, {"url": url, "expires_in": 900}
 
@@ -394,6 +397,7 @@ def delete_consultation(job_id, user_id=None):
             audio = "failed"
             logger.error("[%s] deleted, but its audio %s was not removed from R2: %s",
                          job_id, key, exc)
+            report(exc, "R2 audio delete failed after consultation delete", job_id=job_id)
     logger.info("[%s] consultation deleted by %s (%d FieldPulse write rows, audio %s)",
                 job_id, _text(user_id, 64) or "?", out["writes_deleted"], audio)
     return 200, {"deleted": True, "id": job_id, "audio": audio,

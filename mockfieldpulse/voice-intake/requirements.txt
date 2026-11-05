@@ -11,3 +11,4 @@ redis==7.0.1
 rq==2.8.0
 gunicorn==23.0.0
 clerk-backend-api==4.2.0
+sentry-sdk[flask]==2.73.0

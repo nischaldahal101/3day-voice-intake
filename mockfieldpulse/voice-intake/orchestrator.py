@@ -25,6 +25,7 @@ from customer_source import CustomerSourceError, list_customers
 from extractor import ExtractionError, extract_intake
 from fieldpulse_writer import WriterError, write_intake_to_fieldpulse
 from jobs import create_job, get_job, list_recent_jobs
+from observability import init_sentry, report
 from pipeline import run_from_transcript as _run_consult_from_transcript
 from queue_setup import enqueue_consultation
 from storage import (
@@ -37,6 +38,10 @@ from transcriber import TranscriptionError, transcribe_audio
 
 _HERE = Path(__file__).resolve().parent
 load_dotenv(_HERE / ".env")
+
+# Sentry (errors + tracing). No-op unless SENTRY_DSN is set. Before the Flask
+# app exists so the Flask integration covers every request.
+init_sentry("orchestrator")
 
 # Render sets $PORT; default to 5100 for local dev so existing scripts /
 # curl commands keep working. (Under gunicorn on Render, gunicorn binds
@@ -101,7 +106,10 @@ app = Flask(__name__)
 CORS(
     app,
     origins="*",
-    allow_headers=["Content-Type", "Authorization"],
+    # sentry-trace + baggage: Sentry trace propagation from the React app
+    # (links a browser action to the request and the worker job). Headers only;
+    # origins are unchanged.
+    allow_headers=["Content-Type", "Authorization", "sentry-trace", "baggage"],
     # DELETE: admin "Delete consultation" (our DB only). Methods only; the
     # origins lockdown above is still a separate, flagged production step.
     methods=["GET", "POST", "DELETE", "OPTIONS"],
@@ -212,6 +220,8 @@ def _require_clerk_session():
         )
     except Exception as exc:  # noqa: BLE001 — never want SDK bugs to 500 auth
         logger.warning("Clerk auth threw on %s: %s", request.path, exc)
+        report(exc, "Clerk authenticate_request raised",
+               route=request.url_rule.rule if request.url_rule else "/unmatched")
         return jsonify({
             "status": "unauthorized",
             "error": "Session verification failed.",
@@ -623,6 +633,7 @@ def consultation_upload_url():
         upload_url = generate_upload_url(audio_key, content_type)
     except StorageError as exc:
         logger.error("Upload URL generation failed: %s", exc)
+        report(exc, "R2 upload URL generation failed")
         return jsonify({"error": str(exc)}), 502
 
     logger.info(
@@ -698,6 +709,7 @@ def consultation_submit():
             exists = audio_exists(audio_key)
         except StorageError as exc:
             logger.error("Failed to verify R2 key: %s", exc)
+            report(exc, "R2 HEAD check on submit failed")
             return jsonify({"error": f"Could not verify R2 upload: {exc}"}), 502
 
         if not exists:
@@ -771,6 +783,7 @@ def app_customers():
         customers = list_customers()
     except CustomerSourceError as exc:
         logger.error("/app/customers failed (%s): %s", exc.status, exc)
+        report(exc, "Customer list failed", status=exc.status, http_status=exc.http_status)
         return jsonify({"status": exc.status, "error": str(exc)}), exc.http_status
     logger.info("/app/customers -> %d customers", len(customers))
     return jsonify({"customers": customers})

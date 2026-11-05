@@ -3,7 +3,13 @@ import { createRoot } from 'react-dom/client'
 import { ClerkProvider, SignedIn, SignedOut } from '@clerk/clerk-react'
 import App from './App.jsx'
 import SignInScreen from './screens/SignInScreen.jsx'
+import ErrorScreen from './screens/ErrorScreen.jsx'
+import { AppErrorBoundary, initSentry } from './lib/sentry.jsx'
 import './index.css'
+
+// Sentry first, so errors during the rest of boot are reported. No-op unless
+// VITE_SENTRY_DSN is set at build time (see lib/sentry.jsx).
+initSentry()
 
 // Clerk publishable key is baked in at build time via Vite's env system.
 // It's public (not a secret), so shipping it in the JS bundle is fine.
@@ -54,8 +60,32 @@ const CLERK_APPEARANCE = {
   },
 }
 
+// A render crash anywhere shows the normal error screen instead of a blank
+// page. "Try again" re-mounts the app (an active job resumes from
+// localStorage); "Home" also clears an #admin hash so it lands on Home.
+function CrashScreen({ resetError }) {
+  return (
+    <div className="app">
+      <ErrorScreen
+        error={{
+          title: 'Something went wrong',
+          message: 'The app hit an unexpected problem. Your recordings and consultations are safe.',
+        }}
+        onRetry={resetError}
+        onHome={() => {
+          if (window.location.hash) {
+            window.history.replaceState(null, '', window.location.pathname + window.location.search)
+          }
+          resetError()
+        }}
+      />
+    </div>
+  )
+}
+
 createRoot(document.getElementById('root')).render(
   <StrictMode>
+    <AppErrorBoundary fallback={CrashScreen}>
     <ClerkProvider
       publishableKey={CLERK_PUBLISHABLE_KEY}
       appearance={CLERK_APPEARANCE}
@@ -70,5 +100,6 @@ createRoot(document.getElementById('root')).render(
         <App />
       </SignedIn>
     </ClerkProvider>
+    </AppErrorBoundary>
   </StrictMode>,
 )

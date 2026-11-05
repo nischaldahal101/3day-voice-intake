@@ -75,6 +75,8 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from observability import report
+
 logger = logging.getLogger("voice_intake.fieldpulse_sync")
 if not logger.handlers:
     _handler = logging.StreamHandler(sys.stdout)
@@ -240,8 +242,9 @@ def consultation_reference(job):
     try:
         tz = _config()["tz"]
         return _consultation_day(job, tz), getattr(tz, "key", None) or DEFAULT_TIMEZONE
-    except Exception:  # noqa: BLE001 — a reference date is optional
+    except Exception as exc:  # noqa: BLE001 — a reference date is optional
         logger.exception("consultation_reference failed")
+        report(exc, "consultation_reference failed", job_id=_dict(job).get("id"))
         return None, None
 
 
@@ -900,6 +903,7 @@ def sync_consultation(job, extraction, manual=False):
         out = _sync(job, extraction, manual)
     except Exception as exc:  # noqa: BLE001 — the write must never fail the job
         logger.exception("[%s] FieldPulse sync crashed", job.get("id"))
+        report(exc, "FieldPulse sync crashed", job_id=job.get("id"), manual=manual)
         out = {"status": "failed", "mode": None,
                 "message": "FieldPulse sync hit an internal error. Nothing more was sent. "
                            "The consultation is saved.",
@@ -976,8 +980,12 @@ def _sync(job, extraction, manual=False):
             status_code, payload = _send(step["request"], cfg)
         except _NotDelivered as exc:
             store.finish_fieldpulse_write(job_id, name_, "failed", error=str(exc))
+            report(message=f"FieldPulse {name_} not delivered", level="warning",
+                   job_id=job_id, step=name_, mode=cfg["mode"], manual=manual)
             continue
         except _OutcomeUnknown as exc:
+            report(message=f"FieldPulse {name_} sent, outcome unknown", level="warning",
+                   job_id=job_id, step=name_, mode=cfg["mode"], manual=manual)
             store.finish_fieldpulse_write(
                 job_id, name_, "sent",
                 error=f"{exc}. It may or may not have been created; check FieldPulse "
@@ -992,6 +1000,11 @@ def _sync(job, extraction, manual=False):
             error=None if ok else _error_text(status_code, payload))
         logger.info("[%s] FieldPulse %s -> HTTP %s (%s)", job_id, name_, status_code,
                     "ok" if ok else "failed")
+        if not ok:
+            # Fixed text + tags only: FieldPulse's error body may echo customer data.
+            report(message=f"FieldPulse {name_} failed (HTTP {status_code})", level="warning",
+                   job_id=job_id, step=name_, http_status=status_code, mode=cfg["mode"],
+                   manual=manual)
 
     rows = {r["step"]: r for r in store.list_fieldpulse_writes(job_id)}
     out = _summarize(base, cfg, plan, rows, allowed, why)

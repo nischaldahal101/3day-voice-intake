@@ -61,6 +61,9 @@ mock service over HTTPS once deployed.
 | `FIELDPULSE_READ_BASE_URL` | *Optional.* Real FieldPulse base URL (`https://ywe3crmpll.execute-api.us-east-2.amazonaws.com/stage`, see `docs/FIELDPULSE_API.md` §1). Used **only** by `customer_source.py` to list customers for the picker, GET only. Unset = the picker reads the mock (`FIELDPULSE_BASE_URL`). Set it together with the key below, or the picker returns a 500 config error. **Orchestrator only; never set it on the worker.** Run `probe_fieldpulse_customers.py` once before relying on it. |
 | `FIELDPULSE_READ_API_KEY` | *Optional.* Mike's real FieldPulse API key for the read above. Secret. Never put it in `FIELDPULSE_API_KEY` (that one is for writes to the mock). |
 | `INTAKE_API_KEY` | The shared secret the React app sends as `x-intake-key`. Pick a real value here when going to production; locally defaults to `dev-intake-key`. |
+| `SENTRY_DSN` | *Optional.* Sentry DSN of project `voice-intake-backend` (Sentry → Project Settings → Client Keys). Unset = Sentry off. Same value on the orchestrator and the worker. See "Sentry" below. |
+| `SENTRY_ENVIRONMENT` | *Optional.* Default `production` on Render (Render sets `RENDER`), `development` elsewhere. |
+| `SENTRY_RELEASE` | *Optional.* Default `RENDER_GIT_COMMIT` (Render sets it), so no need to set it on Render. |
 
 > **Schema (automatic, additive):** on boot, `jobs.py` runs
 > `ALTER TABLE consultation_jobs ADD COLUMN IF NOT EXISTS customer JSONB` and
@@ -79,6 +82,8 @@ mock service over HTTPS once deployed.
 Runs `worker.process_consultation_job` for each queued job (transcribe or paste → extract → save →
 FieldPulse sync). Start command: `rq worker consultations` (Root Directory `voice-intake`). It needs the
 same `DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` and `R2_*` as the orchestrator.
+Sentry: the same optional `SENTRY_DSN` / `SENTRY_ENVIRONMENT` / `SENTRY_RELEASE` as the orchestrator
+(events are tagged `component=worker`). The start command does **not** change.
 
 ### FieldPulse write variables — WORKER ONLY
 
@@ -111,6 +116,24 @@ R2 CORS lockdown doesn't affect it.
 
 The worker keeps `FIELDPULSE_BASE_URL` only because the deprecated mock code still imports it; the live
 flow no longer writes to the mock (stage 6 removes it).
+
+### Sentry (errors + tracing)
+
+`observability.py` sets it up for both services (`component` tag = `orchestrator` / `worker`). With
+`SENTRY_DSN` unset nothing is initialised. Settings: 100% of transactions traced, no PII
+(`send_default_pii=False`), no request bodies, no stack-frame local variables (they hold transcripts and
+customer records), no profiling, no Sentry logs, no AI prompts. URLs lose their query strings, request
+headers are an allowlist (no `Authorization`/cookies), and log lines become breadcrumbs as their template
+only (no interpolated values). The worker needs no special start command: `worker.py` initialises Sentry
+inside each RQ work-horse and flushes before it exits.
+
+Frontend (static site, `3day-app`): optional build-time env vars `VITE_SENTRY_DSN` (project
+`voice-intake-frontend`; unset = Sentry off) and `SENTRY_AUTH_TOKEN` (Sentry auth token with
+`project:releases` scope: uploads hidden source maps to `nd-tv/voice-intake-frontend`, then deletes the
+`.map` files; unset = no source maps are built at all). `VITE_SENTRY_ENVIRONMENT` / `SENTRY_RELEASE` are
+optional (release defaults to `RENDER_GIT_COMMIT`). The frontend sends `sentry-trace` / `baggage` headers
+to the API only, so **deploy the orchestrator (which allows those headers in CORS) before setting
+`VITE_SENTRY_DSN` on the static site**; an old orchestrator would fail the browser preflight.
 
 > **Deploy the mock first**, copy its `https://...onrender.com` URL into the
 > orchestrator's `FIELDPULSE_BASE_URL`, then deploy the orchestrator.
