@@ -21,13 +21,16 @@ from __future__ import annotations
 import logging
 import os
 import re
+import select
 import sys
 import time
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
+from psycopg import OperationalError
 from psycopg import errors as psycopg_errors
+from psycopg.pq import ExecStatus, TransactionStatus
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -63,8 +66,9 @@ DATABASE_URL = os.environ.get(
 # own Postgres add-on.
 #
 # Hardening (review-log F-26): a request must never wait forever on the DB.
-#   - check: each connection is pinged when handed out, so a dead one (DB
-#     restart, dropped TCP) is replaced instead of failing/hanging a request.
+#   - check: each connection is pinged when handed out (with a 5 s deadline,
+#     see _check_connection), so a dead one (DB restart, dropped TCP) is
+#     replaced instead of failing/hanging a request.
 #   - max_idle / max_lifetime: recycle connections well before Render/the
 #     network drops them silently.
 #   - timeout: getconn waits 10s, not 30s, so a stall surfaces quickly.
@@ -77,6 +81,77 @@ _SERVER_OPTIONS = (
     "-c statement_timeout=20000 -c lock_timeout=5000 "
     "-c idle_in_transaction_session_timeout=60000"
 )
+
+# Client-side timeouts (review-log F-42). Production: after ~30 min idle the
+# orchestrator's pooled connections went silently dead (no RST), and every DB
+# request then failed with a 10 s PoolTimeout until a restart. The pool's
+# per-checkout check (and any query) on such a socket waits with no client
+# deadline (Linux only gives up after ~15 min of TCP retransmits), and once
+# max_size checkouts are stuck nothing is left to hand out. So:
+#   - connect_timeout: a new connection gives up after 10 s (psycopg's default
+#     is 130 s), so the pool's reconnect loop keeps moving.
+#   - TCP keepalives: an idle dead connection is detected within ~60 s
+#     (30 s idle + 3 probes x 10 s) and then fails its check instantly; the
+#     probes also keep NAT/proxy idle timers from dropping a live one.
+#   - tcp_user_timeout: data unacknowledged for 30 s errors the socket (a query
+#     sent into a dead link). Linux only; libpq accepts it and ignores it on
+#     macOS.
+#   - _check_connection: the checkout ping has its own 5 s deadline, so a stale
+#     connection is discarded (and replaced) even when the TCP layer still looks
+#     healthy (e.g. a stalled proxy in between).
+_CLIENT_TIMEOUTS = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 30000,
+}
+_CHECK_TIMEOUT_S = 5.0
+
+
+def _check_connection(conn) -> None:
+    """ConnectionPool.check_connection (an empty query) with a deadline.
+    Raises on a broken, busy or unresponsive connection; the pool then closes
+    it, opens a replacement and retries the checkout within its own timeout."""
+    pgconn = conn.pgconn
+    if pgconn.transaction_status != TransactionStatus.IDLE:
+        raise OperationalError("pooled connection is not idle")
+    deadline = time.monotonic() + _CHECK_TIMEOUT_S
+    pgconn.send_query(b"")
+    # One deadline covers the whole exchange (review-log F-44): get_result()
+    # blocks while libpq is busy, so it is only called once is_busy() is false,
+    # for every result INCLUDING the final end-of-results (ReadyForQuery). A
+    # reply that arrives in pieces and then stalls fails here instead of hanging.
+    results = 0
+    while True:
+        _wait_not_busy(pgconn, deadline)
+        res = pgconn.get_result()
+        if res is None:
+            break
+        results += 1
+        if results > 1 or res.status not in (ExecStatus.EMPTY_QUERY, ExecStatus.COMMAND_OK):
+            raise OperationalError("connection check failed")
+    if results != 1 or pgconn.transaction_status != TransactionStatus.IDLE:
+        raise OperationalError("connection check failed")
+
+
+def _wait_not_busy(pgconn, deadline: float) -> None:
+    """Flush and read until libpq can hand out the next result without
+    blocking; raise OperationalError once `deadline` (monotonic) passes."""
+    while True:
+        flushed = pgconn.flush() == 0
+        if flushed:
+            pgconn.consume_input()
+            if not pgconn.is_busy():
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OperationalError(
+                f"connection check timed out after {_CHECK_TIMEOUT_S:.0f}s")
+        sock = pgconn.socket
+        select.select([sock], [] if flushed else [sock], [], remaining)
+
 # Surface psycopg_pool's own warnings (e.g. "error connecting in 'pool-1':
 # <real reason>") in the Render logs. Without a handler they are silently
 # dropped and a failure only shows up as a bare PoolTimeout.
@@ -95,8 +170,8 @@ pool = ConnectionPool(
     timeout=10.0,
     max_idle=300.0,
     max_lifetime=1800.0,
-    check=ConnectionPool.check_connection,
-    kwargs={"row_factory": dict_row, "options": _SERVER_OPTIONS},
+    check=_check_connection,
+    kwargs={"row_factory": dict_row, "options": _SERVER_OPTIONS, **_CLIENT_TIMEOUTS},
 )
 
 _SCHEMA_SQL = """

@@ -332,6 +332,62 @@ class TestCommentText(Base):
         self.assertIn("[Trimmed to fit.", t)
         self.assertIn("Full transcript and details:", t)
 
+    def test_comment_fits_fieldpulse_4000_char_limit(self):
+        # Real FieldPulse: HTTP 400 "The text may not be greater than 4000 characters."
+        self.assertLessEqual(fs.MAX_COMMENT_CHARS, 4000)
+        self.setenv(ADMIN_BASE_URL="https://threeday-voice-intake-1.onrender.com")
+        ex = full_extraction(scheduled=True, details="Thursday, November 12 at 6 pm")
+        ex["notes_summary"] = "Summary sentence — with an em dash. " * 120
+        ex["scope"]["project_vision"] = "Walk-in shower, molded bench, niche. " * 120
+        ex["flags"] = [f"flag {i}: " + "detail " * 40 for i in range(30)]
+        t = self.text(ex)
+        self.assertLessEqual(len(t), 4000)
+        self.assertIn("[Trimmed to fit.", t)
+        self.assertIn("Full transcript and details:", t)
+
+    def _long_extraction(self):
+        ex = full_extraction(scheduled=True, details="Thursday, November 12 at 6 pm")
+        ex["notes_summary"] = "Résumé — 🚿 浴室 sentence. " * 200
+        ex["scope"]["project_vision"] = "Walk-in shower, molded bench, niche. " * 120
+        ex["flags"] = [f"flag {i}: " + "détail " * 40 for i in range(30)]
+        return ex
+
+    def test_oversized_admin_url_never_exceeds_cap(self):
+        # review-log F-45: a huge ADMIN_BASE_URL / job id must not defeat the cap
+        long_id = "job_" + "9" * 3000
+        for pad in (0, 300, 470, 3700, 3800, 5000):
+            for jid in ("job_123456789012", long_id):
+                self.setenv(ADMIN_BASE_URL="https://example.invalid/" + "a" * pad)
+                for long_ex in (True, False):
+                    ex = self._long_extraction() if long_ex else empty_extraction()
+                    t = self.text(ex, job(id=jid))
+                    self.assertLessEqual(len(t), fs.MAX_COMMENT_CHARS, (pad, len(jid)))
+                    self.assertIn("Written by AI from the consultation.", t)
+                    self.assertIn("Full transcript and details:", t)
+                    link = next(l for l in t.splitlines() if l.startswith("Full transcript"))
+                    self.assertLessEqual(len(link), fs._MAX_LINK_CHARS)
+                    if "/#admin/" in link:          # a link is either complete or absent
+                        self.assertTrue(link.endswith("/#admin/" + jid))
+                    if long_ex:
+                        self.assertIn("[Trimmed to fit.", t)
+        # oversized -> plain fallback, keeps a short id, drops a huge one
+        self.setenv(ADMIN_BASE_URL="https://example.invalid/" + "a" * 3800)
+        t = self.text(self._long_extraction(), job(id="job_123456789012"))
+        self.assertIn("in the consultation tool (consultation job_123456789012).", t)
+        t = self.text(self._long_extraction(), job(id=long_id))
+        self.assertNotIn(long_id, t)
+
+    def test_normal_admin_url_kept_and_link_boundary(self):
+        jid = "job_123456789012"
+        prefix = len("Full transcript and details: ") + len("/#admin/") + len(jid)
+        for base_len, kept in ((fs._MAX_LINK_CHARS - prefix, True),
+                               (fs._MAX_LINK_CHARS - prefix + 1, False)):
+            base = "https://x.invalid/" + "b" * (base_len - len("https://x.invalid/"))
+            self.setenv(ADMIN_BASE_URL=base)
+            t = self.text(self._long_extraction(), job(id=jid))
+            self.assertLessEqual(len(t), fs.MAX_COMMENT_CHARS)
+            self.assertEqual(f"{base}/#admin/{jid}" in t, kept)
+
     def test_garbage_extraction_does_not_crash(self):
         for ex in ({}, None, {"sales": "x", "scope": [], "flags": "abc",
                               "return_appointment": 5}):

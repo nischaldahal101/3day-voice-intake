@@ -92,7 +92,11 @@ DEFAULT_MODE = "dry_run"
 DEFAULT_TIMEZONE = "America/Chicago"
 DEFAULT_COMMENTABLE_TYPE = "customer"   # UNVERIFIED, see module docstring
 
-MAX_COMMENT_CHARS = 6000
+# FieldPulse rejects longer comments: HTTP 400 "The text may not be greater than 4000
+# characters." (confirmed on the real API 2026-11-05; Laravel max:4000 counts characters).
+# 3900 leaves a margin; the body is trimmed at a line break and the footer is kept.
+MAX_COMMENT_CHARS = 3900
+_MAX_LINK_CHARS = 500         # admin link line in the comment footer (longer -> plain fallback)
 _FIELD_CHARS = 600            # one extracted text field inside the comment
 _MAX_ATTEMPTS = 3
 _MANUAL_MAX_ATTEMPTS = 10     # manual "Retry" may go past the automatic cap
@@ -730,8 +734,15 @@ def build_comment_text(job, extraction, task_window, task_reason, cfg):
         lines += ["", "AI FLAGS"] + [f"- {f}" for f in flags[:20]]
 
     footer = ["", "Written by AI from the consultation. Please double-check before acting on it."]
+    job_id = str(job.get("id") or "")
     if cfg["admin_base_url"]:
-        footer.append(f"Full transcript and details: {cfg['admin_base_url']}/#admin/{job.get('id')}")
+        link = f"Full transcript and details: {cfg['admin_base_url']}/#admin/{job_id}"
+        if len(link) > _MAX_LINK_CHARS:
+            # review-log F-45: an oversized ADMIN_BASE_URL / id must not push the
+            # comment past FieldPulse's limit; a cut URL would be a broken link.
+            ref = f" (consultation {job_id})" if job_id and len(job_id) <= 64 else ""
+            link = f"Full transcript and details: in the consultation tool{ref}."
+        footer.append(link)
     footer_text = "\n" + "\n".join(footer)        # blank line before the footer
 
     body = "\n".join(lines)
@@ -742,7 +753,9 @@ def build_comment_text(job, extraction, task_window, task_reason, cfg):
         if "\n" in cut:
             cut = cut[: cut.rfind("\n")]
         body = cut.rstrip() + note
-    return body + footer_text
+    # The footer is bounded above, so this never cuts in practice; it makes the
+    # FieldPulse length limit a guarantee for every input.
+    return (body + footer_text)[:MAX_COMMENT_CHARS]
 
 
 # --- Plan ----------------------------------------------------------------------------
