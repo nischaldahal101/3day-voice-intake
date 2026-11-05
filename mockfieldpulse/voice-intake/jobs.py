@@ -77,6 +77,16 @@ _SERVER_OPTIONS = (
     "-c statement_timeout=20000 -c lock_timeout=5000 "
     "-c idle_in_transaction_session_timeout=60000"
 )
+# Surface psycopg_pool's own warnings (e.g. "error connecting in 'pool-1':
+# <real reason>") in the Render logs. Without a handler they are silently
+# dropped and a failure only shows up as a bare PoolTimeout.
+_pool_logger = logging.getLogger("psycopg.pool")
+if not _pool_logger.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _pool_logger.addHandler(_h)
+    _pool_logger.setLevel(logging.WARNING)
+
 pool = ConnectionPool(
     DATABASE_URL,
     min_size=1,
