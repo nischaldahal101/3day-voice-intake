@@ -981,7 +981,9 @@ def build_plan(job, extraction, cfg):
         n_groups = len(material["groupings"])
         steps.append({
             "step": _MATERIAL_STEP,
-            "request": {"method": "POST", "path": "/material-list", "body": material},
+            # Plural: the docs say /material-list, but the API only routes /material-lists
+            # (the singular path answers 403 "Missing Authentication Token").
+            "request": {"method": "POST", "path": "/material-lists", "body": material},
             "skip_reason": None,
             "description": (f"Create a draft material list for {name} ({info} item"
                             f"{'' if info == 1 else 's'} in {n_groups} group"

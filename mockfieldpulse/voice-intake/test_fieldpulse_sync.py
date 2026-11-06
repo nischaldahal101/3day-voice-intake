@@ -1093,7 +1093,7 @@ class TestMaterialList(Base):
         self.assertIsNone(step["skip_reason"])
         req = step["request"]
         self.assertEqual(set(req), {"method", "path", "body"})
-        self.assertEqual((req["method"], req["path"]), ("POST", "/material-list"))
+        self.assertEqual((req["method"], req["path"]), ("POST", "/material-lists"))
         body = req["body"]
         self.assertEqual(set(body), {"customer_id", "is_template", "title", "notes", "groupings"})
         self.assertNotIn("status_id", body)
@@ -1214,7 +1214,7 @@ class TestMaterialSync(Base):
         rows = {r["step"]: r for r in self.store.list_fieldpulse_writes("job_abc")}
         self.assertEqual(rows["material_list"]["status"], "planned")
         self.assertEqual(rows["material_list"]["mode"], "dry_run")
-        self.assertEqual(rows["material_list"]["request"]["path"], "/material-list")
+        self.assertEqual(rows["material_list"]["request"]["path"], "/material-lists")
 
     def test_skipped_materials_leave_message_and_status_unchanged(self):
         out = fs.sync_consultation(job(), with_materials([]))
@@ -1243,7 +1243,7 @@ class TestMaterialSync(Base):
                          (200, {"error": False, "response": {"id": 2}}),
                          (200, {"error": False, "response": {"id": 3}})])
         out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
-        self.assertEqual([r["path"] for r in self.sent], ["/comments", "/jobs", "/material-list"])
+        self.assertEqual([r["path"] for r in self.sent], ["/comments", "/jobs", "/material-lists"])
         self.assertEqual(out["status"], "succeeded")
         self.assertIn("Created a draft material list (5 items).", out["message"])
         rows = {r["step"]: r for r in self.store.list_fieldpulse_writes("job_abc")}

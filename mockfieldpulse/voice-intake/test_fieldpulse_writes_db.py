@@ -129,7 +129,7 @@ class TestWritesDB(unittest.TestCase):
                          [("comment", "planned", "dry_run"), ("return_task", "planned", "dry_run"),
                           ("material_list", "planned", "dry_run")])
         self.assertEqual(rows[1]["request"]["body"]["type"], "task")
-        self.assertEqual(rows[2]["request"]["path"], "/material-list")
+        self.assertEqual(rows[2]["request"]["path"], "/material-lists")
         self.assertEqual(rows[2]["request"]["body"]["groupings"][0]["title"], "Shower")
         # Mode switched to live later: the dry-run rows are held, nothing is sent.
         with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "live",
