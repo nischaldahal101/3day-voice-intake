@@ -157,6 +157,9 @@ def _config():
         "commentable_type": (os.environ.get("FIELDPULSE_COMMENT_COMMENTABLE_TYPE") or "").strip()
                             or DEFAULT_COMMENTABLE_TYPE,
         "tag_id": _int_id(os.environ.get("FIELDPULSE_AI_JOB_TAG_ID")),
+        # FieldPulse refuses a material-list line without an item_id (NOT NULL in its DB),
+        # so every draft line links to one $0 placeholder item in Mike's item list.
+        "material_item_id": _int_id(os.environ.get("FIELDPULSE_MATERIAL_ITEM_ID")),
         "admin_base_url": (os.environ.get("ADMIN_BASE_URL") or "").strip().rstrip("/"),
         "tz": tz,
     }
@@ -841,7 +844,7 @@ def _material_entries(extraction):
     return out, None
 
 
-def _material_line(entry):
+def _material_line(entry, item_id):
     desc = " ".join(p for p in (
         entry["details"] and (entry["details"] if entry["details"][-1] in ".!?…"
                               else entry["details"] + "."),
@@ -850,7 +853,7 @@ def _material_line(entry):
     # (HTTP 400 'Undefined array key "id"' when absent); null means "create new".
     line = {
         "id": None,
-        "item_id": None,
+        "item_id": item_id,
         "title": entry["item"],
         "quantity": entry["quantity"] if entry["quantity"] is not None else 1,
         "unit_price": 0,
@@ -883,7 +886,7 @@ def build_material_list(job, extraction, cfg):
             if len(groups) >= _MAX_MATERIAL_GROUPS:
                 title, key = _OTHER_AREA, _OTHER_AREA.casefold()
             groups.setdefault(key, (title, []))
-        groups[key][1].append(_material_line(e))
+        groups[key][1].append(_material_line(e, cfg.get("material_item_id")))
         kept += 1
     other = groups.pop(_OTHER_AREA.casefold(), None)
     ordered = list(groups.values()) + ([other] if other else [])
@@ -981,6 +984,9 @@ def build_plan(job, extraction, cfg):
         })
 
     material, info = build_material_list(job, ex, cfg)
+    if material and not cfg.get("material_item_id"):
+        material, info = None, ("FIELDPULSE_MATERIAL_ITEM_ID is not set (FieldPulse needs a "
+                                "placeholder item for material-list lines)")
     if material:
         n_groups = len(material["groupings"])
         steps.append({

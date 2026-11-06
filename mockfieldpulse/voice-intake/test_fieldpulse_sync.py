@@ -1079,6 +1079,16 @@ def with_materials(materials, **ra):
 
 
 class TestMaterialList(Base):
+    def setUp(self):
+        super().setUp()
+        self.setenv(FIELDPULSE_MATERIAL_ITEM_ID="7001")
+
+    def test_no_placeholder_item_skips_the_step(self):
+        os.environ.pop("FIELDPULSE_MATERIAL_ITEM_ID")
+        step = self.mat(with_materials(BATH_MATERIALS))
+        self.assertIsNone(step["request"])
+        self.assertIn("FIELDPULSE_MATERIAL_ITEM_ID is not set", step["skip_reason"])
+
     def plan(self, ex, j=None):
         return fs.build_plan(j or job(), ex, fs._config())
 
@@ -1114,7 +1124,7 @@ class TestMaterialList(Base):
                              ("group", "all", "all"))
             for li in g["line_items"]:
                 self.assertEqual((li["item_id"], li["unit_price"], li["unit_cost"], li["type"]),
-                                 (None, 0, 0, "product"))
+                                 (7001, 0, 0, "product"))
         shower = groups[0]["line_items"]
         self.assertEqual([li["title"] for li in shower], ["subway tile", "frameless glass door"])
         self.assertEqual(shower[0]["description"], "white 3x6, matte. Quantity not mentioned.")
@@ -1203,6 +1213,10 @@ class TestMaterialList(Base):
 
 
 class TestMaterialSync(Base):
+    def setUp(self):
+        super().setUp()
+        self.setenv(FIELDPULSE_MATERIAL_ITEM_ID="7001")
+
     def test_dry_run_records_request_and_never_sends(self):
         with mock.patch("requests.post", side_effect=AssertionError("network")) as post:
             out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
