@@ -136,7 +136,7 @@ _REDIS_COMMANDS = frozenset((
 _TAG_RULES = {
     "component": {"orchestrator", "worker"},
     "job_id": re.compile(_JOB_ID),
-    "step": {"comment", "return_task"},
+    "step": {"comment", "return_task", "material_list"},
     "mode": {"dry_run", "off", "test_customer_only", "live"},
     "manual": {"True", "False"},
     "status": {"fieldpulse_error", "config_error", "fieldpulse_unreachable", "fieldpulse_timeout"},

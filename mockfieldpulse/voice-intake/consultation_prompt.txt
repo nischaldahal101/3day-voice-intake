@@ -47,6 +47,14 @@ SALES QUALIFICATION:
   - resolved_date: "YYYY-MM-DD", only when the date is unambiguous given the consultation date (e.g. "tomorrow", "this Friday", "Thursday the 12th", "November 12"). If it could mean more than one day (e.g. "next Thursday" when it could be this coming Thursday or the one after and the transcript doesn't settle it, "sometime next week", "early December"), or there is no "Consultation date:" line and the phrase has no full calendar date, use null and add a flag explaining why, quoting what was said (e.g. "return appointment date not resolved: said 'sometime next week'").
   - resolved_time: "HH:MM" in 24-hour time, only when a time was actually said AND am/pm is clear from what was said or the surrounding conversation (e.g. "6 pm", "7 tonight", "after work at 6"). If no time was said, use null. NEVER invent or guess a time. If am/pm is unclear, use null and add a flag explaining why.
   - If scheduled is not true, both are null.
+- For materials: list the materials, products and fixtures the client or rep actually chose or settled on as the plan (tile, vanity, shower door, faucet, cabinets, countertop, flooring, sink, lighting fixtures, grab bars, etc.). One entry per material. Use an empty list [] if no materials were discussed.
+  - Include ONLY what was chosen or discussed as the plan. Do NOT include materials that were rejected, ruled out, or only browsed as options without a decision. If a choice changed during the conversation, keep ONLY the final choice and note the change in details (e.g. "changed from brushed nickel to matte black").
+  - area: the part of the room it is for, in plain words ("Shower", "Vanity", "Flooring", "Tub", "Cabinets", "Countertops", "Backsplash", "Lighting"). null if unclear.
+  - item: the material or product as said ("subway tile", "quartz countertop", "frameless glass door").
+  - details: color, finish, size, brand, model or style exactly as said ("white 3x6, matte", "Moen, matte black"). null if none was said. NEVER invent a brand, size, color or model.
+  - quantity: a number ONLY if a quantity was explicitly said ("two sinks" -> 2, "about 120 square feet" -> 120). Otherwise null. NEVER estimate or calculate a quantity from room size.
+  - unit: the unit said with the quantity ("sq ft", "linear ft", "each", "boxes"), or null.
+  - quote: a short verbatim snippet from the transcript (under 25 words) that supports this entry.
 - For raw_quotes: include 3-6 verbatim phrases worth preserving — especially budget mentions, concerns, the close score, and anything revealing about motivation.
 - For flags: surface what was NOT covered (checklist topics the rep skipped), any inferences you made, and uncertainty. Examples: "budget not discussed", "close score (1-10) not asked", "electrical not covered", "project type inferred from context".
 - For notes_summary: 3-5 sentences a human would write summarizing the consultation — scope highlights, the client's readiness, and the sales read.
@@ -112,6 +120,16 @@ SALES QUALIFICATION:
     "resolved_date": "YYYY-MM-DD or null",
     "resolved_time": "HH:MM (24h) or null"
   },
+  "materials": [
+    {
+      "area": "string or null",
+      "item": "string",
+      "details": "string or null",
+      "quantity": "number or null",
+      "unit": "string or null",
+      "quote": "string (short verbatim snippet)"
+    }
+  ],
   "notes_summary": "string, 3-5 sentences",
   "raw_quotes": ["array of strings"],
   "flags": ["array of strings"]

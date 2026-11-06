@@ -61,6 +61,7 @@ export const SOURCE_LABEL = {
 export const STEP_NAME = {
   comment: 'Comment on the customer',
   return_task: 'Return-appointment task',
+  material_list: 'Draft material list',
 }
 
 export const WRITE_STATUS_LABEL = {
@@ -371,6 +372,29 @@ function returnAppointment(ra) {
   return null
 }
 
+// Materials as said, grouped by area ("Other" last), one line per area:
+// "Shower: subway tile (white 3x6; 120 sq ft); glass door". null = none
+// mentioned; a missing key (older consultations) says so instead.
+export function materialsText(ex) {
+  if (!isObj(ex) || !('materials' in ex)) return 'Not captured (older consultation)'
+  if (!Array.isArray(ex.materials)) return null
+  const groups = new Map()
+  for (const m of ex.materials) {
+    if (!isObj(m) || !str(m.item)) continue
+    const area = str(m.area) ? m.area.trim() : 'Other'
+    const key = area.toLowerCase()
+    if (!groups.has(key)) groups.set(key, { area, items: [] })
+    const qty = typeof m.quantity === 'number' && Number.isFinite(m.quantity) && m.quantity > 0
+      ? [m.quantity, str(m.unit)].filter(Boolean).join(' ') : null
+    const extra = [str(m.details), qty].filter(Boolean).join('; ')
+    groups.get(key).items.push(extra ? `${m.item.trim()} (${extra})` : m.item.trim())
+  }
+  const other = groups.get('other')
+  groups.delete('other')
+  const ordered = [...groups.values(), ...(other ? [other] : [])]
+  return ordered.length ? ordered.map((g) => `${g.area}: ${g.items.join('; ')}`).join('\n') : null
+}
+
 // The few results Mike reads first. Each: { key, label, value } with value
 // null = "Not mentioned" (never filled in). The full list stays in
 // groupExtraction for the troubleshooting section.
@@ -395,6 +419,7 @@ export function keyResults(ex) {
       { key: 'return', label: 'Return appointment', value: returnAppointment(ra) },
       { key: 'concerns', label: 'Concerns', value: v(sales.concerns, fmt.text) },
       { key: 'financing', label: 'Financing', value: v(sales.financing_details, fmt.text) },
+      { key: 'materials', label: 'Materials', value: materialsText(ex) },
     ],
   }
 }

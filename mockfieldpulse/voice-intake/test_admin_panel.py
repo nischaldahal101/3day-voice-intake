@@ -78,6 +78,15 @@ class TestClassification(unittest.TestCase):
         held = {"status": "blocked", "steps": [{"step": "comment", "status": "held"}]}
         cases = [
             ("done", None, W(("succeeded", "live"), ("skipped", "live")), False, "succeeded"),
+            # Third step (material_list): skipped never makes it "needs attention".
+            ("done", None, W(("succeeded", "live"), ("succeeded", "live"), ("skipped", "live")),
+             False, "succeeded"),
+            ("done", None, W(("succeeded", "live"), ("skipped", "live"), ("failed", "live")),
+             False, "partial"),
+            ("done", None, W(("planned", "dry_run"), ("skipped", "dry_run"),
+                             ("planned", "dry_run")), False, "dry_run"),
+            ("done", None, W(("planned", "dry_run"), ("planned", "dry_run"),
+                             ("skipped", "dry_run")), False, "dry_run"),
             ("done", None, W(("succeeded", "live"), ("failed", "live")), False, "partial"),
             ("done", None, W(("succeeded", "live"), ("planned", "live")), False, "partial"),
             ("done", None, W(("failed", "live")), False, "failed"),
@@ -250,6 +259,35 @@ class TestDetail(unittest.TestCase):
         self.assertEqual(d["legacy_fieldpulse"]["fieldpulse_url"], "http://mock/x")
         # Known extraction keys survive the scrub.
         self.assertEqual(set(d["extraction"]), set(full_extraction()))
+
+    def test_material_step_and_materials_in_payload(self):
+        ex = full_extraction()
+        ex["materials"] = [{"area": "Shower", "item": "subway tile", "details": "white 3x6",
+                            "quantity": None, "unit": None, "quote": "the white subway"}]
+        plan = fs.build_plan(job(), ex, fs._config())
+        req = plan[2]["request"]
+        writes = [{"job_id": "job_abc", "step": s, "status": st, "mode": "dry_run",
+                   "request": r, "response": None, "fieldpulse_record_id": None,
+                   "error": e, "attempts": 0, "created_at": "x", "updated_at": "y"}
+                  for s, st, r, e in (("comment", "planned", plan[0]["request"], None),
+                                      ("return_task", "planned", plan[1]["request"], None),
+                                      ("material_list", "planned", req, None))]
+        j = done_job()
+        j["result"]["extraction"] = ex
+        code, d = self.call(j, writes)
+        self.assertEqual(code, 200)
+        self.assertEqual(d["fieldpulse_status"], "dry_run")
+        self.assertFalse(d["needs_attention"])
+        mat = d["fieldpulse_writes"][2]
+        self.assertEqual(mat["step"], "material_list")
+        # The scrub keeps every key of the material request and the extraction.
+        self.assertEqual(mat["request"], req)
+        self.assertEqual(d["extraction"]["materials"], ex["materials"])
+        # Skipped material step (no materials): still not "needs attention".
+        writes[2].update(status="skipped", request=None, error="No materials mentioned")
+        writes[0]["status"] = writes[1]["status"] = "succeeded"
+        code, d = self.call(j, writes)
+        self.assertEqual((d["fieldpulse_status"], d["needs_attention"]), ("succeeded", False))
 
     def test_legacy_failed_and_garbage_rows(self):
         self.assertEqual(self.call(None)[0], 404)
@@ -554,7 +592,8 @@ class TestManualSend(Base):
         self.assertTrue(out["manual"])
         self.assertTrue(out["message"].startswith("Not sent: write mode is dry_run."), out["message"])
         self.assertEqual(self.rows(), [("comment", "planned", "dry_run"),
-                                       ("return_task", "planned", "dry_run")])
+                                       ("return_task", "planned", "dry_run"),
+                                       ("material_list", "skipped", "dry_run")])
         self.setenv(FIELDPULSE_WRITE_MODE="off")
         out = fs.sync_consultation(job(), full_extraction(), manual=True)
         self.assertEqual(out["message"], "Not sent: write mode is off. Nothing was sent to "
@@ -586,7 +625,8 @@ class TestManualSend(Base):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(out["status"], "succeeded")
         self.assertEqual(self.rows(), [("comment", "succeeded", "test_customer_only"),
-                                       ("return_task", "succeeded", "test_customer_only")])
+                                       ("return_task", "succeeded", "test_customer_only"),
+                                       ("material_list", "skipped", "test_customer_only")])
 
     def test_live_releases_held_rows_and_never_resends(self):
         self.dry_run_first()

@@ -18,6 +18,12 @@ Plan (Nick's decisions, stage 2):
                    date AND time (validated, see below): POST /jobs type "task",
                    UNASSIGNED (no `assignments`). Missing/vague date -> the step
                    is `skipped` and the comment says why (flag, don't fabricate).
+  - `material_list` (stage 1a, DRY-RUN build) only when the extraction lists
+                   materials: POST /material-list, a separate DRAFT list
+                   ("Consultation materials (draft): <name>") grouped by area,
+                   every line at price 0 / cost 0 and quantity as said (else 1,
+                   with "Quantity not mentioned"). No materials, or an older
+                   extraction without a `materials` key -> `skipped`.
   No pipeline moves, no custom fields, no consultation job.
 
 Mode (env FIELDPULSE_WRITE_MODE, read on every call):
@@ -63,6 +69,11 @@ UNVERIFIED against real FieldPulse (stage 4 confirms on the test customer):
     default "customer"; may need a class name like "App\\Customer").
   - POST /jobs type "task" without `assignments` (doc §5 always sent one).
   - `tags` write shape ([<tag id>]); only sent when FIELDPULSE_AI_JOB_TAG_ID is set.
+  - POST /material-list body (from the public API reference, never tried on
+    our account): {customer_id, is_template: false, title, notes, groupings:
+    [{order_number, title, type "group", component_visibility, price_visibility,
+    line_items: [{item_id null, title, description, quantity, unit_price,
+    unit_cost, type "product", unit_measure}]}]}. status_id is omitted.
 """
 
 from __future__ import annotations
@@ -105,6 +116,17 @@ _CONNECT_TIMEOUT = 5
 _READ_TIMEOUT = 15
 _TASK_MINUTES = 60
 _TASK_JOB_TYPE = "Return Presentation Appointment"   # free text (doc §4)
+_MATERIAL_STEP = "material_list"
+_MATERIAL_TITLE_CHARS = 255       # FieldPulse max for list/grouping/line titles
+_MATERIAL_NOTES_CHARS = 10000     # FieldPulse max for list notes
+_MATERIAL_DESC_CHARS = 1000       # our cap for one line description (API max unknown)
+_MATERIAL_UNIT_CHARS = 255
+_MAX_MATERIAL_LINES = 60          # a draft list; the rest are named in the notes count
+_MAX_MATERIAL_GROUPS = 20
+_OTHER_AREA = "Other"
+_NO_MATERIALS = "No materials mentioned"
+_MATERIALS_NOT_CAPTURED = ("Materials were not captured for this consultation "
+                           "(processed before material lists were added)")
 _HELD_REASON = ("planned during a dry run, so it is never sent automatically; "
                 "send it by hand from the admin page")
 # Part-of-day windows from doc §5 (local time, hours).
@@ -306,7 +328,7 @@ _UNIT_AFTER = r"\s*(?:days?|weeks?|months?|years?)\b"
 # A word hour's minutes: ":30" digits or a spoken quarter-hour.
 # The lookahead: a longer spoken minute ("thirty-five") isn't read as "thirty"; the match
 # falls back to the bare hour, exactly as before word minutes were read (F-61).
-_WORD_HOUR_MIN = r"(?::([0-5]\d)|[ -]" + _WORD_MIN + r"\b(?![\s-]+(?:one|two|three|four|five|six|seven|eight|nine)\b))?"
+_WORD_HOUR_MIN = r"(?::([0-5]\d)|[ -]" + _WORD_MIN + r"\b(?![\s\-‐-―−]+(?:one|two|three|four|five|six|seven|eight|nine)\b))?"
 # A bare hour with no am/pm: "at 6", "around 7:30", "around five-thirty", "six o'clock".
 # Groups: (1,2) "at 6[:30]"; (3,4,5) "at six[:30| thirty]"; (6,7) "6[:30] o'clock";
 # (8,9,10) "six[:30| thirty] o'clock". The lookahead right after a word hour rejects
@@ -646,6 +668,21 @@ def _not_mentioned(extraction):
     return out
 
 
+def _admin_link_line(job, cfg):
+    """"Full transcript and details: <ADMIN_BASE_URL>/#admin/<id>", or None when
+    ADMIN_BASE_URL is unset. Bounded by _MAX_LINK_CHARS (review-log F-45: an
+    oversized ADMIN_BASE_URL / id must not push a FieldPulse text past its
+    limit; a cut URL would be a broken link, so it falls back to plain text)."""
+    if not cfg["admin_base_url"]:
+        return None
+    job_id = str(job.get("id") or "")
+    link = f"Full transcript and details: {cfg['admin_base_url']}/#admin/{job_id}"
+    if len(link) > _MAX_LINK_CHARS:
+        ref = f" (consultation {job_id})" if job_id and len(job_id) <= 64 else ""
+        link = f"Full transcript and details: in the consultation tool{ref}."
+    return link
+
+
 def build_comment_text(job, extraction, task_window, task_reason, cfg):
     """Plain text for Mike's FieldPulse Comments tab. Capped at MAX_COMMENT_CHARS
     (the body is trimmed at a line break, with a note; the footer is kept)."""
@@ -753,14 +790,8 @@ def build_comment_text(job, extraction, task_window, task_reason, cfg):
         lines += ["", "AI FLAGS"] + [f"- {f}" for f in flags[:20]]
 
     footer = ["", "Written by AI from the consultation. Please double-check before acting on it."]
-    job_id = str(job.get("id") or "")
-    if cfg["admin_base_url"]:
-        link = f"Full transcript and details: {cfg['admin_base_url']}/#admin/{job_id}"
-        if len(link) > _MAX_LINK_CHARS:
-            # review-log F-45: an oversized ADMIN_BASE_URL / id must not push the
-            # comment past FieldPulse's limit; a cut URL would be a broken link.
-            ref = f" (consultation {job_id})" if job_id and len(job_id) <= 64 else ""
-            link = f"Full transcript and details: in the consultation tool{ref}."
+    link = _admin_link_line(job, cfg)
+    if link:
         footer.append(link)
     footer_text = "\n" + "\n".join(footer)        # blank line before the footer
 
@@ -775,6 +806,110 @@ def build_comment_text(job, extraction, task_window, task_reason, cfg):
     # The footer is bounded above, so this never cuts in practice; it makes the
     # FieldPulse length limit a guarantee for every input.
     return (body + footer_text)[:MAX_COMMENT_CHARS]
+
+
+# --- Material list (draft) --------------------------------------------------------
+
+def _material_quantity(value):
+    """The quantity as said: a positive number, else None (never guessed)."""
+    return _num(value, 1e-9, 1_000_000)
+
+
+def _material_entries(extraction):
+    """-> (entries, skip_reason). entries: [{area, item, details, quantity, unit}]
+    with a usable item name. Old extractions (no `materials` key) and anything
+    that isn't a list are 'not captured'; nothing usable -> 'No materials mentioned'."""
+    raw = extraction.get("materials")
+    if not isinstance(raw, list):
+        return [], _MATERIALS_NOT_CAPTURED
+    out = []
+    for m in raw:
+        m = _dict(m)
+        item = _txt(m.get("item"), _MATERIAL_TITLE_CHARS)
+        if not item:
+            continue
+        qty = _material_quantity(m.get("quantity"))
+        out.append({
+            "area": _txt(m.get("area"), _MATERIAL_TITLE_CHARS),
+            "item": item,
+            "details": _txt(m.get("details"), _MATERIAL_DESC_CHARS),
+            "quantity": qty,
+            "unit": _txt(m.get("unit"), _MATERIAL_UNIT_CHARS) if qty is not None else None,
+        })
+    if not out:
+        return [], _NO_MATERIALS
+    return out, None
+
+
+def _material_line(entry):
+    desc = " ".join(p for p in (
+        entry["details"] and (entry["details"] if entry["details"][-1] in ".!?…"
+                              else entry["details"] + "."),
+        "Quantity not mentioned." if entry["quantity"] is None else None) if p)
+    line = {
+        "item_id": None,
+        "title": entry["item"],
+        "quantity": entry["quantity"] if entry["quantity"] is not None else 1,
+        "unit_price": 0,
+        "unit_cost": 0,
+        "type": "product",
+    }
+    if desc:
+        line["description"] = desc[:_MATERIAL_DESC_CHARS]
+    if entry["unit"]:
+        # Only with a said quantity: "1 sq ft" from a default 1 would be invented.
+        line["unit_measure"] = entry["unit"]
+    return line
+
+
+def build_material_list(job, extraction, cfg):
+    """-> (request body, item count) for a DRAFT material list, or (None, reason).
+    One grouping per area in the order first mentioned ("Other" last), prices 0,
+    capped at _MAX_MATERIAL_LINES lines / _MAX_MATERIAL_GROUPS groups."""
+    entries, reason = _material_entries(_dict(extraction))
+    if reason:
+        return None, reason
+    groups = {}                                     # area key -> (title, [lines])
+    kept = 0
+    for e in entries:
+        if kept >= _MAX_MATERIAL_LINES:
+            break
+        title = e["area"] or _OTHER_AREA
+        key = title.casefold()
+        if key not in groups:
+            if len(groups) >= _MAX_MATERIAL_GROUPS:
+                title, key = _OTHER_AREA, _OTHER_AREA.casefold()
+            groups.setdefault(key, (title, []))
+        groups[key][1].append(_material_line(e))
+        kept += 1
+    other = groups.pop(_OTHER_AREA.casefold(), None)
+    ordered = list(groups.values()) + ([other] if other else [])
+    groupings = [{
+        "order_number": i,
+        "title": title[:_MATERIAL_TITLE_CHARS],
+        "type": "group",
+        "component_visibility": "all",
+        "price_visibility": "all",
+        "line_items": lines,
+    } for i, (title, lines) in enumerate(ordered, start=1)]
+
+    notes = (f"Draft from the consultation recording on "
+             f"{_fmt_day(_consultation_day(job, cfg['tz']))}. Materials as discussed; "
+             f"prices and quantities to be confirmed by the office.")
+    if len(entries) > kept:
+        notes += (f" Only the first {kept} of {len(entries)} materials are listed; "
+                  f"the rest are in the consultation tool.")
+    link = _admin_link_line(job, cfg)
+    if link:
+        notes += "\n" + link
+    body = {
+        "customer_id": _int_id(job.get("customer_id")),
+        "is_template": False,
+        "title": f"Consultation materials (draft): {customer_name(job)}"[:_MATERIAL_TITLE_CHARS],
+        "notes": notes[:_MATERIAL_NOTES_CHARS],
+        "groupings": groupings,
+    }
+    return body, kept
 
 
 # --- Plan ----------------------------------------------------------------------------
@@ -839,6 +974,29 @@ def build_plan(job, extraction, cfg):
             "skip_reason": reason,
             "description": f"No task: {reason}",
             "window": None,
+        })
+
+    material, info = build_material_list(job, ex, cfg)
+    if material:
+        n_groups = len(material["groupings"])
+        steps.append({
+            "step": _MATERIAL_STEP,
+            "request": {"method": "POST", "path": "/material-list", "body": material},
+            "skip_reason": None,
+            "description": (f"Create a draft material list for {name} ({info} item"
+                            f"{'' if info == 1 else 's'} in {n_groups} group"
+                            f"{'' if n_groups == 1 else 's'})"),
+            "window": None,
+            "items": info,
+        })
+    else:
+        steps.append({
+            "step": _MATERIAL_STEP,
+            "request": None,
+            "skip_reason": info,
+            "description": f"No material list: {info}",
+            "window": None,
+            "items": 0,
         })
     return steps
 
@@ -1068,12 +1226,16 @@ def _summarize(base, cfg, plan, rows, allowed, why):
     task = next(s for s in plan if s["step"] == "return_task")
     when = _fmt_window(*task["window"]) if task["window"] else None
     no_task = f" No task: {task['skip_reason']}." if task["skip_reason"] else ""
+    mat = next((s for s in plan if s["step"] == _MATERIAL_STEP), None)
+    n_mat = mat["items"] if mat and mat["request"] else 0
+    mat_text = f"draft material list ({n_mat} item{'' if n_mat == 1 else 's'})"
 
     active = [s for s in steps if s["status"] != "skipped" or s["step"] == "comment"]
     if cfg["mode"] == "dry_run":
         status = "dry_run"
         message = (f"Dry run: nothing sent to FieldPulse yet. Would add a comment to {name}"
-                   + (f" and create a task for {when}." if when else ".") + no_task)
+                   + (f" and create a task for {when}." if when else ".") + no_task
+                   + (f" Would also create a {mat_text}." if n_mat else ""))
     elif not allowed:
         status = "blocked"
         message = f"Nothing was sent to FieldPulse ({why})."
@@ -1087,7 +1249,8 @@ def _summarize(base, cfg, plan, rows, allowed, why):
             status = "succeeded"
             message = (f"Added a comment to {name}"
                        + (f" and created a task for {when}" if when else "")
-                       + " in FieldPulse." + no_task)
+                       + " in FieldPulse." + no_task
+                       + (f" Created a {mat_text}." if n_mat else ""))
         else:
             status = "partial" if done else "failed"
             bad = "; ".join(f"{s['step'].replace('_', ' ')}: {s['status']}"

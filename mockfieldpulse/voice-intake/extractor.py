@@ -21,7 +21,11 @@ from dotenv import load_dotenv
 # the current Sonnet version is)"; the installed SDK's current Sonnet is 4.6.
 MODEL = "claude-sonnet-4-6"
 TEMPERATURE = 0.0
-MAX_TOKENS = 2000
+# Room for the full consultation JSON incl. the `materials` list (a long
+# consultation can list dozens of materials; 2000 tokens could cut the JSON).
+MAX_TOKENS = 8000
+_MAX_MATERIALS = 100          # entries kept from the model (FieldPulse caps lower)
+_MATERIAL_TEXT = {"area": 80, "item": 255, "details": 500, "unit": 40, "quote": 300}
 
 _HERE = Path(__file__).resolve().parent
 _PROMPT_PATH = _HERE / "extraction_prompt.txt"
@@ -184,6 +188,72 @@ def _extract(system_prompt_template: str, transcript: str, label: str,
     return result
 
 
+# --- Materials (flag, don't fabricate) ----------------------------------------
+
+def _clean_text(value, limit):
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split())
+    return value[:limit] if value else None
+
+
+def _clean_quantity(value):
+    """Only a real, positive number the model was told to give when it was
+    said. Strings ("about 120"), booleans, zero, NaN and absurd values -> None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value <= 0 or value > 1_000_000:
+        return None
+    return int(value) if float(value).is_integer() else value
+
+
+def normalize_materials(result):
+    """Shape result["materials"] in place and return result.
+
+    - key absent: left absent (not extracted; never assumed to be "none").
+    - not a list: set to None, with a flag.
+    - a list: each entry needs a non-empty `item`; area/details/unit/quote are
+      strings or None; quantity is a positive number or None (a unit without
+      a quantity is dropped, it means nothing alone). Bad entries are dropped
+      with a flag. Nothing is ever filled in.
+    """
+    if not isinstance(result, dict) or "materials" not in result:
+        return result
+    raw = result["materials"]
+    flags = result.get("flags") if isinstance(result.get("flags"), list) else None
+
+    def flag(text):
+        if flags is not None:
+            flags.append(text)
+
+    if not isinstance(raw, list):
+        result["materials"] = None
+        flag("materials list was not in the expected format and was ignored")
+        return result
+    clean, dropped = [], 0
+    for entry in raw:
+        item = _clean_text(entry.get("item"), _MATERIAL_TEXT["item"]) if isinstance(entry, dict) else None
+        if not item:
+            dropped += 1
+            continue
+        qty = _clean_quantity(entry.get("quantity"))
+        clean.append({
+            "area": _clean_text(entry.get("area"), _MATERIAL_TEXT["area"]),
+            "item": item,
+            "details": _clean_text(entry.get("details"), _MATERIAL_TEXT["details"]),
+            "quantity": qty,
+            "unit": _clean_text(entry.get("unit"), _MATERIAL_TEXT["unit"]) if qty is not None else None,
+            "quote": _clean_text(entry.get("quote"), _MATERIAL_TEXT["quote"]),
+        })
+    if len(clean) > _MAX_MATERIALS:
+        flag(f"materials list cut to the first {_MAX_MATERIALS} of {len(clean)} entries")
+        clean = clean[:_MAX_MATERIALS]
+    if dropped:
+        flag(f"{dropped} materials entr{'y' if dropped == 1 else 'ies'} without an item name ignored")
+    result["materials"] = clean
+    return result
+
+
 # --- Public API -------------------------------------------------------------
 
 def extract_intake(transcript: str) -> dict:
@@ -215,6 +285,7 @@ def extract_consultation(transcript: str, reference_date: date = None,
     """
     result = _extract(SYSTEM_PROMPT_CONSULT, transcript, "Consultation",
                       user_message=_user_message(transcript, reference_date, reference_tz))
+    normalize_materials(result)
 
     logger.info(
         "Consultation extraction succeeded (project_type: %s, match_confidence: %s)",

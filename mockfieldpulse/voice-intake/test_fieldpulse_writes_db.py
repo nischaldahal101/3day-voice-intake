@@ -116,7 +116,9 @@ class TestWritesDB(unittest.TestCase):
         j = J.get_job(self.new_job()["id"])
         ex = {"project_type": "bath", "notes_summary": "Bath refresh.",
               "sales": {"close_score_1_10": 7},
-              "return_appointment": {"scheduled": True, "details": "2026-11-20 at 10 am"}}
+              "return_appointment": {"scheduled": True, "details": "2026-11-20 at 10 am"},
+              "materials": [{"area": "Shower", "item": "subway tile", "details": "white",
+                             "quantity": None, "unit": None, "quote": "white subway"}]}
         with mock.patch.object(fs, "_send", side_effect=AssertionError("must not send")):
             out = fs.sync_consultation(j, ex)
             again = fs.sync_consultation(j, ex)
@@ -124,8 +126,11 @@ class TestWritesDB(unittest.TestCase):
         self.assertEqual(again["status"], "dry_run")
         rows = J.list_fieldpulse_writes(j["id"])
         self.assertEqual([(r["step"], r["status"], r["mode"]) for r in rows],
-                         [("comment", "planned", "dry_run"), ("return_task", "planned", "dry_run")])
+                         [("comment", "planned", "dry_run"), ("return_task", "planned", "dry_run"),
+                          ("material_list", "planned", "dry_run")])
         self.assertEqual(rows[1]["request"]["body"]["type"], "task")
+        self.assertEqual(rows[2]["request"]["path"], "/material-list")
+        self.assertEqual(rows[2]["request"]["body"]["groupings"][0]["title"], "Shower")
         # Mode switched to live later: the dry-run rows are held, nothing is sent.
         with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "live",
                                           "FIELDPULSE_WRITE_BASE_URL": "https://fp.invalid",
@@ -133,9 +138,9 @@ class TestWritesDB(unittest.TestCase):
                 mock.patch.object(fs, "_send", side_effect=AssertionError("must not send")):
             held = fs.sync_consultation(j, ex)
         self.assertEqual(held["status"], "blocked")
-        self.assertEqual([s["status"] for s in held["steps"]], ["held", "held"])
+        self.assertEqual([s["status"] for s in held["steps"]], ["held", "held", "held"])
         self.assertEqual([(r["status"], r["mode"]) for r in J.list_fieldpulse_writes(j["id"])],
-                         [("planned", "dry_run"), ("planned", "dry_run")])
+                         [("planned", "dry_run")] * 3)
         J.update_job_status(j["id"], "done", result={"input": "paste", "extraction": ex,
                                                      "fieldpulse_sync": out})
         # An old mock-writer job alongside.
@@ -149,7 +154,7 @@ class TestWritesDB(unittest.TestCase):
         self.assertEqual(new_s["input"], "paste")
         self.assertEqual(new_s["fieldpulse_sync"]["status"], "dry_run")
         self.assertEqual([s["status"] for s in new_s["fieldpulse_sync"]["steps"]],
-                         ["planned", "planned"])
+                         ["planned", "planned", "planned"])
         self.assertEqual(recent[j["id"]]["customer"]["display_name"], "Jane Doe")
         old_s = recent[old["id"]]["summary"]
         self.assertIsNone(old_s["fieldpulse_sync"])

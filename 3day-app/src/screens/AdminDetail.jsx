@@ -160,6 +160,31 @@ function TaskBody({ body }) {
   )
 }
 
+function MaterialBody({ body }) {
+  if (!isObj(body)) return null
+  const groups = Array.isArray(body.groupings) ? body.groupings.filter(isObj) : []
+  return (
+    <dl className="admin-fields admin-fields-tight">
+      <Field label="Title">{display(body.title) || '—'}</Field>
+      <Field label="Customer id">{display(body.customer_id) || '—'}</Field>
+      <Field label="Notes"><span className="admin-pre">{display(body.notes) || '—'}</span></Field>
+      {groups.map((g, i) => (
+        <Field key={i} label={display(g.title) || 'Group'}>
+          <ul className="admin-list">
+            {(Array.isArray(g.line_items) ? g.line_items.filter(isObj) : []).map((li, j) => (
+              <li key={j}>
+                {display(li.quantity) || '?'}{str(li.unit_measure) ? ` ${li.unit_measure}` : ''} ×{' '}
+                {display(li.title) || '—'}
+                {str(li.description) ? <span className="admin-sub"> · {li.description}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </Field>
+      ))}
+    </dl>
+  )
+}
+
 function WriteStep({ w, held }) {
   const req = isObj(w.request) ? w.request : null
   const body = req && isObj(req.body) ? req.body : null
@@ -198,6 +223,7 @@ function WriteStep({ w, held }) {
         </div>
       )}
       {w.step === 'return_task' && body && <TaskBody body={body} />}
+      {w.step === 'material_list' && body && <MaterialBody body={body} />}
       <RawJson value={w.request} label="Request (raw JSON)" />
       {w.response != null && <RawJson value={w.response} label="FieldPulse response (raw JSON)" />}
     </div>

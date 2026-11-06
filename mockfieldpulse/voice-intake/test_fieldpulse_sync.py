@@ -400,7 +400,7 @@ class TestCommentText(Base):
 class TestPlan(Base):
     def test_comment_and_unassigned_task_requests(self):
         plan = fs.build_plan(job(), full_extraction(), fs._config())
-        self.assertEqual([s["step"] for s in plan], ["comment", "return_task"])
+        self.assertEqual([s["step"] for s in plan], ["comment", "return_task", "material_list"])
         c = plan[0]["request"]
         self.assertEqual((c["method"], c["path"]), ("POST", "/comments"))
         self.assertEqual(c["body"]["commentable_type"], "customer")
@@ -453,7 +453,8 @@ class TestModes(Base):
                                                   "a task for Thursday, November 12, 2026"))
         rows = self.store.list_fieldpulse_writes("job_abc")
         self.assertEqual([(r["step"], r["status"]) for r in rows],
-                         [("comment", "planned"), ("return_task", "planned")])
+                         [("comment", "planned"), ("return_task", "planned"),
+                          ("material_list", "skipped")])   # old extraction: no materials key
         self.assertEqual(rows[0]["request"]["path"], "/comments")
         self.assertIn("Close score: 9/10", out["comment_text"])
 
@@ -566,7 +567,7 @@ class TestIdempotency(Base):
             out = fs.sync_consultation(job(), full_extraction())
             self.assertEqual(len(self.sent), 2)
         rows = self.store.list_fieldpulse_writes("job_abc")
-        self.assertTrue(all(r["status"] == "succeeded" for r in rows))
+        self.assertEqual([r["status"] for r in rows], ["succeeded", "succeeded", "skipped"])
         self.assertEqual(out["steps"][0]["status"], "succeeded")
 
     def test_no_answer_stays_sent_and_is_not_retried(self):
@@ -946,7 +947,11 @@ class TestResolvedAppointment(Base):
         for text, bare in [("at six fifteen", (6, 15)), ("around seven forty-five", (7, 45)),
                            ("five thirty o'clock", (5, 30)), ("at five:30", (5, 30)),
                            ("about five ten tall", (5, 0)), ("about five fifty", (5, 0)),
-                           ("at five thirty-five", (5, 0)), ("at five thirty five", (5, 0)), ("at five thirty\nfive", (5, 0)), ("at 6", (6, 0)),
+                           ("at five thirty-five", (5, 0)), ("at five thirty five", (5, 0)), ("at five thirty\nfive", (5, 0)),
+                           # F-61 remainder: CRLF, NBSP and Unicode hyphens/minus
+                           ("at five thirty\r\nfive", (5, 0)), ("at five thirty\u00a0five", (5, 0)),
+                           ("at five thirty\u2011five", (5, 0)), ("at five thirty\u2013five", (5, 0)),
+                           ("at five thirty\u2212five", (5, 0)), ("at 6", (6, 0)),
                            ("six o'clock", (6, 0))]:
             with self.subTest(text):
                 self.assertEqual(fs._parse_time(text, day, CHI)[2:], ("bare", bare))
@@ -1016,11 +1021,11 @@ class TestDryRunNeverAutoSent(Base):
                 out = fs.sync_consultation(job(), full_extraction())
                 self.assertEqual(self.sent, [])
                 self.assertEqual(out["status"], "blocked")
-                self.assertEqual([s["status"] for s in out["steps"]], ["held", "held"])
+                self.assertEqual([s["status"] for s in out["steps"]], ["held", "held", "skipped"])
                 self.assertIn("never sent automatically", out["message"])
         rows = self.store.list_fieldpulse_writes("job_abc")
         self.assertEqual([(r["status"], r["mode"]) for r in rows],
-                         [("planned", "dry_run"), ("planned", "dry_run")])
+                         [("planned", "dry_run"), ("planned", "dry_run"), ("skipped", "dry_run")])
         # Back to dry_run: still just a dry run.
         self.setenv(FIELDPULSE_WRITE_MODE="dry_run")
         self.assertEqual(fs.sync_consultation(job(), full_extraction())["status"], "dry_run")
@@ -1050,6 +1055,282 @@ class TestDryRunNeverAutoSent(Base):
         out = fs.sync_consultation(job(), full_extraction())
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(out["status"], "succeeded")
+
+# --- Draft material list (stage 1a: dry-run build) ----------------------------------
+
+BATH_MATERIALS = [
+    {"area": "Shower", "item": "subway tile", "details": "white 3x6, matte",
+     "quantity": None, "unit": None, "quote": "the matte white subway"},
+    {"area": "Vanity", "item": "faucets", "details": "Moen, matte black",
+     "quantity": 2, "unit": "each", "quote": "two of the black Moen faucets"},
+    {"area": "shower", "item": "frameless glass door", "details": None,
+     "quantity": None, "unit": None, "quote": "frameless glass door"},
+    {"area": None, "item": "grab bar", "details": None, "quantity": None, "unit": None,
+     "quote": "a grab bar by the toilet"},
+    {"area": "Flooring", "item": "porcelain tile", "details": "wood-look", "quantity": 85,
+     "unit": "sq ft", "quote": "about 85 square feet"},
+]
+
+
+def with_materials(materials, **ra):
+    ex = full_extraction(**ra)
+    ex["materials"] = materials
+    return ex
+
+
+class TestMaterialList(Base):
+    def plan(self, ex, j=None):
+        return fs.build_plan(j or job(), ex, fs._config())
+
+    def mat(self, ex, j=None):
+        steps = self.plan(ex, j)
+        self.assertEqual([s["step"] for s in steps], ["comment", "return_task", "material_list"])
+        return steps[2]
+
+    def test_dry_run_request_shape(self):
+        self.setenv(ADMIN_BASE_URL="https://app.example.com")
+        step = self.mat(with_materials(BATH_MATERIALS))
+        self.assertIsNone(step["skip_reason"])
+        req = step["request"]
+        self.assertEqual(set(req), {"method", "path", "body"})
+        self.assertEqual((req["method"], req["path"]), ("POST", "/material-list"))
+        body = req["body"]
+        self.assertEqual(set(body), {"customer_id", "is_template", "title", "notes", "groupings"})
+        self.assertNotIn("status_id", body)
+        self.assertEqual(body["customer_id"], 18809123)
+        self.assertIs(body["is_template"], False)
+        self.assertEqual(body["title"], "Consultation materials (draft): Jane Doe")
+        self.assertEqual(body["notes"],
+                         "Draft from the consultation recording on Tuesday, November 3, 2026. "
+                         "Materials as discussed; prices and quantities to be confirmed by the "
+                         "office.\nFull transcript and details: "
+                         "https://app.example.com/#admin/job_abc")
+        groups = body["groupings"]
+        # One group per area, first-mentioned order, case-insensitive merge, "Other" last.
+        self.assertEqual([(g["order_number"], g["title"]) for g in groups],
+                         [(1, "Shower"), (2, "Vanity"), (3, "Flooring"), (4, "Other")])
+        for g in groups:
+            self.assertEqual((g["type"], g["component_visibility"], g["price_visibility"]),
+                             ("group", "all", "all"))
+            for li in g["line_items"]:
+                self.assertEqual((li["item_id"], li["unit_price"], li["unit_cost"], li["type"]),
+                                 (None, 0, 0, "product"))
+        shower = groups[0]["line_items"]
+        self.assertEqual([li["title"] for li in shower], ["subway tile", "frameless glass door"])
+        self.assertEqual(shower[0]["description"], "white 3x6, matte. Quantity not mentioned.")
+        self.assertEqual(shower[0]["quantity"], 1)
+        self.assertNotIn("unit_measure", shower[0])      # no said quantity -> no unit
+        self.assertEqual(shower[1]["description"], "Quantity not mentioned.")
+        faucets = groups[1]["line_items"][0]
+        self.assertEqual((faucets["quantity"], faucets["unit_measure"], faucets["description"]),
+                         (2, "each", "Moen, matte black."))
+        floor = groups[2]["line_items"][0]
+        self.assertEqual((floor["quantity"], floor["unit_measure"]), (85, "sq ft"))
+        self.assertIn("5 items in 4 groups", step["description"])
+
+    def test_no_link_line_without_admin_base_url(self):
+        body = self.mat(with_materials(BATH_MATERIALS))["request"]["body"]
+        self.assertNotIn("\n", body["notes"])
+        self.assertNotIn("http", body["notes"])
+
+    def test_no_materials_is_skipped_with_plain_reason(self):
+        for mats in ([], [{"item": ""}, {"item": None}, "junk", None, {"area": "Shower"}]):
+            with self.subTest(mats=mats):
+                step = self.mat(with_materials(mats))
+                self.assertIsNone(step["request"])
+                self.assertEqual(step["skip_reason"], "No materials mentioned")
+
+    def test_old_extraction_without_key_is_skipped_never_an_error(self):
+        for ex in (full_extraction(), empty_extraction(), with_materials(None),
+                   with_materials("tile"), with_materials({"item": "tile"}), {}):
+            with self.subTest(ex=str(ex)[:40]):
+                step = self.mat(ex)
+                self.assertIsNone(step["request"])
+                self.assertIn("not captured", step["skip_reason"])
+
+    def test_quantities_are_never_invented(self):
+        mats = [{"area": "Tub", "item": f"thing {i}", "quantity": q, "unit": "sq ft"}
+                for i, q in enumerate((0, -3, True, "120", float("nan"), 2e9, None))]
+        mats.append({"area": "Tub", "item": "half box", "quantity": 1.5, "unit": "boxes"})
+        lines = self.mat(with_materials(mats))["request"]["body"]["groupings"][0]["line_items"]
+        for li in lines[:-1]:
+            self.assertEqual(li["quantity"], 1)
+            self.assertEqual(li["description"], "Quantity not mentioned.")
+            self.assertNotIn("unit_measure", li)
+        self.assertEqual((lines[-1]["quantity"], lines[-1]["unit_measure"]), (1.5, "boxes"))
+        self.assertNotIn("description", lines[-1])
+
+    def test_caps(self):
+        mats = [{"area": f"Area {i % 30}", "item": "x" * 400, "details": "d" * 3000,
+                 "quantity": 1, "unit": "u" * 400} for i in range(150)]
+        j = job(customer={"display_name": "N" * 300})
+        body = self.mat(with_materials(mats), j)["request"]["body"]
+        self.assertLessEqual(len(body["title"]), 255)
+        self.assertLessEqual(len(body["notes"]), 10000)
+        self.assertLessEqual(len(body["groupings"]), fs._MAX_MATERIAL_GROUPS + 1)   # + "Other"
+        self.assertEqual(body["groupings"][-1]["title"], "Other")                    # overflow areas
+        lines = [li for g in body["groupings"] for li in g["line_items"]]
+        self.assertEqual(len(lines), fs._MAX_MATERIAL_LINES)
+        self.assertIn(f"Only the first {fs._MAX_MATERIAL_LINES} of 150 materials", body["notes"])
+        for g in body["groupings"]:
+            self.assertLessEqual(len(g["title"]), 255)
+        for li in lines:
+            self.assertLessEqual(len(li["title"]), 255)
+            self.assertLessEqual(len(li["description"]), fs._MATERIAL_DESC_CHARS)
+            self.assertLessEqual(len(li["unit_measure"]), 255)
+
+    def test_oversized_admin_url_uses_plain_fallback(self):
+        self.setenv(ADMIN_BASE_URL="https://x.example/" + "a" * 900)
+        notes = self.mat(with_materials(BATH_MATERIALS))["request"]["body"]["notes"]
+        self.assertTrue(notes.endswith("\nFull transcript and details: in the consultation tool "
+                                       "(consultation job_abc)."))
+
+    def test_comment_and_task_unchanged_by_materials(self):
+        for env in ({}, {"ADMIN_BASE_URL": "https://app.example.com"}):
+            with self.subTest(env=env):
+                self.setenv(**env) if env else None
+                a = self.plan(full_extraction())
+                b = self.plan(with_materials(BATH_MATERIALS))
+                self.assertEqual(a[:2], b[:2])
+
+    def test_garbage_extraction_does_not_crash(self):
+        for ex in (None, {"materials": [1, "x", [], {"item": 5}, {"item": {"a": 1}}]},
+                   {"materials": [{"item": "tile", "area": 7, "details": ["x"], "unit": 3,
+                                   "quantity": 4}]}):
+            with self.subTest(ex=ex):
+                step = self.mat(ex)
+                self.assertTrue(step["request"] or step["skip_reason"])
+
+
+class TestMaterialSync(Base):
+    def test_dry_run_records_request_and_never_sends(self):
+        with mock.patch("requests.post", side_effect=AssertionError("network")) as post:
+            out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+            post.assert_not_called()
+        self.send.assert_not_called()
+        self.assertEqual(out["status"], "dry_run")
+        self.assertTrue(out["message"].endswith(" Would also create a draft material list "
+                                                "(5 items)."), out["message"])
+        rows = {r["step"]: r for r in self.store.list_fieldpulse_writes("job_abc")}
+        self.assertEqual(rows["material_list"]["status"], "planned")
+        self.assertEqual(rows["material_list"]["mode"], "dry_run")
+        self.assertEqual(rows["material_list"]["request"]["path"], "/material-list")
+
+    def test_skipped_materials_leave_message_and_status_unchanged(self):
+        out = fs.sync_consultation(job(), with_materials([]))
+        self.assertNotIn("material", out["message"])
+        self.assertEqual(out["status"], "dry_run")
+        step = next(s for s in out["steps"] if s["step"] == "material_list")
+        self.assertEqual((step["status"], step["error"]), ("skipped", "No materials mentioned"))
+
+    def test_blocked_modes_never_send_materials(self):
+        for mode, test_id in (("test_customer_only", "999"), ("live", None)):
+            with self.subTest(mode=mode):
+                self.store.rows.clear(); self.store.order.clear()
+                if test_id:
+                    self.sendable(mode=mode, test_id=test_id)
+                else:
+                    for k in [k for k in os.environ if k.startswith("FIELDPULSE")]:
+                        os.environ.pop(k)
+                    self.setenv(FIELDPULSE_WRITE_MODE=mode)
+                out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+                self.assertEqual(out["status"], "blocked")
+                self.send.assert_not_called()
+
+    def test_send_mode_sends_third_and_succeeded_never_resent(self):
+        self.sendable()
+        self.allow_send([(200, {"error": False, "response": {"id": 1}}),
+                         (200, {"error": False, "response": {"id": 2}}),
+                         (200, {"error": False, "response": {"id": 3}})])
+        out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+        self.assertEqual([r["path"] for r in self.sent], ["/comments", "/jobs", "/material-list"])
+        self.assertEqual(out["status"], "succeeded")
+        self.assertIn("Created a draft material list (5 items).", out["message"])
+        rows = {r["step"]: r for r in self.store.list_fieldpulse_writes("job_abc")}
+        self.assertEqual(rows["material_list"]["fieldpulse_record_id"], "3")
+        fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+        fs.sync_consultation(job(), with_materials(BATH_MATERIALS), manual=True)
+        self.assertEqual(len(self.sent), 3)
+
+    def test_material_failure_is_partial_and_no_answer_is_never_resent(self):
+        self.sendable()
+        self.allow_send([(200, {"response": {"id": 1}}), (200, {"response": {"id": 2}}),
+                         fs._OutcomeUnknown("ReadTimeout: no response")])
+        out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+        self.assertEqual(out["status"], "partial")
+        self.assertIn("material list: sent", out["message"])
+        fs.sync_consultation(job(), with_materials(BATH_MATERIALS), manual=True)
+        self.assertEqual(len(self.sent), 3)
+
+    def test_dry_run_material_row_is_held_after_mode_switch(self):
+        fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+        self.sendable(mode="live")
+        out = fs.sync_consultation(job(), with_materials(BATH_MATERIALS))
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual([s["status"] for s in out["steps"]], ["held", "held", "held"])
+        self.send.assert_not_called()
+
+
+# --- extractor: materials normalisation (offline: no API call) -----------------------
+
+class TestExtractorMaterials(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import extractor
+        cls.ex = extractor
+
+    def test_missing_key_stays_missing(self):
+        r = {"flags": []}
+        self.assertEqual(self.ex.normalize_materials(r), {"flags": []})
+
+    def test_empty_list(self):
+        self.assertEqual(self.ex.normalize_materials({"materials": []})["materials"], [])
+
+    def test_not_a_list_is_null_and_flagged(self):
+        r = self.ex.normalize_materials({"materials": "tile", "flags": []})
+        self.assertIsNone(r["materials"])
+        self.assertTrue(any("materials" in f for f in r["flags"]))
+
+    def test_entries_cleaned_never_filled_in(self):
+        r = self.ex.normalize_materials({"flags": [], "materials": [
+            {"area": "  Shower ", "item": " subway\n tile ", "details": "", "quantity": "120",
+             "unit": "sq ft", "quote": "the subway tile", "extra": "x"},
+            {"area": None, "item": "faucet", "details": "Moen", "quantity": 2, "unit": "each"},
+            {"item": "door", "quantity": True}, {"item": ""}, "junk", {"area": "Vanity"},
+            {"item": "box", "quantity": 2.0},
+        ]})
+        m = r["materials"]
+        self.assertEqual(m[0], {"area": "Shower", "item": "subway tile", "details": None,
+                                "quantity": None, "unit": None, "quote": "the subway tile"})
+        self.assertEqual(m[1], {"area": None, "item": "faucet", "details": "Moen",
+                                "quantity": 2, "unit": "each", "quote": None})
+        self.assertIsNone(m[2]["quantity"])
+        self.assertEqual(m[3]["quantity"], 2)
+        self.assertEqual(len(m), 4)
+        self.assertTrue(any("3 materials entries" in f for f in r["flags"]))
+
+    def test_cap(self):
+        r = self.ex.normalize_materials({"flags": [], "materials": [{"item": "x"}] * 150})
+        self.assertEqual(len(r["materials"]), self.ex._MAX_MATERIALS)
+
+    def test_prompt_schema_and_token_room(self):
+        p = self.ex.SYSTEM_PROMPT_CONSULT
+        self.assertIn('"materials": [', p)
+        self.assertIn("NEVER estimate or calculate a quantity", p)
+        self.assertIn("keep ONLY the final choice", p)
+        for key in ('"notes_summary"', '"return_appointment"', '"close_score_1_10"',
+                    '"appliances"', '"raw_quotes"', '"flags"'):
+            self.assertIn(key, p)                     # existing fields kept
+        self.assertGreaterEqual(self.ex.MAX_TOKENS, 8000)
+
+    def test_extract_consultation_normalizes(self):
+        resp = types.SimpleNamespace(content=[types.SimpleNamespace(
+            type="text", text='{"materials": [{"item": "tile", "quantity": "lots"}], "flags": []}')])
+        with mock.patch.object(self.ex._client.messages, "create", return_value=resp) as create:
+            out = self.ex.extract_consultation("REP: hi")
+        self.assertEqual(create.call_args.kwargs["max_tokens"], self.ex.MAX_TOKENS)
+        self.assertEqual(out["materials"][0]["quantity"], None)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
