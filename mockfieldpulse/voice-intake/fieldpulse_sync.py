@@ -846,7 +846,10 @@ def _material_line(entry):
         entry["details"] and (entry["details"] if entry["details"][-1] in ".!?…"
                               else entry["details"] + "."),
         "Quantity not mentioned." if entry["quantity"] is None else None) if p)
+    # "id": None on lines and groupings: FieldPulse reads $x["id"] without a default
+    # (HTTP 400 'Undefined array key "id"' when absent); null means "create new".
     line = {
+        "id": None,
         "item_id": None,
         "title": entry["item"],
         "quantity": entry["quantity"] if entry["quantity"] is not None else 1,
@@ -885,6 +888,7 @@ def build_material_list(job, extraction, cfg):
     other = groups.pop(_OTHER_AREA.casefold(), None)
     ordered = list(groups.values()) + ([other] if other else [])
     groupings = [{
+        "id": None,
         "order_number": i,
         "title": title[:_MATERIAL_TITLE_CHARS],
         "type": "group",
