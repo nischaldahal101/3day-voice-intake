@@ -297,11 +297,26 @@ _ISO_DAY = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _HHMM = re.compile(r"([01]?\d|2[0-3]):([0-5]\d)")
 _NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
               "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
-_HOUR_TOKEN = r"(\d{1,2}|" + "|".join(_NUM_WORDS) + r")"
-# A bare hour with no am/pm: "at 6", "around 7:30", "six o'clock".
-_BARE_HOUR = re.compile(r"\b(?:at|around|about|by)\s+" + _HOUR_TOKEN + r"(?::([0-5]\d))?\b"
-                        r"(?!\s*(?:days?|weeks?|months?|years?)\b)"
-                        r"|\b" + _HOUR_TOKEN + r"(?::([0-5]\d))?\s*o'?\s?clock\b")
+_WORD_HOUR = r"(" + "|".join(_NUM_WORDS) + r")"
+# Spoken minutes right after a word hour ("five-thirty", "seven forty-five"); hyphen or one
+# space. Only the quarter-hours: "five ten" / "five fifty" are too often a height or a price.
+_MINUTE_WORDS = {"fifteen": 15, "thirty": 30, "forty five": 45}
+_WORD_MIN = r"(fifteen|thirty|forty[ -]five)"
+_UNIT_AFTER = r"\s*(?:days?|weeks?|months?|years?)\b"
+# A word hour's minutes: ":30" digits or a spoken quarter-hour.
+# The lookahead: a longer spoken minute ("thirty-five") isn't read as "thirty"; the match
+# falls back to the bare hour, exactly as before word minutes were read (F-61).
+_WORD_HOUR_MIN = r"(?::([0-5]\d)|[ -]" + _WORD_MIN + r"\b(?![\s-]+(?:one|two|three|four|five|six|seven|eight|nine)\b))?"
+# A bare hour with no am/pm: "at 6", "around 7:30", "around five-thirty", "six o'clock".
+# Groups: (1,2) "at 6[:30]"; (3,4,5) "at six[:30| thirty]"; (6,7) "6[:30] o'clock";
+# (8,9,10) "six[:30| thirty] o'clock". The lookahead right after a word hour rejects
+# "at five thirty days" so backtracking can't fall back to a bare "at five".
+_BARE_HOUR = re.compile(r"\b(?:at|around|about|by)\s+(?:(\d{1,2})(?::([0-5]\d))?\b"
+                        r"|" + _WORD_HOUR + r"\b(?![ -](?:" + _WORD_MIN[1:] + _UNIT_AFTER + r")"
+                        + _WORD_HOUR_MIN + r")"
+                        r"(?!" + _UNIT_AFTER + r")"
+                        r"|\b(?:(\d{1,2})(?::([0-5]\d))?|" + _WORD_HOUR + _WORD_HOUR_MIN
+                        + r")\s*o'?\s?clock\b")
 _PM_WORDS = re.compile(r"\b(?:afternoon|evening|tonight|night)\b")
 _AM_WORDS = re.compile(r"\bmorning\b")
 
@@ -458,10 +473,14 @@ def _parse_time(masked, day, tz):
 
     bares = set()
     for b in _BARE_HOUR.finditer(masked):
-        tok, minute = (b.group(1), b.group(2)) if b.group(1) else (b.group(3), b.group(4))
+        g = b.groups()
+        tok, minute = next((g[i], g[i + 1] or (g[i + 2] if i in (2, 7) else None))
+                           for i in (0, 2, 5, 7) if g[i])
         hour = _hour_value(tok)
         if not 1 <= hour <= 12:
             return None, "the time is not a real clock time", "bad", None
+        if minute and not minute.isdigit():
+            minute = _MINUTE_WORDS[re.sub(r"[ -]", " ", minute)]
         bares.add((hour, int(minute or 0)))
     if len(bares) > 1:
         return None, "more than one time was mentioned", "bad", None

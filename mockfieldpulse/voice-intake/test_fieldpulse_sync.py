@@ -929,6 +929,32 @@ class TestResolvedAppointment(Base):
         self.assertIn('Scheduled: "next Friday at 6pm"', text)
         self.assertIn("No FieldPulse task was created: the AI read it as Thursday, November 12", text)
 
+    def test_spoken_word_minutes(self):
+        # F-58: "around five-thirty" is a bare 5:30, not a bare 5:00. Only quarter-hour words
+        # count (F-59: "about five ten" is a height); "at five:30" keeps its :30 (F-60).
+        said = "next Tuesday, the tenth, around five-thirty"
+        plan = fs.build_plan(job(), full_extraction(**ra(said, "2026-11-10", "17:30")), fs._config())
+        task = plan[1]["request"]
+        self.assertIsNotNone(task, plan[1].get("skip_reason"))
+        self.assertEqual(task["body"]["start_time"],
+                         int(datetime(2026, 11, 10, 17, 30, tzinfo=CHI).timestamp()))
+        window, reason = self.parse(ra(said, "2026-11-10", "17:00"))
+        self.assertIsNone(window)
+        self.assertIn("doesn't match the hour said", reason)
+
+        day = date(2026, 11, 10)
+        for text, bare in [("at six fifteen", (6, 15)), ("around seven forty-five", (7, 45)),
+                           ("five thirty o'clock", (5, 30)), ("at five:30", (5, 30)),
+                           ("about five ten tall", (5, 0)), ("about five fifty", (5, 0)),
+                           ("at five thirty-five", (5, 0)), ("at five thirty five", (5, 0)), ("at five thirty\nfive", (5, 0)), ("at 6", (6, 0)),
+                           ("six o'clock", (6, 0))]:
+            with self.subTest(text):
+                self.assertEqual(fs._parse_time(text, day, CHI)[2:], ("bare", bare))
+        for text in ["at five thirty days", "around two forty-five weeks", "at five days",
+                     "five thirty"]:
+            with self.subTest(text):
+                self.assertEqual(fs._parse_time(text, day, CHI)[2], "none")
+
 
 class TestReferenceDate(unittest.TestCase):
     def setUp(self):
