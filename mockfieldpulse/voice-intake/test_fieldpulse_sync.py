@@ -103,6 +103,16 @@ class FakeStore:
                 row["mode"] == "dry_run" and mode != "dry_run"):
             row.update(status=status, mode=mode, request=request, error=error)
 
+    def release_held_fieldpulse_writes(self, job_id, mode):
+        assert mode in ("test_customer_only", "live")
+        n = 0
+        for (jid, _), row in self.rows.items():
+            if jid == job_id and row["mode"] == "dry_run" and row["status"] in (
+                    "planned", "failed", "skipped"):
+                row["mode"] = mode
+                n += 1
+        return n
+
     def claim_fieldpulse_write(self, job_id, step, max_attempts):
         row = self.rows.get((job_id, step))
         if (row and row["status"] in ("planned", "failed") and row["attempts"] < max_attempts
@@ -1151,7 +1161,7 @@ class TestMaterialList(Base):
                 self.assertEqual(step["skip_reason"], "No materials mentioned")
 
     def test_old_extraction_without_key_is_skipped_never_an_error(self):
-        for ex in (full_extraction(), empty_extraction(), with_materials(None),
+        for ex in (full_extraction(), empty_extraction(),
                    with_materials("tile"), with_materials({"item": "tile"}), {}):
             with self.subTest(ex=str(ex)[:40]):
                 step = self.mat(ex)

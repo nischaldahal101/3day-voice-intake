@@ -4,6 +4,9 @@ One public function, `list_customers()`, returns every customer as a small
 dict (id, names, phone, email, company_name, address, created_at), sorted newest-added first, with
 customers that have no usable date at the end.
 
+A second, `list_catalog_items()` (bottom of the file), reads Mike's item list
+for the worker's material matching: real FieldPulse only, never raises.
+
 Where it reads from:
   - FIELDPULSE_READ_BASE_URL + FIELDPULSE_READ_API_KEY when set (real
     FieldPulse, read-only).
@@ -776,3 +779,90 @@ def _sorted_simplified(records):
     decorated.sort(key=lambda pair: pair[0])
     return [simple for _, simple in decorated]
 
+
+
+# --- Item catalog (read-only; used by the worker to match materials) ---------
+
+_CATALOG_PAGE_SIZE = 100        # FieldPulse /items `limit` max
+_CATALOG_MAX_PAGES = 10         # ~252 items today; hard cap, the rest are ignored
+_CATALOG_BUDGET_S = 30.0        # worker-side, shared by every page
+
+
+def list_catalog_items():
+    """Mike's FieldPulse item list, read-only: [{id, name, type, unit_price,
+    unit_cost}] for active, non-deleted items, without the placeholder item
+    (FIELDPULSE_MATERIAL_ITEM_ID). Only real FieldPulse (FIELDPULSE_READ_*): when
+    unset -> []. NEVER raises: any failure -> [] + a log line, so the caller
+    (worker.py) falls back to the placeholder item. GET /items, `page` from 1,
+    until a short page or _CATALOG_MAX_PAGES."""
+    try:
+        base = (os.environ.get("FIELDPULSE_READ_BASE_URL") or "").strip().rstrip("/")
+        key = (os.environ.get("FIELDPULSE_READ_API_KEY") or "").strip()
+        if not base or not key:
+            logger.info("item catalog: FIELDPULSE_READ_* not set; no catalog")
+            return []
+        placeholder = (os.environ.get("FIELDPULSE_MATERIAL_ITEM_ID") or "").strip()
+        deadline = time.monotonic() + _CATALOG_BUDGET_S
+        headers = {"x-api-key": key, "Accept": "application/json",
+                   "Accept-Encoding": "identity"}
+        items, seen = [], set()
+        for page in range(1, _CATALOG_MAX_PAGES + 1):
+            if _remaining(deadline) < _MIN_ATTEMPT_S:
+                raise CustomerSourceError("item catalog read ran out of time")
+            status, body = _http_get(f"{base}/items",
+                                     params={"page": page, "limit": _CATALOG_PAGE_SIZE},
+                                     headers=headers, deadline=deadline)
+            if status != 200:
+                raise CustomerSourceError(f"item catalog HTTP {int(status)}")
+            raw, _ = _extract_items(json.loads(body))
+            for it in raw:
+                item = _catalog_entry(it)
+                if item and str(item["id"]) != placeholder and item["id"] not in seen:
+                    seen.add(item["id"])
+                    items.append(item)
+            if len(raw) < _CATALOG_PAGE_SIZE:
+                break
+        else:
+            logger.warning("item catalog: stopped at the %d-page cap", _CATALOG_MAX_PAGES)
+        logger.info("item catalog: %d usable items", len(items))
+        return items
+    except Exception as exc:  # noqa: BLE001 — matching is optional, never fail the job
+        # Class name only: transport errors can carry the host.
+        logger.warning("item catalog read failed (%s); matching skipped", type(exc).__name__)
+        return []
+
+
+def _catalog_entry(it):
+    """One usable catalog item or None (inactive, deleted, no id/name)."""
+    if not isinstance(it, dict):
+        return None
+    active = it.get("is_active")
+    if active not in (True, 1, "1", "true", "True"):
+        return None
+    if it.get("deleted_at") not in (None, "", False):
+        return None
+    raw_id = it.get("id")
+    if isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, str) and raw_id.strip().isdigit():
+        raw_id = int(raw_id.strip())
+    if not isinstance(raw_id, int) or raw_id <= 0:
+        return None
+    name = _text(it.get("name"))
+    if not name:
+        return None
+    return {"id": raw_id, "name": " ".join(name.split())[:255],
+            "type": it.get("type") if it.get("type") in ("product", "service") else None,
+            "unit_price": _catalog_money(it.get("default_unit_price")),
+            "unit_cost": _catalog_money(it.get("default_unit_cost"))}
+
+
+def _catalog_money(v):
+    """"4800" / 4800 / "12.50" -> float >= 0; anything else -> None."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v.strip()) if isinstance(v, str) else float(v)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return f if math.isfinite(f) and 0 <= f <= 10_000_000 else None

@@ -160,7 +160,14 @@ function TaskBody({ body }) {
   )
 }
 
-function MaterialBody({ body }) {
+// Catalog item ids the worker matched (extraction.materials[].catalog_item); any
+// other line item_id is the placeholder item.
+function matchedItemIds(ex) {
+  const mats = isObj(ex) && Array.isArray(ex.materials) ? ex.materials : []
+  return new Set(mats.filter((m) => isObj(m) && isObj(m.catalog_item)).map((m) => String(m.catalog_item.id)))
+}
+
+function MaterialBody({ body, matched }) {
   if (!isObj(body)) return null
   const groups = Array.isArray(body.groupings) ? body.groupings.filter(isObj) : []
   return (
@@ -176,6 +183,9 @@ function MaterialBody({ body }) {
                 {display(li.quantity) || '?'}{str(li.unit_measure) ? ` ${li.unit_measure}` : ''} ×{' '}
                 {display(li.title) || '—'}
                 {str(li.description) ? <span className="admin-sub"> · {li.description}</span> : null}
+                <span className="admin-sub">
+                  {' · '}{matched.has(String(li.item_id)) ? `Matched: ${display(li.title)}` : 'Placeholder (to be priced)'}
+                </span>
               </li>
             ))}
           </ul>
@@ -185,7 +195,7 @@ function MaterialBody({ body }) {
   )
 }
 
-function WriteStep({ w, held }) {
+function WriteStep({ w, held, matched }) {
   const req = isObj(w.request) ? w.request : null
   const body = req && isObj(req.body) ? req.body : null
   const status = held && w.status === 'planned' ? 'held' : w.status
@@ -223,7 +233,7 @@ function WriteStep({ w, held }) {
         </div>
       )}
       {w.step === 'return_task' && body && <TaskBody body={body} />}
-      {w.step === 'material_list' && body && <MaterialBody body={body} />}
+      {w.step === 'material_list' && body && <MaterialBody body={body} matched={matched} />}
       <RawJson value={w.request} label="Request (raw JSON)" />
       {w.response != null && <RawJson value={w.response} label="FieldPulse response (raw JSON)" />}
     </div>
@@ -278,6 +288,7 @@ function FieldPulseSection({ d, onSend, sending, sendNote }) {
       ? sync.steps.filter((s) => isObj(s) && s.status === 'held').map((s) => s.step)
       : [],
   )
+  const matched = matchedItemIds(d.extraction)
   const hasCommentRow = writes.some((w) => w.step === 'comment' && isObj(w.request))
   const summaryComment = sync && str(sync.comment_text)
   const legacy = isObj(d.legacy_fieldpulse) ? d.legacy_fieldpulse : null
@@ -305,7 +316,7 @@ function FieldPulseSection({ d, onSend, sending, sendNote }) {
         <p className="admin-note">No FieldPulse steps were recorded for this consultation.</p>
       )}
       {writes.map((w, i) => (
-        <WriteStep key={`${display(w.step)}-${i}`} w={w} held={heldSteps.has(w.step)} />
+        <WriteStep key={`${display(w.step)}-${i}`} w={w} held={heldSteps.has(w.step)} matched={matched} />
       ))}
       {!hasCommentRow && summaryComment && (
         <div className="admin-comment">

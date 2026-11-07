@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 import jobs
 import queue_setup
 import storage
+from fieldpulse_sync import SEND_MODES, material_config_gap
 from observability import report
 
 logger = logging.getLogger("voice_intake.admin_panel")
@@ -122,6 +123,10 @@ def fieldpulse_status(job_status, sync, writes, legacy_mock):
     truth for what went out) win; then the stored sync summary; then legacy."""
     rows = [w for w in (writes or []) if isinstance(w, dict)]
     active = {w.get("status") for w in rows if w.get("status") != "skipped"}
+    # Material list skipped only for the missing placeholder env var in a send mode:
+    # owed, so a sent comment/task shows as partial (Needs attention + Retry).
+    if any(material_config_gap(w) and w.get("mode") in SEND_MODES for w in rows):
+        active.add("needs_config")
     if "sent" in active:
         return "sent"
     if "succeeded" in active:

@@ -7,7 +7,9 @@ For each job on the `consultations` queue:
        - recorded/uploaded audio (audio_key): download from R2, transcribe;
        - pasted transcript (jobs.transcript): use it as-is, no transcription.
   4. Extract (Claude, null-flagged), told the consultation's date so a
-     relative return appointment ("next Thursday") can be resolved.
+     relative return appointment ("next Thursday") can be resolved. Then
+     match the extracted materials to Mike's FieldPulse item list (optional,
+     never fails the job; stored on the extraction).
   5. SAVE FIRST: transcript + extraction go on the row (still 'processing')
      before anything touches FieldPulse (docs/FIELDPULSE_API.md §11).
   6. fieldpulse_sync.sync_consultation: real FieldPulse write, gated by
@@ -34,7 +36,8 @@ import os
 import sys
 import tempfile
 
-from extractor import ExtractionError, extract_consultation
+from customer_source import list_catalog_items
+from extractor import ExtractionError, extract_consultation, match_catalog_items
 from fieldpulse_sync import consultation_reference, sync_consultation
 from jobs import JobError, get_job, save_manual_send, update_job_status
 from observability import init_sentry, report, traced_job
@@ -99,6 +102,7 @@ def process_consultation_job(job_id):
         ref_day, ref_tz = consultation_reference(job)
         extraction = extract_consultation(transcript, reference_date=ref_day,
                                           reference_tz=ref_tz)
+        _match_materials(job_id, extraction)
 
         # Save first: everything the app (and the stage-3 admin panel) needs
         # is on the row before FieldPulse is touched.
@@ -200,6 +204,22 @@ def send_consultation_to_fieldpulse(job_id, request_id):
         except Exception as exc2:  # noqa: BLE001
             logger.exception("[%s] could not record the manual send error", job_id)
             report(exc2, "Could not record manual send error", job_id=job_id)
+
+
+def _match_materials(job_id, extraction):
+    """Stage 1b: link each extracted material to Mike's FieldPulse item list
+    (read-only GET /items via customer_source, so fieldpulse_sync never reads the read-only key).
+    Stored on the extraction (materials[].catalog_item), so Retry reuses it.
+    Optional: never raises, never fails the job; no match -> placeholder item."""
+    try:
+        mats = extraction.get("materials") if isinstance(extraction, dict) else None
+        if not isinstance(mats, list) or not mats:
+            return
+        n = match_catalog_items(extraction, list_catalog_items())
+        logger.info("[%s] materials matched to the item list: %d of %d", job_id, n, len(mats))
+    except Exception as exc:  # noqa: BLE001 — both callees already never raise
+        logger.warning("[%s] material matching skipped (%s)", job_id, type(exc).__name__)
+        report(exc, "Material catalog matching crashed", job_id=job_id)
 
 
 def _fail(job_id, message):

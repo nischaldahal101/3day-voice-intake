@@ -52,7 +52,7 @@ SALES QUALIFICATION:
   - area: the part of the room it is for, in plain words ("Shower", "Vanity", "Flooring", "Tub", "Cabinets", "Countertops", "Backsplash", "Lighting"). null if unclear.
   - item: the material or product as said ("subway tile", "quartz countertop", "frameless glass door").
   - details: color, finish, size, brand, model or style exactly as said ("white 3x6, matte", "Moen, matte black"). null if none was said. NEVER invent a brand, size, color or model.
-  - quantity: a number ONLY if a quantity was explicitly said ("two sinks" -> 2, "about 120 square feet" -> 120). Otherwise null. NEVER estimate or calculate a quantity from room size.
+  - quantity: a number ONLY if a number was actually said ("two sinks" -> 2, "about 120 square feet" -> 120). "a", "an", "one of those" or a plain singular ("a grab bar", "the vanity") is NOT a stated quantity: use null. Otherwise null. NEVER estimate or calculate a quantity from room size.
   - unit: the unit said with the quantity ("sq ft", "linear ft", "each", "boxes"), or null.
   - quote: a short verbatim snippet from the transcript (under 25 words) that supports this entry.
 - For raw_quotes: include 3-6 verbatim phrases worth preserving — especially budget mentions, concerns, the close score, and anything revealing about motivation.

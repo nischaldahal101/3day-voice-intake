@@ -22,7 +22,10 @@ Plan (Nick's decisions, stage 2):
                    materials: POST /material-list, a separate DRAFT list
                    ("Consultation materials (draft): <name>") grouped by area,
                    every line at price 0 / cost 0 and quantity as said (else 1,
-                   with "Quantity not mentioned"). No materials, or an older
+                   with "Quantity not mentioned"). Stage 1b: a material with a stored
+                   `catalog_item` (worker match) uses that item (name, type, default
+                   prices unless FIELDPULSE_MATERIAL_CATALOG_PRICES=off); the rest use
+                   the placeholder FIELDPULSE_MATERIAL_ITEM_ID (dropped if unset). No materials, or an older
                    extraction without a `materials` key -> `skipped`.
   No pipeline moves, no custom fields, no consultation job.
 
@@ -127,6 +130,10 @@ _OTHER_AREA = "Other"
 _NO_MATERIALS = "No materials mentioned"
 _MATERIALS_NOT_CAPTURED = ("Materials were not captured for this consultation "
                            "(processed before material lists were added)")
+_MATERIALS_UNREADABLE = "The materials list from this consultation could not be read"
+# A config gap, not a decision: once the env var is set, the admin's Send/Retry sends it
+# (admin_panel counts a send-mode row skipped for this reason as needing attention).
+MATERIAL_ITEM_MISSING = "FIELDPULSE_MATERIAL_ITEM_ID is not set"
 _HELD_REASON = ("planned during a dry run, so it is never sent automatically; "
                 "send it by hand from the admin page")
 # Part-of-day windows from doc §5 (local time, hours).
@@ -160,6 +167,9 @@ def _config():
         # FieldPulse refuses a material-list line without an item_id (NOT NULL in its DB),
         # so every draft line links to one $0 placeholder item in Mike's item list.
         "material_item_id": _int_id(os.environ.get("FIELDPULSE_MATERIAL_ITEM_ID")),
+        # Lines matched to Mike's item list carry its default price/cost unless "off".
+        "material_catalog_prices": (os.environ.get("FIELDPULSE_MATERIAL_CATALOG_PRICES")
+                                    or "").strip().lower() != "off",
         "admin_base_url": (os.environ.get("ADMIN_BASE_URL") or "").strip().rstrip("/"),
         "tz": tz,
     }
@@ -822,6 +832,8 @@ def _material_entries(extraction):
     """-> (entries, skip_reason). entries: [{area, item, details, quantity, unit}]
     with a usable item name. Old extractions (no `materials` key) and anything
     that isn't a list are 'not captured'; nothing usable -> 'No materials mentioned'."""
+    if "materials" in extraction and extraction["materials"] is None:
+        return [], _MATERIALS_UNREADABLE              # extractor saw a malformed list (F-64)
     raw = extraction.get("materials")
     if not isinstance(raw, list):
         return [], _MATERIALS_NOT_CAPTURED
@@ -838,27 +850,52 @@ def _material_entries(extraction):
             "details": _txt(m.get("details"), _MATERIAL_DESC_CHARS),
             "quantity": qty,
             "unit": _txt(m.get("unit"), _MATERIAL_UNIT_CHARS) if qty is not None else None,
+            "catalog": _catalog_item(m.get("catalog_item")),
         })
     if not out:
         return [], _NO_MATERIALS
     return out, None
 
 
-def _material_line(entry, item_id):
+def _catalog_item(value):
+    """The stored catalog match ({id, name, type, unit_price, unit_cost}, set by
+    extractor.match_catalog_items) if usable, else None (-> placeholder line)."""
+    c = _dict(value)
+    cid, name = _int_id(c.get("id")), _txt(c.get("name"), _MATERIAL_TITLE_CHARS)
+    if cid is None or not name:
+        return None
+    return {"id": cid, "name": name,
+            "type": c.get("type") if c.get("type") in ("product", "service") else "product",
+            "unit_price": _num(c.get("unit_price"), 0, 10_000_000),
+            "unit_cost": _num(c.get("unit_cost"), 0, 10_000_000)}
+
+
+def _sentence(text):
+    return text if text[-1] in ".!?…" else text + "."
+
+
+def _material_line(entry, item_id, prices=False):
+    """One draft line. Matched to the catalog: that item (its name, type and, when
+    `prices`, its default price/cost), the spoken words in the description.
+    Unmatched: the placeholder `item_id`, the spoken item as the title, price 0."""
+    cat = entry["catalog"]
+    if cat:
+        said = entry["item"] + (f": {entry['details']}" if entry["details"] else "")
+    else:
+        said = entry["details"]
     desc = " ".join(p for p in (
-        entry["details"] and (entry["details"] if entry["details"][-1] in ".!?…"
-                              else entry["details"] + "."),
+        said and _sentence(said),
         "Quantity not mentioned." if entry["quantity"] is None else None) if p)
     # "id": None on lines and groupings: FieldPulse reads $x["id"] without a default
     # (HTTP 400 'Undefined array key "id"' when absent); null means "create new".
     line = {
         "id": None,
-        "item_id": item_id,
-        "title": entry["item"],
+        "item_id": cat["id"] if cat else item_id,
+        "title": cat["name"] if cat else entry["item"],
         "quantity": entry["quantity"] if entry["quantity"] is not None else 1,
-        "unit_price": 0,
-        "unit_cost": 0,
-        "type": "product",
+        "unit_price": (cat["unit_price"] or 0) if cat and prices else 0,
+        "unit_cost": (cat["unit_cost"] or 0) if cat and prices else 0,
+        "type": cat["type"] if cat else "product",
     }
     if desc:
         line["description"] = desc[:_MATERIAL_DESC_CHARS]
@@ -870,11 +907,22 @@ def _material_line(entry, item_id):
 
 def build_material_list(job, extraction, cfg):
     """-> (request body, item count) for a DRAFT material list, or (None, reason).
-    One grouping per area in the order first mentioned ("Other" last), prices 0,
-    capped at _MAX_MATERIAL_LINES lines / _MAX_MATERIAL_GROUPS groups."""
+    One grouping per area in the order first mentioned ("Other" last), capped at
+    _MAX_MATERIAL_LINES lines / _MAX_MATERIAL_GROUPS groups. Lines matched to the
+    item catalog use that item; the rest use the placeholder item (price 0) and are
+    left out (counted in the notes) when FIELDPULSE_MATERIAL_ITEM_ID is unset."""
     entries, reason = _material_entries(_dict(extraction))
     if reason:
         return None, reason
+    placeholder = cfg.get("material_item_id")
+    all_count = len(entries)
+    if not placeholder:
+        entries = [e for e in entries if e["catalog"]]
+        if not entries:
+            return None, (f"{MATERIAL_ITEM_MISSING} and no material matched the FieldPulse "
+                          f"item list (FieldPulse needs an item on every line)")
+    dropped = all_count - len(entries)
+    prices = bool(cfg.get("material_catalog_prices", True))
     groups = {}                                     # area key -> (title, [lines])
     kept = 0
     for e in entries:
@@ -886,7 +934,7 @@ def build_material_list(job, extraction, cfg):
             if len(groups) >= _MAX_MATERIAL_GROUPS:
                 title, key = _OTHER_AREA, _OTHER_AREA.casefold()
             groups.setdefault(key, (title, []))
-        groups[key][1].append(_material_line(e, cfg.get("material_item_id")))
+        groups[key][1].append(_material_line(e, placeholder, prices))
         kept += 1
     other = groups.pop(_OTHER_AREA.casefold(), None)
     ordered = list(groups.values()) + ([other] if other else [])
@@ -900,9 +948,18 @@ def build_material_list(job, extraction, cfg):
         "line_items": lines,
     } for i, (title, lines) in enumerate(ordered, start=1)]
 
+    matched = sum(1 for e in entries[:kept] if e["catalog"])
     notes = (f"Draft from the consultation recording on "
              f"{_fmt_day(_consultation_day(job, cfg['tz']))}. Materials as discussed; "
              f"prices and quantities to be confirmed by the office.")
+    if matched:
+        notes += (f" {matched} of {kept} line{'' if kept == 1 else 's'} matched to the item "
+                  f"list" + (" (its default prices)" if prices else "") + "; the rest use "
+                  f"the placeholder item, price 0.")
+    if dropped:
+        notes += (f" {dropped} material{' was' if dropped == 1 else 's were'} not matched to "
+                  f"the item list and left out (no placeholder item is set); see the "
+                  f"consultation tool.")
     if len(entries) > kept:
         notes += (f" Only the first {kept} of {len(entries)} materials are listed; "
                   f"the rest are in the consultation tool.")
@@ -984,9 +1041,6 @@ def build_plan(job, extraction, cfg):
         })
 
     material, info = build_material_list(job, ex, cfg)
-    if material and not cfg.get("material_item_id"):
-        material, info = None, ("FIELDPULSE_MATERIAL_ITEM_ID is not set (FieldPulse needs a "
-                                "placeholder item for material-list lines)")
     if material:
         n_groups = len(material["groupings"])
         steps.append({
@@ -1216,6 +1270,14 @@ def _sync(job, extraction, manual=False):
     return out
 
 
+def material_config_gap(step_or_row):
+    """True for a material_list step/row skipped only because no placeholder item
+    is configured (re-sendable once FIELDPULSE_MATERIAL_ITEM_ID is set)."""
+    s = _dict(step_or_row)
+    return (s.get("step") == _MATERIAL_STEP and s.get("status") == "skipped"
+            and isinstance(s.get("error"), str) and s["error"].startswith(MATERIAL_ITEM_MISSING))
+
+
 def _summarize(base, cfg, plan, rows, allowed, why):
     name = base["customer_name"]
     steps = []
@@ -1242,7 +1304,10 @@ def _summarize(base, cfg, plan, rows, allowed, why):
     n_mat = mat["items"] if mat and mat["request"] else 0
     mat_text = f"draft material list ({n_mat} item{'' if n_mat == 1 else 's'})"
 
-    active = [s for s in steps if s["status"] != "skipped" or s["step"] == "comment"]
+    # A material list skipped only for the missing placeholder env var is owed, not
+    # decided: in an allowed send it keeps the result partial so Retry is offered.
+    active = [s for s in steps if s["status"] != "skipped" or s["step"] == "comment"
+              or (allowed and material_config_gap(s))]
     if cfg["mode"] == "dry_run":
         status = "dry_run"
         message = (f"Dry run: nothing sent to FieldPulse yet. Would add a comment to {name}"
@@ -1254,7 +1319,7 @@ def _summarize(base, cfg, plan, rows, allowed, why):
     else:
         done = [s for s in active if s["status"] == "succeeded"]
         held = [s for s in active if s["status"] == "held"]
-        if held and not done and len(held) == len(active):
+        if held and not done and all(s in held or material_config_gap(s) for s in active):
             status = "blocked"
             message = f"Nothing was sent to FieldPulse: {_HELD_REASON}."
         elif len(done) == len(active):

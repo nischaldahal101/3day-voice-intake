@@ -254,6 +254,108 @@ def normalize_materials(result):
     return result
 
 
+# --- Catalog matching (flag, don't fabricate) ---------------------------------
+
+_MATCH_TIMEOUT_S = 90.0   # whole matcher call; on timeout every line uses the placeholder
+_MATCH_MAX_TOKENS = 4000
+_MATCH_PROMPT = """You match materials from a kitchen/bath remodeling consultation to a contractor's item catalog.
+
+You get JSON with "materials" (index, area, item, details) and "catalog" (id, name, type).
+For EACH material return the id of the catalog item that clearly IS that product or service, or null.
+
+Rules:
+- Match only when the catalog item is plainly the same thing (e.g. material "grab bar" -> catalog "Grab Bar"; "frameless glass shower door" -> "Frameless Shower Door").
+- Do NOT match a single material to a broad package, bundle, upgrade or labor/service line (e.g. "faucet" is NOT "Plumbing - Bathroom Basic Upgrade"; "subway tile" is NOT "Tile Installation") unless the material obviously is that package.
+- Do NOT match to cost-code or section headers (names like "01 Plans and Permits | 01.1 Plans").
+- If more than one catalog item could fit, or you are unsure, use null. A null is always acceptable; a wrong match is not.
+- Never invent ids. Use only ids from the catalog.
+
+Reply with JSON only, no prose:
+{"matches": [{"index": 0, "item_id": 123}, {"index": 1, "item_id": null}]}"""
+
+
+def _int_or_none(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return v if isinstance(v, int) else None
+
+
+def _parse_matches(raw_text, n, by_id):
+    """index -> catalog id, keeping only in-range indexes and ids in the catalog."""
+    data = json.loads(_strip_code_fences(raw_text))
+    rows = data.get("matches") if isinstance(data, dict) else None
+    out = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        idx, cid = _int_or_none(row.get("index")), _int_or_none(row.get("item_id"))
+        if idx is None or not 0 <= idx < n or idx in out:
+            continue
+        out[idx] = cid if cid in by_id else None
+    return out
+
+
+def match_catalog_items(extraction, catalog):
+    """Give each extraction["materials"] entry a `catalog_item` ({id, name,
+    type, unit_price, unit_cost} from `catalog`, or None) in place; returns the
+    number matched. One Claude call. No materials -> nothing changed; empty
+    catalog, any API/parse failure or an invalid answer -> None (the draft line
+    then uses the placeholder item). NEVER raises: the job must not fail here.
+    The result is stored with the extraction, so a later Retry rebuilds the same
+    plan without reading the catalog or calling Claude again."""
+    try:
+        materials = extraction.get("materials") if isinstance(extraction, dict) else None
+        if not isinstance(materials, list) or not materials:
+            return 0
+        for m in materials:
+            if isinstance(m, dict):
+                m["catalog_item"] = None
+        by_id = {c["id"]: c for c in (catalog or [])
+                 if isinstance(c, dict) and isinstance(c.get("id"), int)
+                 and not isinstance(c.get("id"), bool) and isinstance(c.get("name"), str)}
+        if not by_id:
+            return 0
+        payload = {
+            "materials": [{"index": i, "area": m.get("area"), "item": m.get("item"),
+                           "details": m.get("details")}
+                          for i, m in enumerate(materials) if isinstance(m, dict)],
+            "catalog": [{"id": c["id"], "name": c["name"], "type": c.get("type")}
+                        for c in by_id.values()],
+        }
+        # Optional step: one short attempt, no SDK retries (F-65). The shared client's
+        # retries + 600 s timeout could outlast the job and swallow RQ's deadline.
+        response = _client.with_options(max_retries=0, timeout=_MATCH_TIMEOUT_S).messages.create(
+            model=MODEL,
+            max_tokens=_MATCH_MAX_TOKENS,
+            temperature=TEMPERATURE,
+            system=_MATCH_PROMPT,
+            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        )
+        matches = _parse_matches(_response_text(response), len(materials), by_id)
+        n = 0
+        for i, m in enumerate(materials):
+            cid = matches.get(i)
+            if isinstance(m, dict) and cid is not None:
+                c = by_id[cid]
+                m["catalog_item"] = {"id": c["id"], "name": c["name"], "type": c.get("type"),
+                                     "unit_price": c.get("unit_price"),
+                                     "unit_cost": c.get("unit_cost")}
+                n += 1
+        logger.info("Catalog matching: %d of %d materials matched", n, len(materials))
+        return n
+    except Exception as exc:  # noqa: BLE001 — optional step, never fails the job
+        if type(exc).__name__ == "JobTimeoutException":
+            raise               # RQ's job deadline must reach the worker, not be eaten here
+        logger.warning("Catalog matching failed (%s); using the placeholder item",
+                       type(exc).__name__)
+        for m in (extraction.get("materials") or []) if isinstance(extraction, dict) else []:
+            if isinstance(m, dict):
+                m["catalog_item"] = None
+        return 0
+
+
 # --- Public API -------------------------------------------------------------
 
 def extract_intake(transcript: str) -> dict:
