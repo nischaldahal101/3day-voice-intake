@@ -370,3 +370,21 @@ test('P1b: vendor document endpoints, #documents hash and upload messages', () =
     'Submit document failed (HTTP 404): [redacted]')
   assert.equal(safeExceptionValue(`Couldn't load the document failed (HTTP 500)`), "Couldn't load the document failed (HTTP 500)")
 })
+
+test('P2: per-customer vendor list endpoints, #documents/c/<id> hash and messages', () => {
+  assert.equal(requestUrl('https://api.example/documents/customers'), 'https://api.example/documents/customers')
+  assert.equal(requestUrl('https://api.example/documents/customers/18809123'), 'https://api.example/documents/customers/[id]')
+  assert.equal(requestUrl('https://api.example/documents/customers/18809123/send'), 'https://api.example/documents/customers/[id]/send')
+  assert.equal(requestUrl(`https://api.example/documents/customers/${NAME}/x`), 'https://api.example')
+  assert.equal(requestUrl('https://api.example/documents/doc_0123456789ab'), 'https://api.example/documents/[id]')
+  assert.equal(pageUrl('https://a.example/#documents/c/18809123'), 'https://a.example/#documents/c/[id]')
+  assert.equal(pageUrl(`https://a.example/#documents/c/${NAME} ${PHONE}`), 'https://a.example/#documents/c/[id]')
+  assert.equal(pageUrl('https://a.example/#admin/c/123'), 'https://a.example/#admin/[id]')
+  assert.equal(pageUrl('https://a.example/#documents/doc_0123456789ab'), 'https://a.example/#documents/[id]')
+  for (const msg of ["Couldn't load vendor document customers: the server sent an unexpected response.",
+    "Couldn't load the customer's documents: the server sent an unexpected response."]) {
+    assert.equal(safeExceptionValue(msg), msg)
+  }
+  assert.equal(safeExceptionValue(`Send vendor list failed (HTTP 503): ${NAME}`),
+    'Send vendor list failed (HTTP 503): [redacted]')
+})

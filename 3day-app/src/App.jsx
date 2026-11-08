@@ -18,16 +18,18 @@ import Confirmation from './screens/Confirmation.jsx'
 import ErrorScreen from './screens/ErrorScreen.jsx'
 import AdminList from './screens/AdminList.jsx'
 import AdminDetail from './screens/AdminDetail.jsx'
-import DocumentsList from './screens/DocumentsList.jsx'
+import DocumentCustomers from './screens/DocumentCustomers.jsx'
+import DocumentCustomer from './screens/DocumentCustomer.jsx'
 import DocumentUpload from './screens/DocumentUpload.jsx'
 import DocumentDetail from './screens/DocumentDetail.jsx'
 
 const isAdminScreen = (s) => s === 'admin' || s === 'admin-detail'
-// Vendor documents (stage P1b): list, pick customer, upload, detail.
+// Vendor documents (P1b + P2): customers, customer page, pick customer, upload, detail.
 const isDocumentsScreen = (s) => typeof s === 'string' && s.startsWith('documents')
 // Screens a finishing background consultation must never pull the user out of.
 const isBrowseScreen = (s) => isAdminScreen(s) || isDocumentsScreen(s)
 const isWideScreen = (s) => isAdminScreen(s) || s === 'documents' || s === 'documents-detail'
+  || s === 'documents-customer'
 
 // The Consultations screens (internally 'admin' / 'admin-detail') have their
 // own URL (#admin, #admin/<job_id>; #consultations[/<id>] also accepted) so Mike can
@@ -87,6 +89,9 @@ export default function App() {
   const [adminListState, setAdminListState] = useState(null) // search/filter/page to restore
   const [docId, setDocId] = useState(null)             // open vendor document
   const [docCustomer, setDocCustomer] = useState(null) // customer picked for a document upload
+  const [docCustomerId, setDocCustomerId] = useState(null) // open customer page (#documents/c/<id>)
+  // Customer page that the upload / document detail screens return to (null = the customers list).
+  const [docReturn, setDocReturn] = useState(null)
 
   const pollTimerRef = useRef(null)
   const screenRef = useRef(screen)
@@ -161,7 +166,9 @@ export default function App() {
       setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
     } else if (docRoute) {
       setDocId(docRoute.view === 'detail' ? docRoute.docId : null)
-      setScreen(docRoute.view === 'detail' ? 'documents-detail' : 'documents')
+      setDocCustomerId(docRoute.view === 'customer' ? docRoute.customerId : null)
+      setScreen(docRoute.view === 'detail' ? 'documents-detail'
+        : docRoute.view === 'customer' ? 'documents-customer' : 'documents')
     }
     const active = getActiveJob()
     if (active && active.job_id) {
@@ -186,6 +193,9 @@ export default function App() {
         if (docRoute.view === 'detail') {
           setDocId(docRoute.docId)
           setScreen('documents-detail')
+        } else if (docRoute.view === 'customer') {
+          setDocCustomerId(docRoute.customerId)
+          setScreen('documents-customer')
         } else if (screenRef.current !== 'documents-pick' && screenRef.current !== 'documents-upload') {
           setDocId(null)
           setScreen('documents')   // pick/upload live under #documents too: stay there
@@ -231,29 +241,50 @@ export default function App() {
     setScreen('home')
   }, [])
 
-  // ---- vendor documents (#documents, #documents/<id>) ------------------
-  // Pick and upload screens stay under #documents (reload -> the list).
+  // ---- vendor documents (#documents, #documents/c/<customer_id>, #documents/<id>) ----
+  // Pick and upload screens stay under the current hash (reload -> that list/page).
 
   const openDocuments = useCallback(() => {
     setDocId(null)
+    setDocReturn(null)
     setScreen('documents')
     setAdminHash('#documents')
   }, [])
 
+  const openDocumentCustomer = useCallback((customerId) => {
+    setDocId(null)
+    setDocCustomerId(customerId)
+    setScreen('documents-customer')
+    setAdminHash(`#documents/c/${customerId}`)
+  }, [])
+
+  // A document row on the customer page: its detail returns to that page.
   const openDocument = useCallback((id) => {
     setDocId(id)
     setScreen('documents-detail')
     setAdminHash(`#documents/${id}`)
   }, [])
 
-  // After an upload, or after a delete: back to a fresh list. Replace (not
-  // push) so browser Back doesn't return to a deleted document's URL.
+  // After an upload, or after a delete: back to a fresh customer page (when we
+  // came from one) or customers list. Replace (not push) so browser Back doesn't
+  // return to a deleted document's URL.
   const backToDocuments = useCallback(() => {
     setDocId(null)
     setDocCustomer(null)
-    setScreen('documents')
-    replaceAdminHash('#documents')
-  }, [])
+    if (docReturn) {
+      setDocCustomerId(docReturn)
+      setScreen('documents-customer')
+      replaceAdminHash(`#documents/c/${docReturn}`)
+    } else {
+      setScreen('documents')
+      replaceAdminHash('#documents')
+    }
+  }, [docReturn])
+
+  const leaveDocumentDetail = useCallback(() => {
+    if (docReturn) openDocumentCustomer(docReturn)
+    else openDocuments()
+  }, [docReturn, openDocumentCustomer, openDocuments])
 
   // ---- reset / navigation ---------------------------------------------
 
@@ -382,8 +413,18 @@ export default function App() {
         <AdminDetail key={adminJobId} jobId={adminJobId} onBack={openAdmin} onDeleted={onAdminDeleted} />
       )}
       {screen === 'documents' && (
-        <DocumentsList onBack={leaveAdmin} onOpen={openDocument}
-          onUpload={() => setScreen('documents-pick')} />
+        <DocumentCustomers onBack={leaveAdmin} onOpenCustomer={openDocumentCustomer}
+          onUpload={() => { setDocReturn(null); setScreen('documents-pick') }} />
+      )}
+      {screen === 'documents-customer' && docCustomerId && (
+        <DocumentCustomer key={docCustomerId} customerId={docCustomerId} onBack={openDocuments}
+          onOpenDocument={(id) => { setDocReturn(docCustomerId); openDocument(id) }}
+          onUpload={(c) => {
+            // Upload for this customer: skip the picker.
+            setDocReturn(docCustomerId)
+            setDocCustomer(c)
+            setScreen('documents-upload')
+          }} />
       )}
       {screen === 'documents-pick' && (
         <CustomerPicker
@@ -395,11 +436,12 @@ export default function App() {
         />
       )}
       {screen === 'documents-upload' && docCustomer && (
-        <DocumentUpload customer={docCustomer} onBack={() => setScreen('documents-pick')}
+        <DocumentUpload customer={docCustomer} step={docReturn ? null : 'Step 2 of 2'}
+          onBack={() => (docReturn ? openDocumentCustomer(docReturn) : setScreen('documents-pick'))}
           onUploaded={backToDocuments} />
       )}
       {screen === 'documents-detail' && docId && (
-        <DocumentDetail key={docId} docId={docId} onBack={openDocuments} onDeleted={backToDocuments} />
+        <DocumentDetail key={docId} docId={docId} onBack={leaveDocumentDetail} onDeleted={backToDocuments} />
       )}
     </div>
   )

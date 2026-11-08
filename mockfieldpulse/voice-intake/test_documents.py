@@ -429,10 +429,13 @@ class TestDelete(RouteBase):
         for status in ("done", "failed"):
             with self.subTest(status=status):
                 db = FakeDocsDB([new_doc(status=status)])
-                r, removed = self.delete(db, "doc_0123456789ab")
+                with mock.patch.object(dp.queue_setup, "enqueue_vendor_materials") as enq:
+                    r, removed = self.delete(db, "doc_0123456789ab")
                 self.assertEqual(r.status_code, 200, r.get_json())
                 self.assertEqual(r.get_json(), {"deleted": True, "id": "doc_0123456789ab",
-                                                "file": "deleted"})
+                                                "file": "deleted", "materials": "queued"})
+                # P2: the customer's combined list is rebuilt without it (worker job).
+                enq.assert_called_once_with("18809123", False, CUSTOMER)
                 self.assertEqual(removed, [KEY])
                 self.assertEqual(db.docs, {})
                 self.assertEqual(self.delete(db, "doc_0123456789ab")[0].status_code, 404)

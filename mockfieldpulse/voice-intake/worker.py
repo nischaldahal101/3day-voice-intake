@@ -21,8 +21,10 @@ For each job on the `consultations` queue:
 
 Also runs the admin panel's manual "Send to FieldPulse" for a finished job
 (send_consultation_to_fieldpulse, queued by admin_panel.request_manual_send),
-and reads uploaded vendor PDFs (process_vendor_document, stage P1b, queued by
-documents_panel.submit; no FieldPulse call).
+reads uploaded vendor PDFs (process_vendor_document, stage P1b, queued by
+documents_panel.submit; no FieldPulse call), and rebuilds each customer's combined
+vendor material list (sync_vendor_materials_job, stage P2: queued after a document is
+read, after one is deleted, and by the manual send; fieldpulse_sync does the write).
 
 The worker no longer calls the mock writer (consultation_writer); that module
 stays only for the deprecated sync route until stage 6 removes the mock.
@@ -39,11 +41,12 @@ import sys
 import tempfile
 import time
 
+import queue_setup
 import vendor_documents
 from customer_source import list_catalog_items
 from documents_panel import customer_display_name
 from extractor import ExtractionError, extract_consultation, match_catalog_items
-from fieldpulse_sync import consultation_reference, sync_consultation
+from fieldpulse_sync import consultation_reference, sync_consultation, sync_vendor_materials
 from jobs import (JobError, get_job, get_vendor_document, save_manual_send,
                   update_job_status, update_vendor_document)
 from observability import init_sentry, report, traced_job
@@ -304,6 +307,42 @@ def process_vendor_document(doc_id):
     logger.info("[%s] vendor document DONE (%d lines, %d warnings)", doc_id,
                 len(result.get("lines") or []),
                 sum(1 for c in result.get("checks") or [] if c.get("level") == "warn"))
+    # Rebuild this customer's combined vendor list (its own RQ job; never changes
+    # this document's status). The customer snapshot is read from the documents.
+    queue_vendor_materials(saved.get("customer_id"), ref=doc_id)
+
+
+def queue_vendor_materials(customer_id, manual=False, customer=None, ref=None):
+    """Queue the customer's vendor list rebuild (stage P2). Best effort: a queue
+    failure is logged + reported and never changes a document's status. True if queued."""
+    if not customer_id:
+        return False
+    try:
+        queue_setup.enqueue_vendor_materials(customer_id, manual, customer)
+        return True
+    except Exception as exc:  # noqa: BLE001 — Redis down etc.
+        logger.error("[%s] could not queue the vendor material list update: %s",
+                     ref or customer_id, type(exc).__name__)
+        report(exc, "Could not queue vendor material sync", job_id=ref)
+        return False
+
+
+@traced_job
+def sync_vendor_materials_job(customer_id, manual=False, customer=None):
+    """Rebuild + send one customer's combined vendor material list
+    (fieldpulse_sync.sync_vendor_materials; never raises, mode-gated). Documents are
+    loaded under the per-customer lease, so the newest finished ones are included."""
+    out = sync_vendor_materials(customer_id, customer=customer, documents=None, manual=manual)
+    logger.info("[customer %s] vendor material list: %s (%s)", customer_id,
+                out.get("status"), "manual" if manual else "automatic")
+    if out.get("follow_up"):
+        # Another update was asked for while this one ran (F-78): one more run. The
+        # request stays flagged in the DB (and a flagged manual request is honoured by
+        # whichever run claims it), so a failed enqueue only delays it to the next event.
+        logger.info("[customer %s] vendor material list: queueing the follow-up run",
+                    customer_id)
+        queue_vendor_materials(customer_id)
+    return out.get("status")
 
 
 def _read_vendor_pdf(doc_id, data, customer_name):

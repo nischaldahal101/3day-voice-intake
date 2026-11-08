@@ -355,18 +355,47 @@ export async function uploadVendorDocument({ file, customer, onProgress }) {
   return resp.json()
 }
 
-// { items: [{id, created_at, status, customer_name, filename, vendor, document_type,
-//   line_count, warn_count, error, stuck}], total, offset, limit }, newest first.
-export async function fetchDocuments({ customerId = null, offset = 0, limit = 50 } = {}) {
-  const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-  if (customerId !== null && customerId !== undefined) params.set('customer_id', String(customerId))
-  const resp = await fetch(`${API_BASE}/documents?${params}`, { headers: await authHeaders() })
-  await assertOk(resp, "Couldn't load documents")
+// -------------------- Vendor documents per customer (stage P2) --------------------
+// The combined vendor material list is built and sent by the worker (mode-gated);
+// these calls only read our database or queue that job.
+
+// { items: [{customer_id, customer_name, document_count, last_upload_at,
+//   processing_count, warn_count, fieldpulse_status, fieldpulse_label}], total },
+// newest upload first.
+export async function fetchDocumentCustomers() {
+  const resp = await fetch(`${API_BASE}/documents/customers`, { headers: await authHeaders() })
+  await assertOk(resp, "Couldn't load vendor document customers")
   const data = await resp.json()
   if (!isPlainObject(data) || !Array.isArray(data.items)) {
-    throw new Error("Couldn't load documents: the server sent an unexpected response.")
+    throw new Error("Couldn't load vendor document customers: the server sent an unexpected response.")
   }
   return data
+}
+
+// { customer_id, customer, customer_name, documents: [compact, newest first],
+//   processing_count, preview: {title, notes, sections, line_count, document_count},
+//   fieldpulse: {status, label, list_id, mode, last_error, updated_at, last_request,
+//   last_response, history} }
+export async function fetchDocumentCustomer(customerId) {
+  const resp = await fetch(`${API_BASE}/documents/customers/${encodeURIComponent(customerId)}`, {
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, "Couldn't load the customer's documents")
+  const data = await resp.json()
+  if (!isPlainObject(data) || !Array.isArray(data.documents) || !isPlainObject(data.preview)) {
+    throw new Error("Couldn't load the customer's documents: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// Queue the manual "Send to FieldPulse" of the customer's combined list (202).
+export async function requestVendorListSend(customerId) {
+  const resp = await fetch(
+    `${API_BASE}/documents/customers/${encodeURIComponent(customerId)}/send`,
+    { method: 'POST', headers: await authHeaders() },
+  )
+  await assertOk(resp, 'Send vendor list')
+  return resp.json()
 }
 
 // One document: {id, status, error, created_at, customer_name, filename, can_delete,

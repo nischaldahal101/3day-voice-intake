@@ -1499,3 +1499,23 @@ code { font-size: 12px; overflow-wrap: anywhere; }
   .doc-lines .num { text-align: left; }
   .doc-lines td::before { content: attr(data-label) ": "; color: var(--text-muted); }
 }
+
+/* ---- Vendor documents per customer (stage P2) ---- */
+@media (min-width: 760px) {
+  .doc-cust-table .admin-tr { grid-template-columns: minmax(160px, 1fr) 220px 170px 150px; }
+  .doc-cust-docs .admin-tr {
+    grid-template-columns: 170px 130px 90px minmax(140px, 1fr) 110px 150px;
+  }
+}
+.fp-list { text-transform: none; letter-spacing: 0; white-space: nowrap; }
+.fp-list-sent { background: #e2f3e8; color: #1e7a45; }
+.fp-list-dry_run { background: #e8eef7; color: #2f4f7a; }
+.fp-list-attention { background: #fbe3e1; color: #a0322a; }
+.fp-list-sending { background: #fbf2cf; color: #856404; }
+.doc-flag {
+  display: inline-block; margin: 0 4px 2px 0; padding: 1px 6px; border-radius: var(--radius-sm);
+  background: #fbf2cf; color: #856404; font-size: 12px; white-space: nowrap;
+}
+.doc-section-title { margin: 12px 0 4px; font-size: 15px; }
+.doc-list-notes { white-space: pre-wrap; font-size: 13px; color: var(--text-secondary); margin: 0; }
+.doc-cust-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }

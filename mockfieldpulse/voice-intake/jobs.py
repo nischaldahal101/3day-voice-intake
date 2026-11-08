@@ -248,6 +248,29 @@ CREATE INDEX IF NOT EXISTS idx_vendor_documents_created_at
     ON vendor_documents(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vendor_documents_customer
     ON vendor_documents(customer_id, created_at DESC);
+-- Vendor materials (stage P2): one row per customer for OUR combined vendor material
+-- list in FieldPulse (fieldpulse_sync.sync_vendor_materials is the only writer).
+-- lease_until serializes syncs per customer (claimed under FOR UPDATE, never held
+-- across the HTTP call); resync = another sync asked while the lease was taken.
+-- create_pending: a POST was dispatched and has not answered with an id (never
+-- auto-retried); held: recorded in dry_run (only a manual Send releases it).
+CREATE TABLE IF NOT EXISTS vendor_material_lists (
+    customer_id         TEXT PRIMARY KEY,
+    fieldpulse_list_id  BIGINT,
+    status              TEXT NOT NULL DEFAULT 'new',
+    mode                TEXT,
+    last_request        JSONB,
+    last_response       JSONB,
+    last_error          TEXT,
+    history             JSONB NOT NULL DEFAULT '[]'::jsonb,
+    lease_until         TIMESTAMPTZ,
+    resync              BOOLEAN NOT NULL DEFAULT false,
+    resync_manual       BOOLEAN NOT NULL DEFAULT false,
+    create_pending      BOOLEAN NOT NULL DEFAULT false,
+    held                BOOLEAN NOT NULL DEFAULT false,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -1071,3 +1094,182 @@ def delete_vendor_document(doc_id: str) -> dict | None:
         conn.commit()
     logger.info("Deleted vendor document %s (status=%s)", doc_id, doc["status"])
     return {"deleted": True, "document": doc}
+
+
+# --- Vendor material lists (stage P2; fieldpulse_sync.sync_vendor_materials) ----------
+#
+# One row per customer. A sync CLAIMS the row (short transaction, SELECT ... FOR
+# UPDATE after inserting it if missing) by setting lease_until; it then builds and
+# sends with no transaction open, and FINISHES (another short transaction). A sync
+# that finds the lease taken only sets resync (+ resync_manual) and stops; the holder
+# sees that on finish, releases the lease and the worker queues one more run (the flag
+# stays set until a run CLAIMS it, so a request is never lost). So two documents
+# finishing together never create two lists, and the last build includes both.
+
+VENDOR_LIST_LEASE_S = 120     # > one sync's worst case (PUT 404 + POST, 20 s each)
+_VENDOR_LIST_HISTORY = 10
+
+
+def _serialize_vendor_list(row):
+    if row is None:
+        return None
+    return {
+        "customer_id": row["customer_id"],
+        "fieldpulse_list_id": row["fieldpulse_list_id"],
+        "status": row["status"],
+        "mode": row["mode"],
+        "last_request": row["last_request"],
+        "last_response": row["last_response"],
+        "last_error": row["last_error"],
+        "history": row["history"] if isinstance(row.get("history"), list) else [],
+        "create_pending": bool(row.get("create_pending")),
+        "held": bool(row.get("held")),
+        "resync_manual": bool(row.get("resync_manual")),
+        "created_at": _iso(row["created_at"]),
+        "updated_at": _iso(row["updated_at"]),
+    }
+
+
+def get_vendor_material_list(customer_id: str) -> dict | None:
+    """The customer's vendor material list record, or None (never synced)."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM vendor_material_lists WHERE customer_id = %s",
+                    [customer_id])
+        return _serialize_vendor_list(cur.fetchone())
+
+
+def claim_vendor_material_list(customer_id: str, manual: bool = False) -> dict | None:
+    """Take this customer's sync lease. Returns the row (serialized, with the
+    resync_manual it had: a pending manual request is now this run's) when claimed and
+    clears the resync flags; None when another sync holds it (then resync is flagged)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO vendor_material_lists (customer_id) VALUES (%s) "
+                        "ON CONFLICT (customer_id) DO NOTHING", [customer_id])
+            cur.execute("SELECT *, (lease_until IS NOT NULL AND lease_until > now()) AS busy "
+                        "FROM vendor_material_lists WHERE customer_id = %s FOR UPDATE",
+                        [customer_id])
+            row = cur.fetchone()
+            if row["busy"]:
+                cur.execute("UPDATE vendor_material_lists SET resync = true, "
+                            "resync_manual = resync_manual OR %s WHERE customer_id = %s",
+                            [bool(manual), customer_id])
+                conn.commit()
+                logger.info("Vendor material list %s busy: resync flagged", customer_id)
+                return None
+            cur.execute("UPDATE vendor_material_lists SET lease_until = now() + "
+                        "make_interval(secs => %s), resync = false, resync_manual = false "
+                        "WHERE customer_id = %s", [VENDOR_LIST_LEASE_S, customer_id])
+        conn.commit()
+    return _serialize_vendor_list(row)
+
+
+def mark_vendor_material_list_sending(customer_id: str, request: dict, mode: str) -> None:
+    """Right before EVERY POST, in ONE write: create_pending = true, the old list id
+    cleared, status 'sending' + the request. If the worker dies after dispatch, the next
+    automatic sync sees create_pending and sends nothing (FieldPulse may have created
+    the list); only finish(..., create_pending=False) after an id clears it."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE vendor_material_lists SET status = 'sending', mode = %s, "
+                        "create_pending = true, fieldpulse_list_id = NULL, "
+                        "last_request = %s, last_error = NULL, updated_at = now() "
+                        "WHERE customer_id = %s", [mode, Jsonb(request), customer_id])
+        conn.commit()
+
+
+_UNSET = object()
+
+
+def finish_vendor_material_list(customer_id: str, status: str, mode: str = None,
+                                request: dict = None, response: dict = None,
+                                error: str = None, list_id=_UNSET, create_pending=_UNSET,
+                                held=_UNSET, history_entry: dict = None) -> tuple:
+    """Record a sync's outcome and ALWAYS release the lease. list_id / create_pending /
+    held: leave out to keep the stored value. Returns (again, again_manual): True when
+    another sync was asked for meanwhile. The resync flags are NOT cleared here (the
+    next claim consumes them), so the caller queues a follow-up run and nothing is lost
+    even if that queueing fails (the next document event picks the flag up)."""
+    sets = ["status = %s", "mode = %s", "last_request = %s", "last_response = %s",
+            "last_error = %s", "updated_at = now()",
+            "history = (SELECT coalesce(jsonb_agg(e), '[]'::jsonb) FROM (SELECT e FROM "
+            "jsonb_array_elements(%s::jsonb || history) WITH ORDINALITY AS t(e, n) "
+            "ORDER BY n LIMIT %s) h)"]
+    params = [status, mode, Jsonb(request) if request is not None else None,
+              Jsonb(response) if response is not None else None, error,
+              Jsonb([history_entry] if history_entry else []), _VENDOR_LIST_HISTORY]
+    for column, value in (("fieldpulse_list_id", list_id), ("create_pending", create_pending),
+                          ("held", held)):
+        if value is not _UNSET:
+            sets.append(f"{column} = %s")
+            params.append(value)
+    sets.append("lease_until = NULL")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT resync, resync_manual FROM vendor_material_lists "
+                        "WHERE customer_id = %s FOR UPDATE", [customer_id])
+            row = cur.fetchone()
+            again = bool(row and row["resync"])
+            again_manual = bool(row and row["resync_manual"])
+            cur.execute(f"UPDATE vendor_material_lists SET {', '.join(sets)} "
+                        f"WHERE customer_id = %s", params + [customer_id])
+        conn.commit()
+    return again, again_manual
+
+
+def list_customer_vendor_documents(customer_id: str, limit: int = 500) -> list:
+    """One customer's vendor documents, full rows (incl. result), oldest first."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_DOC_COLUMNS} FROM vendor_documents WHERE customer_id = %s "
+                    f"ORDER BY created_at, id LIMIT %s", [customer_id, max(1, int(limit))])
+        return [_serialize_document(r) for r in cur.fetchall()]
+
+
+def list_vendor_document_customers(limit: int = 500) -> list:
+    """Customers that have vendor documents, newest upload first: {customer_id,
+    customer (latest snapshot), document_count, last_upload_at, processing_count
+    (queued/processing, not stuck), warn_count, list_status, fieldpulse_list_id,
+    list_error, list_updated_at}."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT d.customer_id,
+                   (array_agg(CASE WHEN jsonb_typeof(d.customer) = 'object' THEN d.customer END
+                              ORDER BY d.created_at DESC)
+                      FILTER (WHERE jsonb_typeof(d.customer) = 'object'))[1] AS customer,
+                   count(*) AS document_count,
+                   max(d.created_at) AS last_upload_at,
+                   count(*) FILTER (WHERE d.status IN ('queued', 'processing')
+                       AND d.updated_at >= now() - interval '{VENDOR_DOC_STUCK_MINUTES} minutes')
+                       AS processing_count,
+                   coalesce(sum(CASE WHEN jsonb_typeof(d.result->'checks') = 'array'
+                        THEN (SELECT count(*) FROM jsonb_array_elements(d.result->'checks') c
+                               WHERE jsonb_typeof(c) = 'object' AND c->>'level' = 'warn')
+                        ELSE 0 END), 0) AS warn_count,
+                   max(d.updated_at) FILTER (WHERE d.status = 'done') AS last_done_at,
+                   m.status AS list_status, m.mode AS list_mode,
+                   m.fieldpulse_list_id, left(m.last_error, 300) AS list_error,
+                   m.updated_at AS list_updated_at,
+                   coalesce(m.create_pending, false) AS create_pending
+              FROM vendor_documents d
+              LEFT JOIN vendor_material_lists m ON m.customer_id = d.customer_id
+             WHERE d.customer_id IS NOT NULL
+             GROUP BY d.customer_id, m.status, m.mode, m.fieldpulse_list_id, m.last_error,
+                      m.updated_at, m.create_pending
+             ORDER BY max(d.created_at) DESC, d.customer_id
+             LIMIT %s
+            """,
+            [max(1, int(limit))],
+        )
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["document_count"] = int(r["document_count"])
+        item["processing_count"] = int(r["processing_count"])
+        item["warn_count"] = int(r["warn_count"])
+        item["last_upload_at"] = _iso(r["last_upload_at"])
+        item["list_updated_at"] = _iso(r["list_updated_at"])
+        item["last_done_at"] = _iso(r["last_done_at"])
+        out.append(item)
+    return out

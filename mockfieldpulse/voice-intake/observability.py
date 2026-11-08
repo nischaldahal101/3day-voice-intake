@@ -145,7 +145,7 @@ _REDIS_COMMANDS = frozenset((
 _TAG_RULES = {
     "component": {"orchestrator", "worker"},
     "job_id": re.compile(rf"{_JOB_ID}|{_DOC_ID}"),     # traced_job tags its first arg
-    "step": {"comment", "return_task", "material_list"},
+    "step": {"comment", "return_task", "material_list", "vendor_list"},
     "mode": {"dry_run", "off", "test_customer_only", "live"},
     "manual": {"True", "False"},
     "status": {"fieldpulse_error", "config_error", "fieldpulse_unreachable", "fieldpulse_timeout"},

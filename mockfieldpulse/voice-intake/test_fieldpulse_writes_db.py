@@ -119,7 +119,10 @@ class TestWritesDB(unittest.TestCase):
               "return_appointment": {"scheduled": True, "details": "2026-11-20 at 10 am"},
               "materials": [{"area": "Shower", "item": "subway tile", "details": "white",
                              "quantity": None, "unit": None, "quote": "white subway"}]}
-        with mock.patch.object(fs, "_send", side_effect=AssertionError("must not send")):
+        # The env is scrubbed in setUpClass; a material list needs the placeholder item
+        # (made-up id) or it is skipped by design (MATERIAL_ITEM_MISSING).
+        with mock.patch.object(fs, "_send", side_effect=AssertionError("must not send")), \
+                mock.patch.dict(os.environ, {"FIELDPULSE_MATERIAL_ITEM_ID": "900001"}):
             out = fs.sync_consultation(j, ex)
             again = fs.sync_consultation(j, ex)
         self.assertEqual(out["status"], "dry_run")

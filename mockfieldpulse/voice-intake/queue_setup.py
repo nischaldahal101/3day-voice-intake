@@ -75,3 +75,15 @@ def enqueue_vendor_document(doc_id: str):
                                         job_timeout=300)
     logger.info("Enqueued vendor document %s (rq id=%s)", doc_id, rq_job.id)
     return rq_job
+
+
+def enqueue_vendor_materials(customer_id: str, manual: bool = False, customer: dict = None):
+    """Queue rebuilding + sending one customer's combined vendor material list
+    (worker.sync_vendor_materials_job -> fieldpulse_sync.sync_vendor_materials).
+    Queued after a document is read, after one is deleted, and by the manual
+    "Send to FieldPulse". 120 s: at most a PUT and a POST (20 s each) per round."""
+    rq_job = consultation_queue.enqueue("worker.sync_vendor_materials_job", customer_id,
+                                        manual, customer, job_timeout=120)
+    logger.info("Enqueued vendor material sync for customer %s (manual=%s, rq id=%s)",
+                customer_id, manual, rq_job.id)
+    return rq_job

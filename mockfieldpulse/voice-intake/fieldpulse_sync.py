@@ -1,8 +1,11 @@
 """Write a finished consultation to REAL FieldPulse, in staged modes.
 
-One entry point:
+Entry points (both never raise):
 
-    sync_consultation(job, extraction, manual=False) -> summary dict   (never raises)
+    sync_consultation(job, extraction, manual=False) -> summary dict
+    sync_vendor_materials(customer_id, customer=None, documents=None, manual=False)
+        -> summary dict   (stage P2: one combined vendor material list per customer;
+                           see "Vendor materials list" near the end of this file)
 
 The worker calls it after the transcript + extraction are already saved on the
 job row (docs/FIELDPULSE_API.md §11 "save first"). Everything else is hidden
@@ -89,6 +92,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import vendor_materials
 from observability import report
 
 logger = logging.getLogger("voice_intake.fieldpulse_sync")
@@ -1077,16 +1081,21 @@ class _OutcomeUnknown(Exception):
     """The request may have reached FieldPulse (never auto-retry)."""
 
 
+# The one PUT this module makes: replacing OUR vendor material list (stage P2).
+_VENDOR_PUT_PATH = re.compile(r"/material-lists/[1-9][0-9]{0,17}")
+
+
 def _send(request, cfg):
-    """POST one request to the real FieldPulse write target. Returns
+    """POST (or PUT our vendor list) to the real FieldPulse write target. Returns
     (http_status, parsed JSON or text). Only reachable through the send gate."""
     if cfg["mode"] not in SEND_MODES or not cfg["base_url"] or not cfg["api_key"]:
         raise _NotDelivered("send refused: not in a send mode")   # belt and braces
-    if request["method"] != "POST":
-        raise _NotDelivered("only POST is used")
+    if not (request["method"] == "POST" or (request["method"] == "PUT"
+                                             and _VENDOR_PUT_PATH.fullmatch(request["path"]))):
+        raise _NotDelivered("only POST (and PUT of our vendor material list) is used")
     import requests  # local import: dry_run/off never touch the HTTP stack
     try:
-        resp = requests.post(
+        resp = (requests.post if request["method"] == "POST" else requests.put)(
             cfg["base_url"] + request["path"],
             json=request["body"],
             headers={"x-api-key": cfg["api_key"], "Accept": "application/json",
@@ -1338,3 +1347,258 @@ def _summarize(base, cfg, plan, rows, allowed, why):
     return {**base, "status": status, "message": message, "steps": steps,
             "comment_text": comment["request"]["body"]["text"],
             "task_skipped_reason": task["skip_reason"]}
+
+
+# --- Vendor materials list (stage P2) --------------------------------------------------
+#
+# sync_vendor_materials(customer_id, customer=None, documents=None, manual=False)
+#
+# ONE material list per customer, OURS: "Vendor materials: <name>", built from all the
+# customer's read vendor documents (vendor_materials.build_material_list) and REPLACED
+# whole on every update (PUT /material-lists/<id> with the full body replaces every
+# grouping and line; verified on the test customer 2026-11-08). Same mode gate as
+# consultations. Per-customer record: jobs.vendor_material_lists. One run = claim the
+# lease, build, at most one PUT and/or one POST, finish. Two durable flags decide:
+#
+#   create_pending  set (and the old list id cleared) in ONE write right before every
+#                   POST; cleared only when a POST answers with an id. While set, an
+#                   automatic run never sends (no POST, no PUT): "Needs attention".
+#                   Only the manual Send may POST again. Nothing else clears it.
+#   held            set whenever the list is recorded in dry_run. While set, automatic
+#                   runs (any mode) keep recording the preview but never send; only the
+#                   manual Send releases it, after the mode / test-customer / config
+#                   gates allowed the send (same contract as consultations).
+#
+#   - no stored list id -> POST /material-lists, store response.id
+#   - stored id -> PUT the full body; PUT 404 -> (create_pending + id cleared) -> POST
+#   - a PUT with no answer is just 'failed': replacing again is harmless
+#   - FIELDPULSE_MATERIAL_ITEM_ID unset -> 'needs_config' (every line needs an item_id)
+#   - no read documents left -> an existing list is PUT empty ("No vendor documents");
+#     nothing is ever DELETEd. Without a list: nothing to do.
+#   - another run asked while the lease was taken -> the summary carries "follow_up";
+#     the worker queues one more run (the request stays flagged in the DB until a
+#     run claims it, so it is never lost).
+
+VENDOR_LIST_PREFIX = "Vendor materials: "
+VENDOR_PRICE_VISIBILITY = "group"        # Mike's sections hide item prices (visual check pending)
+VENDOR_COMPONENT_VISIBILITY = "all"
+VENDOR_NOT_LINKED = "This customer isn't linked to a FieldPulse customer"
+VENDOR_NO_DOCUMENTS = "No vendor documents"
+VENDOR_CREATE_PENDING = ("Needs attention: a create may not have finished. Check the customer's "
+                         "material lists in FieldPulse (delete a duplicate 'Vendor materials' "
+                         "list if there is one), then press Send.")
+VENDOR_HELD = ("Held: this list was recorded during a dry run, so it is never sent "
+               "automatically. Press Send to send it.")
+
+
+def vendor_list_notes(document_count, notes):
+    """The list's notes text (FieldPulse max 10000)."""
+    head = (f"Built from {document_count} vendor document{'' if document_count == 1 else 's'} "
+            "uploaded in the 3 Day app. Prices are from vendor documents; $0 = no price yet. "
+            "This list is replaced on every update — edit Mike's own material list instead.")
+    if not document_count:
+        head += f"\n{VENDOR_NO_DOCUMENTS}."
+    extra = [n for n in notes or [] if isinstance(n, str) and n]
+    return "\n".join([head] + extra)[:_MATERIAL_NOTES_CHARS]
+
+
+def build_vendor_list_body(customer_id, name, built, item_id):
+    """The full POST/PUT body for OUR vendor list from build_material_list's output."""
+    groupings = []
+    for i, section in enumerate(built["sections"], start=1):
+        lines = []
+        for ln in section["lines"]:
+            line = {"id": None, "item_id": item_id,
+                    "title": ln["title"][:_MATERIAL_TITLE_CHARS],
+                    "quantity": ln["quantity"], "unit_price": ln["unit_price"],
+                    "unit_cost": ln["unit_price"], "type": "product"}
+            if ln.get("sku"):
+                line["sku"] = ln["sku"][:_MATERIAL_TITLE_CHARS]
+            if ln.get("description"):
+                line["description"] = ln["description"][:_MATERIAL_DESC_CHARS]
+            lines.append(line)
+        groupings.append({"id": None, "order_number": i,
+                          "title": section["vendor"][:_MATERIAL_TITLE_CHARS], "type": "group",
+                          "component_visibility": VENDOR_COMPONENT_VISIBILITY,
+                          "price_visibility": VENDOR_PRICE_VISIBILITY, "line_items": lines})
+    return {"customer_id": customer_id, "is_template": False,
+            "title": (VENDOR_LIST_PREFIX + name)[:_MATERIAL_TITLE_CHARS],
+            "notes": vendor_list_notes(built["document_count"], built["notes"]),
+            "groupings": groupings}
+
+
+def sync_vendor_materials(customer_id, customer=None, documents=None, manual=False):
+    """Build and (when the mode allows) send this customer's combined vendor list.
+    `documents`: the customer's vendor_documents rows; None (the worker) = loaded
+    under the per-customer lease, so a run always sees every finished document.
+    NEVER raises; returns a summary {status, message, ..., follow_up?}."""
+    try:
+        out = _sync_vendor(str(customer_id), customer, documents, manual)
+    except Exception as exc:  # noqa: BLE001 — never fails the document
+        logger.exception("[%s] vendor material sync crashed", customer_id)
+        report(exc, "Vendor material sync crashed", manual=manual)
+        out = {"status": "failed", "mode": None, "customer_id": str(customer_id),
+               "message": "The vendor material list update hit an internal error. "
+                          "The documents are saved."}
+    out.setdefault("manual", bool(manual))
+    return out
+
+
+def _sync_vendor(cid, customer, documents, manual):
+    cfg = _config()
+    if cfg["mode"] == "off":
+        return {"status": "off", "mode": "off", "customer_id": cid,
+                "message": "FieldPulse sync is off. Nothing was sent to FieldPulse."}
+    store = _store()
+    row = store.claim_vendor_material_list(cid, manual)
+    if row is None:
+        return {"status": "queued", "mode": cfg["mode"], "customer_id": cid,
+                "message": "Another update for this customer is running; it will run again "
+                           "with the latest documents."}
+    manual = manual or bool(row.get("resync_manual"))    # a flagged manual request is ours now
+    try:
+        docs = documents if documents is not None else store.list_customer_vendor_documents(cid)
+        record, summary = _vendor_attempt(cfg, cid, customer, docs, row, manual)
+    except Exception:
+        # Release the lease (flags untouched: create_pending / held / list id kept).
+        store.finish_vendor_material_list(cid, "failed", mode=cfg["mode"],
+                                          error="Internal error while building or sending")
+        raise
+    again, again_manual = store.finish_vendor_material_list(cid, **record)
+    summary["manual"] = manual
+    if again:
+        summary["follow_up"] = {"manual": again_manual}
+    return summary
+
+
+def _latest_customer(docs):
+    for d in reversed(docs or []):
+        if isinstance(d, dict) and isinstance(d.get("customer"), dict):
+            return d["customer"]
+    return None
+
+
+def _vendor_attempt(cfg, cid, customer, docs, row, manual):
+    """One build + (maybe) send. -> (finish_vendor_material_list kwargs, summary).
+    Never touches create_pending except through a POST (mark before, clear on an id)."""
+    int_cid = _int_id(cid)
+    name = customer_name({"customer": customer or _latest_customer(docs), "customer_id": cid})
+    built = vendor_materials.build_material_list(docs)
+    list_id = row.get("fieldpulse_list_id")
+    pending = bool(row.get("create_pending"))
+    held = bool(row.get("held"))
+    now = datetime.now(timezone.utc).isoformat()
+    mode = cfg["mode"]
+    extra = {}                       # held / create_pending / list_id changes for finish
+    sent_id = [list_id]
+
+    def done(status, message, request=None, response=None, error=None, http_status=None):
+        record = {"status": status, "mode": mode, "request": request, "response": response,
+                  "error": error, **extra,
+                  "history_entry": {"at": now, "mode": mode, "status": status,
+                                    "manual": bool(manual),
+                                    "method": request and request.get("method"),
+                                    "path": request and request.get("path"),
+                                    "http_status": http_status,
+                                    "error": error[:300] if error else None}}
+        summary = {"status": status, "mode": mode, "customer_id": cid, "message": message,
+                   "list_id": sent_id[0], "document_count": built["document_count"],
+                   "line_count": built["line_count"], "error": error}
+        return record, summary
+
+    if int_cid is None:
+        return done("skipped", f"Not sent: {VENDOR_NOT_LINKED}.", error=VENDOR_NOT_LINKED)
+    item_id = cfg.get("material_item_id")
+    if not item_id:
+        err = f"{MATERIAL_ITEM_MISSING} (FieldPulse needs an item on every line)"
+        return done("needs_config", f"Not sent: {err}.", error=err)
+    if not built["document_count"] and not list_id:
+        return done("skipped", f"Nothing to send: {VENDOR_NO_DOCUMENTS.lower()} read yet.",
+                    error=VENDOR_NO_DOCUMENTS)
+
+    body = build_vendor_list_body(int_cid, name, built, item_id)
+    post = {"method": "POST", "path": "/material-lists", "body": body}
+    request = ({"method": "PUT", "path": f"/material-lists/{int(list_id)}", "body": body}
+               if list_id else post)
+    stamp = {"mode": mode, "at": now}
+
+    if mode == "dry_run":
+        extra["held"] = True
+        verb = "replace the list" if list_id else "create a list"
+        return done("dry_run", f"Dry run: nothing sent to FieldPulse. Would {verb} with "
+                    f"{built['line_count']} line{'' if built['line_count'] == 1 else 's'}.",
+                    request={**request, **stamp})
+    allowed, why = _send_gate(cfg, int_cid)
+    if not allowed:
+        return done("skipped", f"Not sent: {_not_sent_reason(cfg, why)}.",
+                    request={**request, **stamp}, error=why)
+    if not manual and held:
+        return done("held", VENDOR_HELD, request={**request, **stamp}, error=VENDOR_HELD)
+    if not manual and pending:
+        return done("unknown", VENDOR_CREATE_PENDING, request={**request, **stamp},
+                    response=row.get("last_response"), error=VENDOR_CREATE_PENDING)
+    if held:
+        extra["held"] = False        # the explicit manual Send releases the dry-run hold
+
+    status_code, payload, err = _vendor_send(cid, request, cfg, manual)
+    if request["method"] == "PUT" and status_code == 404:
+        logger.info("[%s] vendor list %s gone in FieldPulse (404): creating a new one",
+                    cid, list_id)
+        request = post               # _vendor_send marks create_pending + clears the id first
+        sent_id[0] = None
+        status_code, payload, err = _vendor_send(cid, request, cfg, manual)
+    response = _clip_response(status_code, payload) if status_code is not None else None
+    req = {**request, **stamp}
+
+    if request["method"] == "PUT":
+        if err:
+            return done("failed", "FieldPulse update failed"
+                        + (" (no answer)" if err == "unknown" else f": {err}")
+                        + "; the list will be replaced on the next update.", request=req,
+                        response=response, error="No answer from FieldPulse (PUT)"
+                        if err == "unknown" else err, http_status=status_code)
+        return done("sent", f"Replaced the vendor material list in FieldPulse "
+                    f"({built['line_count']} lines).", request=req, response=response,
+                    http_status=status_code)
+
+    # A POST went out: create_pending stays set (and the id cleared) unless we got an id.
+    sent_id[0] = None
+    new_id = None if err else _int_id(_record_id(payload))
+    if new_id is None:
+        why_ = ("no answer" if err == "unknown" else err if err
+                else "FieldPulse answered without a list id")
+        return done("unknown" if err in ("unknown", None) else "failed",
+                    f"Not confirmed ({why_}). {VENDOR_CREATE_PENDING}", request=req,
+                    response=response, error=f"{why_}. {VENDOR_CREATE_PENDING}",
+                    http_status=status_code)
+    extra.update(list_id=new_id, create_pending=False)
+    sent_id[0] = new_id
+    return done("sent", f"Created the vendor material list in FieldPulse "
+                f"({built['line_count']} lines).", request=req, response=response,
+                http_status=status_code)
+
+
+def _vendor_send(cid, request, cfg, manual):
+    """-> (http_status | None, payload, error | "unknown" | None). Before a POST:
+    ONE write sets create_pending and clears the old list id (crash-safe)."""
+    if request["method"] == "POST":
+        _store().mark_vendor_material_list_sending(cid, request, cfg["mode"])
+    try:
+        status_code, payload = _send(request, cfg)
+    except _NotDelivered as exc:
+        report(message="FieldPulse vendor list not delivered", level="warning",
+               step="vendor_list", mode=cfg["mode"], manual=manual)
+        return None, None, str(exc)
+    except _OutcomeUnknown:
+        report(message="FieldPulse vendor list sent, outcome unknown", level="warning",
+               step="vendor_list", mode=cfg["mode"], manual=manual)
+        return None, None, "unknown"
+    ok = 200 <= status_code < 300 and not (isinstance(payload, dict)
+                                           and payload.get("error") not in (None, False))
+    logger.info("[%s] FieldPulse vendor list %s -> HTTP %s", cid, request["method"], status_code)
+    if ok:
+        return status_code, payload, None
+    if status_code != 404:
+        report(message=f"FieldPulse vendor list failed (HTTP {status_code})", level="warning",
+               step="vendor_list", http_status=status_code, mode=cfg["mode"], manual=manual)
+    return status_code, payload, _error_text(status_code, payload)

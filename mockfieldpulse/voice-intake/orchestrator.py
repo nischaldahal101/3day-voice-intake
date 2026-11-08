@@ -882,6 +882,39 @@ def documents_list():
     return jsonify(out), code
 
 
+# Per customer (stage P2). Static "customers" wins over /documents/<doc_id>.
+def _route_customer_id(raw):
+    customer_id, err = _parse_customer_id(raw)
+    if err or customer_id is None:
+        return None, _bad_request(err or "customer id is required")
+    return customer_id, None
+
+
+@app.get("/documents/customers")
+def documents_customers():
+    code, out = documents_panel.list_customers()
+    return jsonify(out), code
+
+
+@app.get("/documents/customers/<customer_id>")
+def documents_customer(customer_id):
+    cid, bad = _route_customer_id(customer_id)
+    if bad:
+        return bad
+    code, out = documents_panel.customer_detail(cid)
+    return jsonify(out), code
+
+
+@app.post("/documents/customers/<customer_id>/send")
+def documents_customer_send(customer_id):
+    from flask import g
+    cid, bad = _route_customer_id(customer_id)
+    if bad:
+        return bad
+    code, out = documents_panel.request_send(cid, user_id=getattr(g, "clerk_user_id", None))
+    return jsonify(out), code
+
+
 @app.get("/documents/<doc_id>")
 def documents_detail(doc_id):
     code, out = documents_panel.document_detail(doc_id)
@@ -917,6 +950,7 @@ if __name__ == "__main__":
     print(f"    GET  /app/customers             (Clerk-protected — picker list)")
     print(f"    GET  /admin/consultations[/<id>[/audio-url]], POST .../<id>/send, DELETE .../<id>  (Clerk-protected — admin)")
     print(f"    POST /documents/upload-url, POST /documents/submit, GET /documents[/<id>], DELETE /documents/<id>  (Clerk-protected — vendor PDFs)")
+    print(f"    GET  /documents/customers[/<customer_id>], POST /documents/customers/<customer_id>/send  (Clerk-protected — vendor lists)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
     print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
     print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")

@@ -53,10 +53,43 @@ export function count(v) {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
 }
 
-// #documents and #documents/<id>, else null.
+// FieldPulse status of a customer's combined vendor list (documents_panel.list_status).
+export const LIST_STATUS_LABEL = {
+  not_sent: 'Not sent',
+  dry_run: 'Dry run',
+  held: 'Held (dry run)',
+  sent: 'Sent',
+  attention: 'Needs attention',
+  sending: 'Sending…',
+}
+
+export function listStatusLabel(key) {
+  return (typeof key === 'string' && LIST_STATUS_LABEL[key]) || LIST_STATUS_LABEL.not_sent
+}
+
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+
+// Keep auto-refreshing a customers-list row while a document is being read, its
+// FieldPulse list is being sent, or a finished document's automatic sync is still on
+// its way (server: sync_pending). F-80: reading alone stopped too early.
+export function customerRowNeedsRefresh(it) {
+  if (!it || typeof it !== 'object') return false
+  return num(it.processing_count) > 0 || it.sync_pending === true || it.fieldpulse_status === 'sending'
+}
+
+// Same for the customer page (fieldpulse.status instead of fieldpulse_status).
+export function customerPageNeedsRefresh(d) {
+  if (!d || typeof d !== 'object') return false
+  const fp = d.fieldpulse && typeof d.fieldpulse === 'object' ? d.fieldpulse : {}
+  return num(d.processing_count) > 0 || d.sync_pending === true || fp.status === 'sending'
+}
+
+// #documents (customers), #documents/c/<customer_id>, #documents/<doc_id>, else null.
 export function parseDocumentsHash(hash) {
   const h = typeof hash === 'string' ? hash.replace(/^#\/?/, '') : ''
   if (/^documents\/?$/.test(h)) return { view: 'list' }
+  const c = /^documents\/c\/([A-Za-z0-9_]{1,64})$/.exec(h)
+  if (c) return { view: 'customer', customerId: c[1] }
   const m = /^documents\/([A-Za-z0-9_-]{1,64})$/.exec(h)
   if (m) return { view: 'detail', docId: m[1] }
   return null

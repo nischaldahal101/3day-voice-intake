@@ -8,10 +8,10 @@ function sizeLabel(bytes) {
     : `${Math.max(1, Math.round(bytes / 1024))} KB`
 }
 
-// Step 2 of 2: the picked customer + one vendor PDF (<= 20 MB). Uploads it
-// straight to R2, submits it, then hands the new document id back (the list
-// shows it as being read).
-export default function DocumentUpload({ customer, onBack, onUploaded }) {
+// The customer (picked, or the customer page's) + one vendor PDF (<= 20 MB).
+// Uploads it straight to R2, submits it, then hands the new document id back
+// (the list / customer page shows it as being read).
+export default function DocumentUpload({ customer, step = 'Step 2 of 2', onBack, onUploaded }) {
   const [file, setFile] = useState(null)
   const [problem, setProblem] = useState('')
   const [busy, setBusy] = useState(false)
@@ -44,7 +44,7 @@ export default function DocumentUpload({ customer, onBack, onUploaded }) {
       <header className="topbar">
         <button className="topbar-back" onClick={onBack} aria-label="Back" disabled={busy}>←</button>
         <div className="topbar-text">
-          <span className="topbar-eyebrow">Step 2 of 2</span>
+          <span className="topbar-eyebrow">{step || 'Vendor document'}</span>
           <h2 className="topbar-title">Upload vendor document</h2>
         </div>
       </header>
@@ -90,7 +90,8 @@ export default function DocumentUpload({ customer, onBack, onUploaded }) {
           {busy ? 'Uploading…' : 'Upload and read'}
         </button>
         <p className="footer-hint">
-          The document is read in the background. Nothing is sent to FieldPulse.
+          The document is read in the background, then added to this customer&rsquo;s
+          combined vendor material list (sent to FieldPulse only when the write mode allows).
         </p>
       </div>
     </section>

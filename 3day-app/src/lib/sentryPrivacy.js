@@ -74,6 +74,8 @@ const API_ROUTES = [
   '/job-status/:id', '/admin/consultations', '/admin/consultations/:id',
   '/admin/consultations/:id/send', '/admin/consultations/:id/audio-url',
   // Vendor documents (stage P1b); the fixed words before '/documents/:id'.
+  // Stage P2 (per customer) BEFORE '/documents/:id', which would also match 'customers'.
+  '/documents/customers', '/documents/customers/:id', '/documents/customers/:id/send',
   '/documents', '/documents/upload-url', '/documents/submit', '/documents/:id',
 ].map((t) => t.split('/').slice(1))
 // Built bundle files (prod /assets/*) and Vite dev module paths: code, not data.
@@ -104,12 +106,13 @@ function apiTemplate(path) {
   return route ? '/' + route.map((part) => (part === ':id' ? ID : part)).join('/') : undefined
 }
 
-// #admin, #admin/<id>, #consultations[/<id>], #documents[/<id>] -> route word (+ "/[id]");
-// other hashes dropped.
+// #admin, #admin/<id>, #consultations[/<id>], #documents[/<id>], #documents/c/<id> ->
+// route word (+ "/c") (+ "/[id]"); other hashes dropped.
 function safeHash(hash) {
-  const m = /^#(admin|consultations|documents)(\/[^?]*)?(?:\?.*)?$/s.exec(hash || '')
+  const m = /^#(admin|consultations|documents)(\/c(?=\/))?(\/[^?]*)?(?:\?.*)?$/s.exec(hash || '')
   if (!m) return ''
-  return `#${m[1]}` + (m[2] && m[2].length > 1 ? `/${ID}` : '')
+  return `#${m[1]}` + (m[1] === 'documents' && m[2] ? '/c' : '')
+    + (m[3] && m[3].length > 1 ? `/${ID}` : '')
 }
 
 // A page URL (location, navigation from/to, pageload/transaction name).
@@ -199,6 +202,8 @@ const SAFE_VALUES = new Set([
   "Couldn't get the audio link.",
   "Couldn't load documents: the server sent an unexpected response.",
   "Couldn't load the document: the server sent an unexpected response.",
+  "Couldn't load vendor document customers: the server sent an unexpected response.",
+  "Couldn't load the customer's documents: the server sent an unexpected response.",
   "Couldn't prepare the upload: the server sent an unexpected response.",
   'Choose a PDF file.',
   'That file is not a PDF.',
@@ -224,7 +229,7 @@ const TEMPLATES = [
 // Known-safe leading text; whatever follows becomes [redacted].
 const SAFE_PREFIXES = [
   // api.js assertOk(opName): fixed op names + status; the server's `error` text is dropped.
-  /^(?:Couldn't load customers|upload-url|submit|job-status|Couldn't load consultations|Couldn't load the consultation|Send to FieldPulse|Couldn't get the audio link|Delete|Couldn't load documents|Couldn't load the document|Upload document|Submit document|Delete document) failed \(HTTP \d{3}\)/,
+  /^(?:Couldn't load customers|upload-url|submit|job-status|Couldn't load consultations|Couldn't load the consultation|Send to FieldPulse|Couldn't get the audio link|Delete|Couldn't load documents|Couldn't load the document|Upload document|Submit document|Delete document|Couldn't load vendor document customers|Couldn't load the customer's documents|Send vendor list) failed \(HTTP \d{3}\)/,
   /^R2 upload failed \(HTTP \d{1,3}\)/,
   /^Minified React error #\d+/,
   /^Objects are not valid as a React child/,

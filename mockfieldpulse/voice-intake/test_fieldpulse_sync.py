@@ -76,8 +76,13 @@ if "storage" not in sys.modules:
 # per-test patches replace them. setdefault-style so either stub site works.
 for _m, _names in (("jobs", ("create_vendor_document", "get_vendor_document",
                              "list_vendor_documents", "update_vendor_document",
-                             "delete_vendor_document")),
-                   ("queue_setup", ("enqueue_vendor_document",)),
+                             "delete_vendor_document",
+                             # stage P2 (vendor material lists)
+                             "get_vendor_material_list", "claim_vendor_material_list",
+                             "mark_vendor_material_list_sending", "finish_vendor_material_list",
+                             "list_customer_vendor_documents",
+                             "list_vendor_document_customers")),
+                   ("queue_setup", ("enqueue_vendor_document", "enqueue_vendor_materials")),
                    ("storage", ("download_bytes", "object_size", "vendor_document_upload",
                                 "delete_audio"))):
     for _n in _names:
