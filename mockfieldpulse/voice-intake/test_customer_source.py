@@ -86,6 +86,18 @@ _storage.generate_upload_url = lambda key, ct: "https://r2.invalid/put"
 _storage.download_audio = lambda *a, **k: None
 sys.modules["storage"] = _storage
 
+# Vendor document names (stage P1b) that worker.py / documents_panel import; the
+# per-test patches replace them. setdefault-style so either stub site works.
+for _m, _names in (("jobs", ("create_vendor_document", "get_vendor_document",
+                             "list_vendor_documents", "update_vendor_document",
+                             "delete_vendor_document")),
+                   ("queue_setup", ("enqueue_vendor_document",)),
+                   ("storage", ("download_bytes", "object_size", "vendor_document_upload",
+                                "delete_audio"))):
+    for _n in _names:
+        if not hasattr(sys.modules[_m], _n):
+            setattr(sys.modules[_m], _n, lambda *a, **k: None)
+
 import customer_source as cs  # noqa: E402
 from customer_source import CustomerSourceError, list_customers  # noqa: E402
 

@@ -175,7 +175,9 @@ class SchemaObjectsTests(unittest.TestCase):
         relations, columns = objects
         self.assertEqual(sorted(relations), sorted([
             "consultation_jobs", "customer_links", "fieldpulse_writes",
-            "idx_consultation_jobs_status", "idx_consultation_jobs_created_at"]))
+            "idx_consultation_jobs_status", "idx_consultation_jobs_created_at",
+            "vendor_documents", "idx_vendor_documents_created_at",
+            "idx_vendor_documents_customer"]))
         self.assertEqual(sorted(columns), [("consultation_jobs", "customer"),
                                            ("consultation_jobs", "transcript")])
 

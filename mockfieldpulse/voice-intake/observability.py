@@ -63,6 +63,7 @@ logger = logging.getLogger("voice_intake.observability")
 _enabled = False
 
 _JOB_ID = r"job_[0-9a-f]{6,32}"
+_DOC_ID = r"doc_[0-9a-f]{12}"          # vendor_documents ids (stage P1b)
 # Exception values (whole message) known to carry no customer data: our own
 # fixed texts, optionally with a job id / internal status word.
 _SAFE_VALUES = [re.compile(p) for p in (
@@ -79,6 +80,14 @@ _SAFE_VALUES = [re.compile(p) for p in (
     r"Not a consultation recording key",
     r"R2 is not configured — missing in \.env: [A-Z0-9_, ]{1,120}",
     r"R2 key not found: consultations/[0-9a-f-]{36}\.[a-z0-9]{1,10}",
+    r"Vendor document is not a PDF",
+    r"Vendor document is larger than 20 MB",
+    r"Vendor document read failed: Claude (?:API error|output was cut off"
+    r"|returned malformed output)",
+    r"R2 key not found: vendor-docs/[0-9a-f-]{36}\.pdf",
+    r"R2 object is larger than \d{1,12} bytes",
+    r"create_vendor_document needs a file_key",
+    r"update_vendor_document: bad status '[a-z_]{1,32}'",
 )]
 # Known-safe leading text; whatever follows it is replaced by [redacted].
 _SAFE_PREFIXES = [re.compile(p) for p in (
@@ -135,7 +144,7 @@ _REDIS_COMMANDS = frozenset((
 # report() tag values. A new tag needs a rule here or it is not sent.
 _TAG_RULES = {
     "component": {"orchestrator", "worker"},
-    "job_id": re.compile(_JOB_ID),
+    "job_id": re.compile(rf"{_JOB_ID}|{_DOC_ID}"),     # traced_job tags its first arg
     "step": {"comment", "return_task", "material_list"},
     "mode": {"dry_run", "off", "test_customer_only", "live"},
     "manual": {"True", "False"},

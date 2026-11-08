@@ -351,3 +351,22 @@ test('F-41: event and envelope-header sdk rebuilt from our constants', () => {
   assertNoP4(wire(raw))
   assert.deepEqual(raw[1][0], [{ type: 'event' }, { sdk: { name: SDK_NAME, version: '11.10.0' } }])
 })
+
+test('P1b: vendor document endpoints, #documents hash and upload messages', () => {
+  const R2 = 'https://acct.r2.cloudflarestorage.com/b/vendor-docs/0f0e0d0c-0b0a-4908-8706-050403020100.pdf?X-Amz-Signature=SIGNED_SECRET'
+  assert.equal(requestUrl('https://api.example/documents?offset=0&customer_id=18809123'), 'https://api.example/documents')
+  assert.equal(requestUrl('https://api.example/documents/upload-url'), 'https://api.example/documents/upload-url')
+  assert.equal(requestUrl('https://api.example/documents/submit'), 'https://api.example/documents/submit')
+  assert.equal(requestUrl('https://api.example/documents/doc_0123456789ab'), 'https://api.example/documents/[id]')
+  assert.equal(requestUrl(`https://api.example/documents/${NAME}/x`), 'https://api.example')
+  assert.equal(requestUrl(R2), 'https://acct.r2.cloudflarestorage.com')
+  assert.equal(pageUrl('https://a.example/#documents'), 'https://a.example/#documents')
+  assert.equal(pageUrl(`https://a.example/#documents/${NAME} ${PHONE}`), 'https://a.example/#documents/[id]')
+  for (const msg of ['That file is not a PDF.', 'That PDF is larger than 20 MB.', 'Pick a customer first.',
+    "Couldn't load documents: the server sent an unexpected response."]) {
+    assert.equal(safeExceptionValue(msg), msg)
+  }
+  assert.equal(safeExceptionValue(`Submit document failed (HTTP 404): The upload ${NAME}`),
+    'Submit document failed (HTTP 404): [redacted]')
+  assert.equal(safeExceptionValue(`Couldn't load the document failed (HTTP 500)`), "Couldn't load the document failed (HTTP 500)")
+})

@@ -64,3 +64,14 @@ def enqueue_manual_send(job_id: str, request_id: str):
     logger.info("Enqueued manual FieldPulse send for %s (request %s, rq id=%s)",
                 job_id, request_id, rq_job.id)
     return rq_job
+
+
+def enqueue_vendor_document(doc_id: str):
+    """Queue reading one uploaded vendor PDF (worker.process_vendor_document).
+    Same queue/worker as consultations. 300 s: download + up to two Claude
+    reads of <= 120 s each + a short pause; the read itself never retries
+    inside the SDK (see vendor_documents.py)."""
+    rq_job = consultation_queue.enqueue("worker.process_vendor_document", doc_id,
+                                        job_timeout=300)
+    logger.info("Enqueued vendor document %s (rq id=%s)", doc_id, rq_job.id)
+    return rq_job

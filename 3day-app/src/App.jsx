@@ -9,6 +9,7 @@ import {
 } from './lib/api.js'
 import { clearActiveJob, forgetJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
 import { parseAdminHash } from './lib/admin.js'
+import { parseDocumentsHash } from './lib/documents.js'
 import Home from './screens/Home.jsx'
 import CustomerPicker from './screens/CustomerPicker.jsx'
 import Capture from './screens/Capture.jsx'
@@ -17,8 +18,16 @@ import Confirmation from './screens/Confirmation.jsx'
 import ErrorScreen from './screens/ErrorScreen.jsx'
 import AdminList from './screens/AdminList.jsx'
 import AdminDetail from './screens/AdminDetail.jsx'
+import DocumentsList from './screens/DocumentsList.jsx'
+import DocumentUpload from './screens/DocumentUpload.jsx'
+import DocumentDetail from './screens/DocumentDetail.jsx'
 
 const isAdminScreen = (s) => s === 'admin' || s === 'admin-detail'
+// Vendor documents (stage P1b): list, pick customer, upload, detail.
+const isDocumentsScreen = (s) => typeof s === 'string' && s.startsWith('documents')
+// Screens a finishing background consultation must never pull the user out of.
+const isBrowseScreen = (s) => isAdminScreen(s) || isDocumentsScreen(s)
+const isWideScreen = (s) => isAdminScreen(s) || s === 'documents' || s === 'documents-detail'
 
 // The Consultations screens (internally 'admin' / 'admin-detail') have their
 // own URL (#admin, #admin/<job_id>; #consultations[/<id>] also accepted) so Mike can
@@ -33,7 +42,7 @@ function replaceAdminHash(hash) {
   window.history.replaceState(null, '', window.location.pathname + window.location.search + hash)
 }
 function clearAdminHash() {
-  if (parseAdminHash(window.location.hash)) {
+  if (parseAdminHash(window.location.hash) || parseDocumentsHash(window.location.hash)) {
     window.history.pushState(null, '', window.location.pathname + window.location.search)
   }
 }
@@ -76,6 +85,8 @@ export default function App() {
   const [lastPayload, setLastPayload] = useState(null)
   const [adminJobId, setAdminJobId] = useState(null)
   const [adminListState, setAdminListState] = useState(null) // search/filter/page to restore
+  const [docId, setDocId] = useState(null)             // open vendor document
+  const [docCustomer, setDocCustomer] = useState(null) // customer picked for a document upload
 
   const pollTimerRef = useRef(null)
   const screenRef = useRef(screen)
@@ -99,14 +110,14 @@ export default function App() {
         setJobResult(shapeJobResult(data))
         setPhase('done')
         // A background job finishing never pulls the user out of the
-        // Consultations screens; it shows up in that list.
-        if (!isAdminScreen(screenRef.current)) setScreen('confirmation')
+        // Consultations / Vendor documents screens; it shows up in Consultations.
+        if (!isBrowseScreen(screenRef.current)) setScreen('confirmation')
         return
       }
       if (data.status === 'failed') {
         stopPolling()
         clearActiveJob()
-        if (isAdminScreen(screenRef.current)) return
+        if (isBrowseScreen(screenRef.current)) return
         setErrorState({
           title: 'The consultation failed',
           message: data.error || 'The pipeline reported an error.',
@@ -123,7 +134,7 @@ export default function App() {
         forgetJob(jobId)
         setActiveJobId((cur) => (cur === jobId ? null : cur))
         setPhase(null)
-        if (isAdminScreen(screenRef.current)) return
+        if (isBrowseScreen(screenRef.current)) return
         setErrorState(GONE)
         setScreen('error')
         return
@@ -144,16 +155,20 @@ export default function App() {
   // when an admin URL is open, just without switching screens).
   useEffect(() => {
     const route = parseAdminHash(window.location.hash)
+    const docRoute = route ? null : parseDocumentsHash(window.location.hash)
     if (route) {
       setAdminJobId(route.view === 'detail' ? route.jobId : null)
       setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
+    } else if (docRoute) {
+      setDocId(docRoute.view === 'detail' ? docRoute.docId : null)
+      setScreen(docRoute.view === 'detail' ? 'documents-detail' : 'documents')
     }
     const active = getActiveJob()
     if (active && active.job_id) {
       if (active.customer) setCustomer(active.customer)
       setActiveJobId(active.job_id)
       setPhase('queued')
-      if (!route) setScreen('processing')
+      if (!route && !docRoute) setScreen('processing')
       startPolling(active.job_id)
     }
     return stopPolling
@@ -163,10 +178,19 @@ export default function App() {
   useEffect(() => {
     const onHash = () => {
       const route = parseAdminHash(window.location.hash)
+      const docRoute = route ? null : parseDocumentsHash(window.location.hash)
       if (route) {
         setAdminJobId(route.view === 'detail' ? route.jobId : null)
         setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
-      } else if (isAdminScreen(screenRef.current)) {
+      } else if (docRoute) {
+        if (docRoute.view === 'detail') {
+          setDocId(docRoute.docId)
+          setScreen('documents-detail')
+        } else if (screenRef.current !== 'documents-pick' && screenRef.current !== 'documents-upload') {
+          setDocId(null)
+          setScreen('documents')   // pick/upload live under #documents too: stay there
+        }
+      } else if (isBrowseScreen(screenRef.current)) {
         setScreen('home')
       }
     }
@@ -205,6 +229,30 @@ export default function App() {
   const leaveAdmin = useCallback(() => {
     clearAdminHash()
     setScreen('home')
+  }, [])
+
+  // ---- vendor documents (#documents, #documents/<id>) ------------------
+  // Pick and upload screens stay under #documents (reload -> the list).
+
+  const openDocuments = useCallback(() => {
+    setDocId(null)
+    setScreen('documents')
+    setAdminHash('#documents')
+  }, [])
+
+  const openDocument = useCallback((id) => {
+    setDocId(id)
+    setScreen('documents-detail')
+    setAdminHash(`#documents/${id}`)
+  }, [])
+
+  // After an upload, or after a delete: back to a fresh list. Replace (not
+  // push) so browser Back doesn't return to a deleted document's URL.
+  const backToDocuments = useCallback(() => {
+    setDocId(null)
+    setDocCustomer(null)
+    setScreen('documents')
+    replaceAdminHash('#documents')
   }, [])
 
   // ---- reset / navigation ---------------------------------------------
@@ -288,11 +336,12 @@ export default function App() {
   }, [lastPayload, handleSubmit])
 
   return (
-    <div className={isAdminScreen(screen) ? 'app app-wide' : 'app'}>
+    <div className={isWideScreen(screen) ? 'app app-wide' : 'app'}>
       {screen === 'home' && (
         <Home
           onStart={() => setScreen('pick')}
           onConsultations={openAdmin}
+          onDocuments={openDocuments}
         />
       )}
       {screen === 'pick' && (
@@ -331,6 +380,26 @@ export default function App() {
       )}
       {screen === 'admin-detail' && adminJobId && (
         <AdminDetail key={adminJobId} jobId={adminJobId} onBack={openAdmin} onDeleted={onAdminDeleted} />
+      )}
+      {screen === 'documents' && (
+        <DocumentsList onBack={leaveAdmin} onOpen={openDocument}
+          onUpload={() => setScreen('documents-pick')} />
+      )}
+      {screen === 'documents-pick' && (
+        <CustomerPicker
+          onBack={() => setScreen('documents')}
+          onSelect={(c) => {
+            setDocCustomer(c)
+            setScreen('documents-upload')
+          }}
+        />
+      )}
+      {screen === 'documents-upload' && docCustomer && (
+        <DocumentUpload customer={docCustomer} onBack={() => setScreen('documents-pick')}
+          onUploaded={backToDocuments} />
+      )}
+      {screen === 'documents-detail' && docId && (
+        <DocumentDetail key={docId} docId={docId} onBack={openDocuments} onDeleted={backToDocuments} />
       )}
     </div>
   )

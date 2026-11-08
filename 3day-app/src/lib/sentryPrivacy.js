@@ -23,7 +23,7 @@
 //  - Spans/transactions: op / origin / status validated, description rebuilt
 //    from op ("GET <url>", resource URL, page path) else dropped, data by rule.
 //  - URLs (F-38): page URLs keep only known app path words (else "[id]") and
-//    the #admin / #consultations route word + "[id]"; requests to our API become
+//    the #admin / #consultations / #documents route word + "[id]"; requests to our API become
 //    endpoint templates ("/job-status/[id]"); bundle assets keep their path;
 //    anything else is origin only. Never userinfo or query.
 //  - Data keys are an exact list (F-39); numbers only for counts, durations,
@@ -73,6 +73,8 @@ const API_ROUTES = [
   '/health', '/app/customers', '/consultation/upload-url', '/consultation/submit', '/jobs/recent',
   '/job-status/:id', '/admin/consultations', '/admin/consultations/:id',
   '/admin/consultations/:id/send', '/admin/consultations/:id/audio-url',
+  // Vendor documents (stage P1b); the fixed words before '/documents/:id'.
+  '/documents', '/documents/upload-url', '/documents/submit', '/documents/:id',
 ].map((t) => t.split('/').slice(1))
 // Built bundle files (prod /assets/*) and Vite dev module paths: code, not data.
 const CODE_PATH = /^\/(?:assets\/[\w.-]{1,120}\.(?:m?js|css)|src\/[\w./-]{1,200}\.(?:m?jsx?|tsx?|css)|node_modules\/[\w./@-]{1,200}\.m?js|@vite\/client|@react-refresh)$/
@@ -102,9 +104,10 @@ function apiTemplate(path) {
   return route ? '/' + route.map((part) => (part === ':id' ? ID : part)).join('/') : undefined
 }
 
-// #admin, #admin/<id>, #consultations[/<id>] -> route word (+ "/[id]"); other hashes dropped.
+// #admin, #admin/<id>, #consultations[/<id>], #documents[/<id>] -> route word (+ "/[id]");
+// other hashes dropped.
 function safeHash(hash) {
-  const m = /^#(admin|consultations)(\/[^?]*)?(?:\?.*)?$/s.exec(hash || '')
+  const m = /^#(admin|consultations|documents)(\/[^?]*)?(?:\?.*)?$/s.exec(hash || '')
   if (!m) return ''
   return `#${m[1]}` + (m[2] && m[2].length > 1 ? `/${ID}` : '')
 }
@@ -194,6 +197,14 @@ const SAFE_VALUES = new Set([
   "Couldn't load consultations: the server sent an unexpected response.",
   "Couldn't load the consultation: the server sent an unexpected response.",
   "Couldn't get the audio link.",
+  "Couldn't load documents: the server sent an unexpected response.",
+  "Couldn't load the document: the server sent an unexpected response.",
+  "Couldn't prepare the upload: the server sent an unexpected response.",
+  'Choose a PDF file.',
+  'That file is not a PDF.',
+  'That file is empty.',
+  'That PDF is larger than 20 MB.',
+  'Pick a customer first.',
   'Network error uploading to R2',
   'Timed out uploading to R2',
   'Failed to fetch',
@@ -213,7 +224,7 @@ const TEMPLATES = [
 // Known-safe leading text; whatever follows becomes [redacted].
 const SAFE_PREFIXES = [
   // api.js assertOk(opName): fixed op names + status; the server's `error` text is dropped.
-  /^(?:Couldn't load customers|upload-url|submit|job-status|Couldn't load consultations|Couldn't load the consultation|Send to FieldPulse|Couldn't get the audio link|Delete) failed \(HTTP \d{3}\)/,
+  /^(?:Couldn't load customers|upload-url|submit|job-status|Couldn't load consultations|Couldn't load the consultation|Send to FieldPulse|Couldn't get the audio link|Delete|Couldn't load documents|Couldn't load the document|Upload document|Submit document|Delete document) failed \(HTTP \d{3}\)/,
   /^R2 upload failed \(HTTP \d{1,3}\)/,
   /^Minified React error #\d+/,
   /^Objects are not valid as a React child/,

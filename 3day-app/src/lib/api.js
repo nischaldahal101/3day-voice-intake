@@ -301,3 +301,96 @@ export async function deleteAdminConsultation(jobId) {
   await assertOk(resp, 'Delete')
   return resp.json()
 }
+
+// -------------------- Vendor documents (stage P1b) --------------------
+// Vendor PDFs (quotes, order previews, receipts) uploaded for a customer and read
+// by the worker into product lines. Our database + R2 only: nothing here (or in
+// the backend for these routes) talks to FieldPulse.
+
+export const MAX_PDF_BYTES = 20 * 1024 * 1024
+const PDF_TYPE = 'application/pdf'
+
+// Why this file can't be uploaded, in plain words ('' = fine). The worker
+// checks the bytes really are a PDF.
+export function pdfFileProblem(file) {
+  if (!file) return 'Choose a PDF file.'
+  if (typeof file.name !== 'string' || !/\.pdf$/i.test(file.name.trim())) {
+    return 'That file is not a PDF.'
+  }
+  if (!(file.size > 0)) return 'That file is empty.'
+  if (file.size > MAX_PDF_BYTES) return 'That PDF is larger than 20 MB.'
+  return ''
+}
+
+// The whole upload: ask for a presigned URL, PUT the PDF straight to R2
+// (progress 0..1 via onProgress), then submit it for reading. Returns
+// { document_id, status } (status 'queued'). The customer is the picker's
+// selected customer (same identity shape as a consultation).
+export async function uploadVendorDocument({ file, customer, onProgress }) {
+  const problem = pdfFileProblem(file)
+  if (problem) throw new Error(problem)
+  const identity = customerIdentity(customer)
+  if (!identity) throw new Error('Pick a customer first.')
+  const filename = file.name.trim()
+
+  let resp = await fetch(`${API_BASE}/documents/upload-url`, {
+    method: 'POST',
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ filename, size: file.size }),
+  })
+  await assertOk(resp, 'Upload document')
+  const up = await resp.json()
+  if (!isPlainObject(up) || typeof up.url !== 'string' || typeof up.key !== 'string') {
+    throw new Error("Couldn't prepare the upload: the server sent an unexpected response.")
+  }
+  // The content type is part of the R2 signature: send exactly what was signed.
+  await putToR2(up.url, file, up.content_type || PDF_TYPE, onProgress)
+
+  resp = await fetch(`${API_BASE}/documents/submit`, {
+    method: 'POST',
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ file_key: up.key, filename, customer: identity }),
+  })
+  await assertOk(resp, 'Submit document')
+  return resp.json()
+}
+
+// { items: [{id, created_at, status, customer_name, filename, vendor, document_type,
+//   line_count, warn_count, error, stuck}], total, offset, limit }, newest first.
+export async function fetchDocuments({ customerId = null, offset = 0, limit = 50 } = {}) {
+  const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+  if (customerId !== null && customerId !== undefined) params.set('customer_id', String(customerId))
+  const resp = await fetch(`${API_BASE}/documents?${params}`, { headers: await authHeaders() })
+  await assertOk(resp, "Couldn't load documents")
+  const data = await resp.json()
+  if (!isPlainObject(data) || !Array.isArray(data.items)) {
+    throw new Error("Couldn't load documents: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// One document: {id, status, error, created_at, customer_name, filename, can_delete,
+// result: {vendor, document_type, document_number, document_date, job_name,
+// lines, totals, checks} | null}.
+export async function fetchDocument(docId) {
+  const resp = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}`, {
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, "Couldn't load the document")
+  const data = await resp.json()
+  if (!isPlainObject(data) || typeof data.id !== 'string') {
+    throw new Error("Couldn't load the document: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// Delete the document (our database + its PDF in R2). 409 while it is still
+// being read; 404 = already gone.
+export async function deleteDocument(docId) {
+  const resp = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}`, {
+    method: 'DELETE',
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, 'Delete document')
+  return resp.json()
+}

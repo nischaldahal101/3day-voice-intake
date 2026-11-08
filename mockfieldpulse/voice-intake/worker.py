@@ -20,7 +20,9 @@ For each job on the `consultations` queue:
   8. Always clean up the temp audio file.
 
 Also runs the admin panel's manual "Send to FieldPulse" for a finished job
-(send_consultation_to_fieldpulse, queued by admin_panel.request_manual_send).
+(send_consultation_to_fieldpulse, queued by admin_panel.request_manual_send),
+and reads uploaded vendor PDFs (process_vendor_document, stage P1b, queued by
+documents_panel.submit; no FieldPulse call).
 
 The worker no longer calls the mock writer (consultation_writer); that module
 stays only for the deprecated sync route until stage 6 removes the mock.
@@ -35,14 +37,18 @@ import logging
 import os
 import sys
 import tempfile
+import time
 
+import vendor_documents
 from customer_source import list_catalog_items
+from documents_panel import customer_display_name
 from extractor import ExtractionError, extract_consultation, match_catalog_items
 from fieldpulse_sync import consultation_reference, sync_consultation
-from jobs import JobError, get_job, save_manual_send, update_job_status
+from jobs import (JobError, get_job, get_vendor_document, save_manual_send,
+                  update_job_status, update_vendor_document)
 from observability import init_sentry, report, traced_job
 from pipeline import transcribe
-from storage import StorageError, download_audio
+from storage import StorageError, download_audio, download_bytes
 from transcriber import TranscriptionError
 
 logger = logging.getLogger("voice_intake.worker")
@@ -220,6 +226,124 @@ def _match_materials(job_id, extraction):
     except Exception as exc:  # noqa: BLE001 — both callees already never raise
         logger.warning("[%s] material matching skipped (%s)", job_id, type(exc).__name__)
         report(exc, "Material catalog matching crashed", job_id=job_id)
+
+
+# --- Vendor documents (stage P1b) ---------------------------------------------------
+
+_DOC_RETRY_PAUSE_S = 5
+# Fixed, readable messages saved on a failed vendor_documents row (shown in the app);
+# other reader errors use vendor_documents.USER_MESSAGES. Never upstream text.
+DOC_ERR_MISSING = "The uploaded PDF was not found in storage. Upload it again."
+DOC_ERR_STORAGE = "Could not download the PDF from storage. Upload it again later."
+DOC_ERR_TOO_BIG = "This PDF is larger than 20 MB."   # R2 object grew after submit
+DOC_ERR_TIMEOUT = "Reading the document took too long and was stopped."
+DOC_ERR_INTERNAL = "Reading the document hit an internal error."
+# Claude API error (F-74): after the one retry for a transient failure, vs a request
+# Claude rejected (not retried).
+DOC_ERR_CLAUDE_BUSY = ("Claude was busy or unreachable (tried twice). Upload the PDF "
+                       "again later.")
+DOC_ERR_CLAUDE_REJECTED = ("Claude could not read this PDF request (it was rejected). "
+                           "Check that it is a normal, unprotected PDF, then upload it again.")
+
+
+def _is_job_timeout(exc):
+    return type(exc).__name__ == "JobTimeoutException"   # rq.timeouts (any rq version)
+
+
+def _doc_failure(exc):
+    """(fixed message, quiet) for a failed read. quiet = the user's own file
+    (not a PDF / too big): nothing to alert on, not re-raised."""
+    if _is_job_timeout(exc):
+        return DOC_ERR_TIMEOUT, False
+    if isinstance(exc, StorageError):
+        msg = str(exc)
+        if msg.startswith("R2 object is larger"):
+            return DOC_ERR_TOO_BIG, True
+        return (DOC_ERR_MISSING if msg.startswith("R2 key not found") else DOC_ERR_STORAGE), False
+    if isinstance(exc, ValueError):
+        if str(exc) == vendor_documents._ERR_API:
+            return (DOC_ERR_CLAUDE_BUSY if vendor_documents.is_transient(exc)
+                    else DOC_ERR_CLAUDE_REJECTED), False
+        if str(exc) in vendor_documents.USER_MESSAGES:
+            return (vendor_documents.USER_MESSAGES[str(exc)],
+                    str(exc) in vendor_documents.INPUT_ERRORS)
+    return DOC_ERR_INTERNAL, False
+
+
+@traced_job
+def process_vendor_document(doc_id):
+    """Read one uploaded vendor PDF: processing -> R2 download -> Claude read
+    (vendor_documents.read_vendor_document, one retry for a transient Claude
+    failure) -> done with the result. Any failure: status 'failed' with a fixed
+    readable message (_doc_failure; never left 'processing' when the write can
+    be made). Bad input (not a PDF / too big) whose failure was saved is not
+    re-raised; everything else is, after the row is marked, so RQ and Sentry
+    see it. RQ's JobTimeoutException is never swallowed, including one that
+    lands during a status write (F-73)."""
+    doc = get_vendor_document(doc_id)
+    if doc is None:
+        logger.info("[%s] vendor document no longer exists; nothing to do", doc_id)
+        return
+    try:
+        if update_vendor_document(doc_id, "processing") is None:
+            return
+        logger.info("[%s] reading vendor document (%s bytes)", doc_id, doc.get("file_size"))
+        data = download_bytes(doc["file_key"], vendor_documents.MAX_PDF_BYTES)
+        result = _read_vendor_pdf(doc_id, data, customer_display_name(doc.get("customer")))
+        saved = update_vendor_document(doc_id, "done", result=result)
+    except BaseException as exc:  # noqa: BLE001 — row must never stay 'processing'; re-raised
+        message, quiet = _doc_failure(exc)
+        # _fail_document re-raises a deadline that interrupts its own write.
+        if _fail_document(doc_id, message) and quiet:
+            logger.info("[%s] not readable as a vendor PDF: %s", doc_id, message)
+            return                                  # the user's file; failure saved
+        raise
+    if saved is None:
+        logger.info("[%s] vendor document was deleted while it was read", doc_id)
+        return
+    logger.info("[%s] vendor document DONE (%d lines, %d warnings)", doc_id,
+                len(result.get("lines") or []),
+                sum(1 for c in result.get("checks") or [] if c.get("level") == "warn"))
+
+
+def _read_vendor_pdf(doc_id, data, customer_name):
+    """The reader, retried once after a short pause when Claude was only
+    unreachable/busy (vendor_documents.is_transient). The reader itself makes a
+    single attempt and re-raises RQ's deadline, which passes straight through."""
+    try:
+        return vendor_documents.read_vendor_document(data, customer_name)
+    except ValueError as exc:
+        if not vendor_documents.is_transient(exc):
+            raise
+        logger.warning("[%s] Claude request failed (%s); retrying once in %ds", doc_id,
+                       type(exc.__cause__).__name__, _DOC_RETRY_PAUSE_S)
+    time.sleep(_DOC_RETRY_PAUSE_S)
+    return vendor_documents.read_vendor_document(data, customer_name)
+
+
+def _fail_document(doc_id, message):
+    """Mark a vendor document failed. True if the failed status was saved (or the
+    row is gone), False if an ordinary error stopped the write (logged + reported).
+    An RQ deadline that interrupts the write is NEVER swallowed (F-73): one more
+    best-effort write (the interrupted transaction has been unwound by then, and
+    RQ's alarm fires only once), then the deadline is re-raised."""
+    logger.error("[%s] vendor document FAILED: %s", doc_id, message)
+    try:
+        update_vendor_document(doc_id, "failed", error=message)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if _is_job_timeout(exc):
+            try:
+                update_vendor_document(doc_id, "failed", error=DOC_ERR_TIMEOUT)
+            except Exception as exc2:  # noqa: BLE001
+                logger.error("[%s] could not record the failure after the deadline: %s",
+                             doc_id, type(exc2).__name__)
+                report(exc2, "Could not mark vendor document failed", job_id=doc_id)
+            raise
+        logger.error("[%s] additionally failed to record failure: %s", doc_id,
+                     type(exc).__name__)
+        report(exc, "Could not mark vendor document failed", job_id=doc_id)
+        return False
 
 
 def _fail(job_id, message):

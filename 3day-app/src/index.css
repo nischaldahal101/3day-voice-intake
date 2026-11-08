@@ -1451,3 +1451,51 @@ code { font-size: 12px; overflow-wrap: anywhere; }
 .admin-fold > summary:focus-visible, .admin-trouble > summary:focus-visible {
   outline: 2px solid var(--terracotta); outline-offset: 2px;
 }
+
+/* ---- Vendor documents (stage P1b) ---- */
+.doc-upload-btn { justify-self: start; }
+.doc-td-file { color: var(--text-secondary); }
+.doc-warn-badge {
+  margin-left: 6px; background: #fbf2cf; color: #856404;
+  text-transform: none; letter-spacing: 0; white-space: nowrap;
+}
+@media (min-width: 760px) {
+  .screen-documents .admin-tools { grid-template-columns: auto 1fr auto; }
+  .doc-table .admin-tr {
+    grid-template-columns: 170px minmax(140px, 1fr) 130px 90px minmax(140px, 1fr) 110px 150px;
+  }
+}
+.doc-upload { padding: 0 16px; display: grid; gap: 8px; }
+.doc-file-label { font-size: 14px; font-weight: 600; color: var(--text-secondary); }
+.doc-file-input {
+  padding: 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius-md);
+  background: var(--surface); font: inherit; max-width: 100%;
+}
+.doc-checks { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.doc-check {
+  padding: 8px 10px; border-radius: var(--radius-sm); font-size: 14px; overflow-wrap: anywhere;
+  background: var(--bg); border: 1px solid var(--border);
+}
+.doc-check-warn { background: #fbf2cf; color: #856404; border-color: #f0dc8c; }
+.doc-check-ok { color: #1e7a45; }
+.doc-check-info { color: var(--text-secondary); }
+.doc-lines-wrap { overflow-x: auto; }
+.doc-lines { width: 100%; border-collapse: collapse; font-size: 13px; }
+.doc-lines th, .doc-lines td {
+  padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.doc-lines th {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-muted); white-space: nowrap;
+}
+.doc-lines .num { text-align: right; white-space: nowrap; }
+/* Phones: each line as a small card, label before each value. */
+@media (max-width: 759px) {
+  .doc-lines thead { display: none; }
+  .doc-lines, .doc-lines tbody, .doc-lines tr, .doc-lines td { display: block; width: 100%; }
+  .doc-lines tr { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .doc-lines td { border: 0; padding: 2px 0; text-align: left; }
+  .doc-lines .num { text-align: left; }
+  .doc-lines td::before { content: attr(data-label) ": "; color: var(--text-muted); }
+}

@@ -226,6 +226,28 @@ CREATE TABLE IF NOT EXISTS fieldpulse_writes (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, step)
 );
+-- Vendor documents (stage P1b): one row per uploaded vendor PDF (R2 key under
+-- vendor-docs/), read by the worker (worker.process_vendor_document) into
+-- `result` = vendor_documents.read_vendor_document()'s dict. Not linked to a
+-- consultation; `customer` is the picker's identity snapshot, like consultations.
+CREATE TABLE IF NOT EXISTS vendor_documents (
+    id           TEXT PRIMARY KEY,
+    status       TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'processing', 'done', 'failed')),
+    customer_id  TEXT,
+    customer     JSONB,
+    filename     TEXT,
+    file_key     TEXT NOT NULL UNIQUE,   -- one row per upload (delete removes the PDF)
+    file_size    INTEGER,
+    result       JSONB,
+    error        TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_documents_created_at
+    ON vendor_documents(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vendor_documents_customer
+    ON vendor_documents(customer_id, created_at DESC);
 """
 
 
@@ -883,3 +905,169 @@ def save_manual_send(job_id: str, entry: dict, sync: dict = None) -> bool:
                         [Jsonb(result), job_id])
         conn.commit()
     return True
+
+
+# --- Vendor documents (stage P1b; documents_panel.py + worker.py) ------------
+#
+# Statuses: queued -> processing -> done | failed. A queued/processing row can't
+# be deleted (the worker may be reading it) unless it is STUCK: untouched for
+# longer than VENDOR_DOC_STUCK_MINUTES (the RQ job times out after 5 min, so a
+# row that old means the worker died, e.g. a deploy killed it).
+
+VENDOR_DOC_STUCK_MINUTES = 15
+_DOC_STATUSES = ("queued", "processing", "done", "failed")
+_DOC_COLUMNS = f"""*, (status IN ('queued', 'processing')
+                     AND updated_at < now() - interval '{VENDOR_DOC_STUCK_MINUTES} minutes') AS stuck"""
+
+
+def _serialize_document(row):
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "customer_id": row["customer_id"],
+        "customer": row["customer"] if isinstance(row.get("customer"), dict) else None,
+        "filename": row["filename"],
+        "file_key": row["file_key"],
+        "file_size": row["file_size"],
+        "result": row["result"],
+        "error": row["error"],
+        "stuck": bool(row.get("stuck")),
+        "created_at": _iso(row["created_at"]),
+        "updated_at": _iso(row["updated_at"]),
+    }
+
+
+def create_vendor_document(file_key: str, filename: str = None, file_size: int = None,
+                           customer_id: str = None, customer: dict = None) -> dict:
+    """Insert a vendor document row (status 'queued'). Returns the serialized row."""
+    if not file_key:
+        raise JobError("create_vendor_document needs a file_key")
+    new_id = f"doc_{uuid.uuid4().hex[:12]}"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO vendor_documents
+                    (id, status, customer_id, customer, filename, file_key, file_size)
+                VALUES (%s, 'queued', %s, %s, %s, %s, %s)
+                RETURNING {_DOC_COLUMNS}
+                """,
+                [new_id, customer_id, Jsonb(customer) if customer is not None else None,
+                 filename, file_key, file_size],
+            )
+            row = cur.fetchone()
+        conn.commit()
+    logger.info("Created vendor document %s (%s bytes, customer_id=%s)",
+                new_id, file_size if file_size is not None else "?", customer_id or "—")
+    return _serialize_document(row)
+
+
+def get_vendor_document(doc_id: str) -> dict | None:
+    """One vendor document row, or None."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_DOC_COLUMNS} FROM vendor_documents WHERE id = %s", [doc_id])
+        row = cur.fetchone()
+    return _serialize_document(row)
+
+
+def list_vendor_documents(customer_id: str = None, offset: int = 0, limit: int = 50) -> dict:
+    """Light rows newest first (optionally one customer's): no lines, no checks.
+    {"items": [{id, status, customer_id, customer, filename, error (300 chars),
+    created_at, updated_at, stuck, vendor, document_type, line_count,
+    warn_count}], "total": int}. Every JSON path is guarded so a malformed
+    `result` can't break the list."""
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), 100))
+    params = {"cid": customer_id, "off": offset, "lim": limit}
+    where = "WHERE (%(cid)s::text IS NULL OR customer_id = %(cid)s::text)"
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) AS n FROM vendor_documents {where}", params)
+        total = cur.fetchone()["n"]
+        cur.execute(
+            f"""
+            SELECT id, status, customer_id,
+                   CASE WHEN jsonb_typeof(customer) = 'object' THEN customer END AS customer,
+                   filename, left(error, 300) AS error, created_at, updated_at,
+                   (status IN ('queued', 'processing')
+                    AND updated_at < now() - interval '{VENDOR_DOC_STUCK_MINUTES} minutes') AS stuck,
+                   CASE WHEN jsonb_typeof(result->'vendor') = 'string'
+                        THEN left(result->>'vendor', 80) END AS vendor,
+                   CASE WHEN jsonb_typeof(result->'document_type') = 'string'
+                        THEN left(result->>'document_type', 20) END AS document_type,
+                   CASE WHEN jsonb_typeof(result->'lines') = 'array'
+                        THEN jsonb_array_length(result->'lines') END AS line_count,
+                   CASE WHEN jsonb_typeof(result->'checks') = 'array'
+                        THEN (SELECT count(*) FROM jsonb_array_elements(result->'checks') c
+                               WHERE jsonb_typeof(c) = 'object' AND c->>'level' = 'warn')
+                   END AS warn_count
+              FROM vendor_documents
+              {where}
+             ORDER BY created_at DESC, id
+            OFFSET %(off)s LIMIT %(lim)s
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["created_at"] = _iso(r["created_at"])
+        item["updated_at"] = _iso(r["updated_at"])
+        item["stuck"] = bool(r["stuck"])
+        items.append(item)
+    return {"items": items, "total": total}
+
+
+def update_vendor_document(doc_id: str, status: str, result: dict = None,
+                           error: str = None) -> dict | None:
+    """Set a vendor document's status (and result / error). Returns the row,
+    or None if it no longer exists (deleted meanwhile: the worker just stops)."""
+    if status not in _DOC_STATUSES:
+        raise JobError(f"update_vendor_document: bad status {status!r}")
+    sets, params = ["status = %s", "updated_at = now()"], [status]
+    if result is not None:
+        sets.append("result = %s")
+        params.append(Jsonb(result))
+    if error is not None:
+        sets.append("error = %s")
+        params.append(error)
+    params.append(doc_id)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE vendor_documents SET {', '.join(sets)} WHERE id = %s "
+                        f"RETURNING {_DOC_COLUMNS}", params)
+            row = cur.fetchone()
+        conn.commit()
+    if row is None:
+        logger.info("Vendor document %s not updated (%s): it no longer exists", doc_id, status)
+        return None
+    logger.info("Updated vendor document %s: status=%s", doc_id, status)
+    return _serialize_document(row)
+
+
+def delete_vendor_document(doc_id: str) -> dict | None:
+    """Hard-delete one vendor document row (under a row lock, so a concurrent
+    worker update waits, then finds it gone). Refused while queued/processing
+    unless stuck. Never touches R2 or FieldPulse (the caller deletes the PDF).
+    None if it doesn't exist, else {"deleted": False, "reason", "document"} or
+    {"deleted": True, "document"}."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {_DOC_COLUMNS} FROM vendor_documents WHERE id = %s FOR UPDATE",
+                        [doc_id])
+            row = cur.fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            doc = _serialize_document(row)
+            if doc["status"] in ("queued", "processing") and not doc["stuck"]:
+                conn.rollback()
+                return {"deleted": False, "document": doc,
+                        "reason": "This document is still being read. Wait until it is done "
+                                  "or failed, then delete it."}
+            cur.execute("DELETE FROM vendor_documents WHERE id = %s", [doc_id])
+        conn.commit()
+    logger.info("Deleted vendor document %s (status=%s)", doc_id, doc["status"])
+    return {"deleted": True, "document": doc}

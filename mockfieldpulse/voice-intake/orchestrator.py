@@ -20,6 +20,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 import admin_panel
+import documents_panel
 from consultation_writer import WriterError as ConsultWriterError
 from customer_source import CustomerSourceError, list_customers
 from extractor import ExtractionError, extract_intake
@@ -834,6 +835,67 @@ def admin_consultation_delete(job_id):
     return jsonify(out), code
 
 
+# --- Vendor documents (stage P1b) ---------------------------------------------
+#
+# Thin routes over documents_panel.py; Clerk-protected like everything else.
+# Upload goes browser -> R2 directly; the PDF is read by the RQ worker; no
+# FieldPulse call of any kind.
+
+def _json_body():
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
+
+
+@app.post("/documents/upload-url")
+def documents_upload_url():
+    body = _json_body()
+    code, out = documents_panel.upload_url(body.get("filename"), body.get("size"))
+    return jsonify(out), code
+
+
+@app.post("/documents/submit")
+def documents_submit():
+    body = _json_body()
+    raw = body.get("customer")
+    if not isinstance(raw, dict):
+        return _bad_request("'customer' is required (pick the customer first)")
+    customer_id, err = _parse_customer_id(raw.get("id"))
+    if err or customer_id is None:
+        return _bad_request(err or "'customer.id' is required")
+    customer, err = _parse_customer_identity(raw, customer_id)
+    if err:
+        return _bad_request(err)
+    code, out = documents_panel.submit(body.get("file_key"), body.get("filename"),
+                                       customer_id, customer)
+    return jsonify(out), code
+
+
+@app.get("/documents")
+def documents_list():
+    a = request.args
+    customer_id, err = _parse_customer_id(a.get("customer_id"))
+    if err:
+        return _bad_request(err)
+    code, out = documents_panel.list_documents(
+        customer_id=customer_id, offset=a.get("offset", 0),
+        limit=a.get("limit", documents_panel.DEFAULT_PAGE))
+    return jsonify(out), code
+
+
+@app.get("/documents/<doc_id>")
+def documents_detail(doc_id):
+    code, out = documents_panel.document_detail(doc_id)
+    return jsonify(out), code
+
+
+@app.delete("/documents/<doc_id>")
+def documents_delete(doc_id):
+    from flask import g
+    code, out = documents_panel.delete_document(
+        doc_id, user_id=getattr(g, "clerk_user_id", None))
+    return jsonify(out), code
+
+
 # --- Startup ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -854,6 +916,7 @@ if __name__ == "__main__":
     print(f"    GET  /jobs/recent               (Clerk-protected — history)")
     print(f"    GET  /app/customers             (Clerk-protected — picker list)")
     print(f"    GET  /admin/consultations[/<id>[/audio-url]], POST .../<id>/send, DELETE .../<id>  (Clerk-protected — admin)")
+    print(f"    POST /documents/upload-url, POST /documents/submit, GET /documents[/<id>], DELETE /documents/<id>  (Clerk-protected — vendor PDFs)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
     print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
     print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")

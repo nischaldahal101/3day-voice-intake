@@ -3,7 +3,12 @@
 Mirrors fieldpulse_writer.py's conventions: load_dotenv at module load,
 module-level logger to stdout, single module-level client, public functions
 that wrap operations in try/except and raise StorageError on failure.
+
+Keys: consultation recordings live under `consultations/`, vendor PDFs (stage
+P1b, "Vendor documents") under `vendor-docs/`.
 """
+
+from __future__ import annotations
 
 import logging
 import mimetypes
@@ -140,10 +145,11 @@ def download_audio(key: str, local_path: str) -> str:
 
 
 def delete_audio(key: str) -> None:
-    """Delete an R2 object. S3/R2 returns success even if the key didn't
-    exist, so this function is effectively idempotent. Called from an HTTP
-    request (admin delete), so it uses a client with short timeouts and one
-    retry: an R2 outage fails it in seconds instead of hanging the request."""
+    """Delete an R2 object (a consultation recording or a vendor-docs/ PDF).
+    S3/R2 returns success even if the key didn't exist, so this function is
+    effectively idempotent. Called from an HTTP request (admin / documents
+    delete), so it uses a client with short timeouts and one retry: an R2
+    outage fails it in seconds instead of hanging the request."""
     _ensure_configured()
     logger.info("Deleting r2://%s/%s", R2_BUCKET_NAME, key)
     try:
@@ -204,16 +210,25 @@ def generate_upload_url(key: str, content_type: str, expires_in: int = 3600) -> 
 def audio_exists(key: str) -> bool:
     """Return True if the key exists in R2, False if not. Any other error
     (auth, network, wrong bucket) is wrapped in StorageError."""
+    return object_size(key) is not None
+
+
+def object_size(key: str) -> int | None:
+    """Size in bytes of an R2 object (HEAD), or None if the key doesn't exist.
+    Any other error (auth, network, wrong bucket) is wrapped in StorageError.
+    Same client as before audio_exists was built on this (consultation
+    submit unchanged)."""
     _ensure_configured()
     try:
-        _client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
-        return True
+        head = _client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
+        size = head.get("ContentLength")
+        return int(size) if isinstance(size, int) and not isinstance(size, bool) else 0
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         # head_object reports a missing key as "404" or "NoSuchKey" depending
         # on the backend — treat both as "doesn't exist".
         if code in ("404", "NoSuchKey"):
-            return False
+            return None
         raise StorageError(
             f"Failed to check r2://{R2_BUCKET_NAME}/{key}: {exc}"
         )
@@ -241,3 +256,45 @@ def generate_download_url(key: str, expires_in: int = 900) -> str:
     except (ClientError, BotoCoreError) as exc:
         logger.error("Failed to generate download URL: %s", exc)
         raise StorageError(f"Failed to generate download URL for {key}: {exc}")
+
+
+# --- Vendor documents (PDFs under vendor-docs/) ------------------------------
+
+VENDOR_DOC_PREFIX = "vendor-docs/"
+VENDOR_DOC_CONTENT_TYPE = "application/pdf"
+VENDOR_DOC_KEY_RE = re.compile(r"^vendor-docs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}"
+                               r"-[0-9a-f]{12}\.pdf\Z")
+
+
+def vendor_document_upload(expires_in: int = 900) -> dict:
+    """New key `vendor-docs/<uuid>.pdf` + a presigned PUT URL for it. The
+    browser must PUT with `Content-Type: application/pdf` (signed in)."""
+    key = f"{VENDOR_DOC_PREFIX}{uuid.uuid4()}.pdf"
+    return {"key": key,
+            "url": generate_upload_url(key, VENDOR_DOC_CONTENT_TYPE, expires_in=expires_in)}
+
+
+def download_bytes(key: str, max_bytes: int) -> bytes:
+    """Read a whole R2 object into memory (worker only). StorageError if it is
+    missing, larger than `max_bytes` (checked before reading the body), or the
+    read fails."""
+    _ensure_configured()
+    try:
+        obj = _client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        size = obj.get("ContentLength")
+        if isinstance(size, int) and size > max_bytes:
+            obj["Body"].close()
+            raise StorageError(f"R2 object is larger than {max_bytes} bytes")
+        data = obj["Body"].read(max_bytes + 1)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            raise StorageError(f"R2 key not found: {key}")
+        logger.error("R2 download failed: %s", exc)
+        raise StorageError(f"Failed to download r2://{R2_BUCKET_NAME}/{key}: {exc}")
+    except BotoCoreError as exc:
+        logger.error("R2 download failed: %s", exc)
+        raise StorageError(f"Failed to download r2://{R2_BUCKET_NAME}/{key}: {exc}")
+    if len(data) > max_bytes:
+        raise StorageError(f"R2 object is larger than {max_bytes} bytes")
+    return data
