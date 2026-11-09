@@ -18,9 +18,11 @@ from clerk_backend_api import AuthenticateRequestOptions, Clerk
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from psycopg_pool import PoolTimeout
 
 import admin_panel
 import documents_panel
+import jobs
 from consultation_writer import WriterError as ConsultWriterError
 from customer_source import CustomerSourceError, list_customers
 from extractor import ExtractionError, extract_intake
@@ -312,7 +314,28 @@ def _handle(transcript, source):
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "voice-intake-orchestrator"})
+    """Public (no Clerk). Checks the database through the pool (SELECT 1,
+    answers within ~5 s whatever hangs; jobs.db_ping), so a stuck pool turns
+    into 503 and Render's health check can restart the service. A failure also
+    feeds the pool self-repair (jobs.note_pool_timeout). Fixed bodies only."""
+    if jobs.db_ping():
+        return jsonify({"status": "ok", "service": "voice-intake-orchestrator"})
+    return jsonify({"status": "unavailable", "service": "voice-intake-orchestrator",
+                    "error": "Database unavailable"}), 503
+
+
+@app.errorhandler(PoolTimeout)
+def _db_pool_timeout(exc):
+    """Any route that could not get a DB connection (F-82). Counts toward the
+    pool self-repair, logs the pool counters (inside jobs), reports to Sentry
+    with numeric counters as tags (the Flask integration would not see a
+    handled error), and answers the JSON shape the app already shows."""
+    info = jobs.note_pool_timeout()
+    report(exc, "Database pool timeout",
+           route=request.url_rule.rule if request.url_rule else "/unmatched",
+           pool_replaced=info["pool_replaced"], **info["stats"])
+    return jsonify({"status": "db_unavailable",
+                    "error": "The database is not responding. Try again in a minute."}), 503
 
 
 @app.post("/process-transcript")

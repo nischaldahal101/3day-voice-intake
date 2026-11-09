@@ -63,18 +63,39 @@ class _FakePool:
     def __init__(self, conninfo, **kwargs):
         self.conninfo, self.kwargs = conninfo, kwargs
         self.executed, self.closed = [], False
+        self.opened_with = []            # open() calls (wait flag)
+        self.close_timeouts = []
+        self.stats = {"pool_min": 1, "pool_max": 5, "pool_size": 5, "pool_available": 0,
+                      "requests_waiting": 3, "requests_errors": 7, "usage_ms": 12}
+        self.conn_error = None           # raise this from connection() (e.g. PoolTimeout)
+        self.conn_delay = 0.0            # sleep this long in connection() (a hang)
+        self.close_delay = 0.0
+        self.conn_timeouts = []
 
-    def open(self):
+    def open(self, wait=False, timeout=30.0):
+        self.opened_with.append(wait)
+
+    def wait(self, timeout=30.0):
         pass
 
-    def wait(self):
-        pass
-
-    def close(self):
+    def close(self, timeout=5.0):
+        self.close_timeouts.append(timeout)
+        if self.close_delay:
+            import time
+            time.sleep(self.close_delay)
         self.closed = True
 
+    def get_stats(self):
+        return dict(self.stats)
+
     @contextmanager
-    def connection(self):
+    def connection(self, timeout=None):
+        self.conn_timeouts.append(timeout)
+        if self.conn_delay:
+            import time
+            time.sleep(self.conn_delay)
+        if self.conn_error:
+            raise self.conn_error
         conn = _FakeConn(self)
         try:
             yield conn
@@ -420,6 +441,174 @@ class CheckConnectionTests(unittest.TestCase):
         err, took = self._real_check(lambda s, sock: None, 1.0)
         self.assertIsNotNone(err)
         self.assertLess(took, 2.0)
+
+
+class PoolRepairTests(unittest.TestCase):
+    """F-82: repeated PoolTimeouts replace the module-level pool; /health ping."""
+
+    def setUp(self):
+        _FakePool.missing, _FakePool.fail_on = 0, None
+        self.jobs = _load_jobs()
+        self.first = self.jobs.pool
+        self.clock = [1000.0]
+        p = mock.patch.object(self.jobs.time, "monotonic", lambda: self.clock[0])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _join_closers(self):
+        import threading
+        for t in threading.enumerate():
+            if t.name == "jobs-old-pool-close":
+                t.join(2)
+
+    def test_settings_shared_by_import_pool_and_replacement(self):
+        self.jobs.note_pool_timeout()
+        self.assertTrue(self.jobs.note_pool_timeout()["pool_replaced"])
+        self.assertIsNot(self.jobs.pool, self.first)
+        self.assertEqual(self.jobs.pool.kwargs, self.first.kwargs)
+        self.assertEqual(self.jobs.pool.conninfo, self.first.conninfo)
+        self.assertEqual(self.jobs.pool.opened_with, [False])   # no blocking wait
+
+    def test_one_timeout_does_not_replace(self):
+        out = self.jobs.note_pool_timeout()
+        self.assertFalse(out["pool_replaced"])
+        self.assertIs(self.jobs.pool, self.first)
+        # numeric counters only, from the fixed key list (usage_ms is not in it)
+        self.assertEqual(out["stats"], {"pool_min": 1, "pool_max": 5, "pool_size": 5,
+                                        "pool_available": 0, "requests_waiting": 3,
+                                        "requests_errors": 7})
+
+    def test_two_timeouts_outside_window_do_not_replace(self):
+        self.jobs.note_pool_timeout()
+        self.clock[0] += self.jobs._REPAIR_WINDOW_S + 1
+        self.assertFalse(self.jobs.note_pool_timeout()["pool_replaced"])
+        self.assertIs(self.jobs.pool, self.first)
+
+    def test_second_timeout_replaces_and_closes_old_in_background(self):
+        self.first.close_delay = 0.3          # a slow/stuck old pool
+        import time as _t
+        self.jobs.note_pool_timeout()
+        t0 = _t.perf_counter()
+        out = self.jobs.note_pool_timeout()
+        self.assertLess(_t.perf_counter() - t0, 0.2, "caller waited for the old pool")
+        self.assertTrue(out["pool_replaced"])
+        self.assertEqual(out["stats"]["requests_errors"], 7)   # the OLD pool's counters
+        self._join_closers()
+        self.assertTrue(self.first.closed)
+        self.assertEqual(self.first.close_timeouts, [self.jobs._OLD_POOL_CLOSE_S])
+        self.assertFalse(self.jobs.pool.closed)
+
+    def test_cooldown_then_repairs_again(self):
+        self.jobs.note_pool_timeout()
+        self.jobs.note_pool_timeout()
+        second = self.jobs.pool
+        for _ in range(5):                    # a storm inside the cooldown: no new pool
+            self.clock[0] += 5
+            self.assertFalse(self.jobs.note_pool_timeout()["pool_replaced"])
+        self.assertIs(self.jobs.pool, second)
+        self.clock[0] = 1000.0 + self.jobs._REPAIR_COOLDOWN_S + 1
+        self.assertTrue(self.jobs.note_pool_timeout()["pool_replaced"])
+        self.assertIsNot(self.jobs.pool, second)
+        self._join_closers()
+        self.assertTrue(second.closed)
+
+    def test_jobs_functions_use_the_new_pool(self):
+        self.jobs.note_pool_timeout()
+        self.jobs.note_pool_timeout()
+        new = self.jobs.pool
+        self.first.executed.clear()
+        new.executed.clear()
+        try:
+            self.jobs.get_job("job_0123456789ab")
+        except KeyError:                          # the fake row is not a job row; fine here
+            pass
+        self.assertTrue(new.executed, "get_job did not use the replacement pool")
+        self.assertEqual(self.first.executed, [])
+
+    def test_replacement_failure_keeps_old_pool(self):
+        self.jobs.note_pool_timeout()
+        with mock.patch.object(self.jobs, "_new_pool", side_effect=RuntimeError("boom")):
+            out = self.jobs.note_pool_timeout()
+        self.assertFalse(out["pool_replaced"])
+        self.assertIs(self.jobs.pool, self.first)
+        self.assertFalse(self.first.closed)
+
+    def test_thread_safe_single_replacement(self):
+        import threading
+        self.jobs.note_pool_timeout()
+        made = []
+        real = self.jobs._new_pool
+        with mock.patch.object(self.jobs, "_new_pool", lambda: made.append(1) or real()):
+            ts = [threading.Thread(target=self.jobs.note_pool_timeout) for _ in range(20)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(len(made), 1)
+
+    # --- db_ping (/health) --------------------------------------------------
+
+    def test_ping_ok(self):
+        self.assertTrue(self.jobs.db_ping())
+        self.assertIn("SELECT 1", self.first.executed)
+        self.assertEqual(self.first.conn_timeouts[-1], self.jobs._HEALTH_CONN_TIMEOUT_S)
+
+    def test_ping_pool_timeout_counts_toward_repair(self):
+        self.first.conn_error = psycopg_pool.PoolTimeout("couldn't get a connection after 3.00 sec")
+        self.assertFalse(self.jobs.db_ping())
+        self.assertIs(self.jobs.pool, self.first)
+        self.assertFalse(self.jobs.db_ping())
+        self.assertIsNot(self.jobs.pool, self.first)      # second failure repaired it
+        self.jobs.pool.conn_error = None
+        self.assertTrue(self.jobs.db_ping())
+
+    def test_ping_other_error_is_not_a_pool_timeout(self):
+        self.first.conn_error = pg_errors.OperationalError("server at db.internal failed")
+        with mock.patch.object(self.jobs, "note_pool_timeout") as note:
+            self.assertFalse(self.jobs.db_ping())
+            self.assertFalse(self.jobs.db_ping())
+        note.assert_not_called()
+
+    def test_ping_hang_is_bounded_and_counts(self):
+        import time as _t
+        self.first.conn_delay = 1.0
+        before = len(self.first.conn_timeouts)    # bootstrap's own checkout
+        with mock.patch.object(self.jobs, "_HEALTH_DEADLINE_S", 0.2), \
+                mock.patch.object(self.jobs, "note_pool_timeout") as note:
+            t0 = _t.perf_counter()
+            self.assertFalse(self.jobs.db_ping())
+            self.assertLess(_t.perf_counter() - t0, 0.6)
+            self.assertFalse(self.jobs.db_ping())        # waits on the SAME hung ping
+        self.assertEqual(note.call_count, 2)
+        self.assertEqual(len(self.first.conn_timeouts) - before, 1, "a second ping thread was started")
+        self.jobs._ping[0].join(2)
+
+    def test_stale_hung_ping_neither_blocks_nor_repairs_the_new_pool(self):
+        """F-83 (backtester repro): a ping hung on the replaced pool must not keep
+        /health at 503, nor replace the healthy pool again after the cooldown."""
+        self.first.conn_delay = 1.0                       # old pool: checkout hangs
+        with mock.patch.object(self.jobs, "_HEALTH_DEADLINE_S", 0.1):
+            self.assertFalse(self.jobs.db_ping())
+            self.assertFalse(self.jobs.db_ping())         # 2nd timeout -> replaced
+            new = self.jobs.pool
+            self.assertIsNot(new, self.first)
+            stale = self.jobs._ping[0]
+            self.assertTrue(stale.is_alive(), "test needs the old ping still hung")
+            for _ in range(3):                            # health recovers on the new pool
+                self.assertTrue(self.jobs.db_ping())
+            self.assertIn("SELECT 1", new.executed)
+            self.assertTrue(stale.is_alive())
+            # The stale ping's eventual timeout must not count for the new pool.
+            self.clock[0] += self.jobs._REPAIR_COOLDOWN_S + 1
+            out = self.jobs.note_pool_timeout(seen_pool=self.first)
+            self.assertFalse(out["pool_replaced"])
+            out = self.jobs.note_pool_timeout(seen_pool=self.first)
+            self.assertFalse(out["pool_replaced"])
+            self.assertTrue(self.jobs.db_ping())          # after cooldown: still healthy
+        self.assertIs(self.jobs.pool, new, "the healthy pool was replaced again")
+        self.assertEqual(self.jobs._timeouts, [])
+        stale.join(2)
+        self._join_closers()
 
 
 if __name__ == "__main__":

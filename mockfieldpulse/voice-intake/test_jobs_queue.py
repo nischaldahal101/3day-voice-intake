@@ -12,7 +12,8 @@ PREREQUISITES:
   - Redis running   (REDIS_URL   from .env; default localhost:6379)
 """
 
-from jobs import JobError, create_job, get_job, pool as _jobs_pool, update_job_status
+import jobs
+from jobs import JobError, create_job, get_job, update_job_status
 from queue_setup import consultation_queue, enqueue_consultation
 
 
@@ -134,7 +135,7 @@ def main():
         # Drop the test rows so re-runs start clean (the queue test job is
         # also removed below so a stale stub run doesn't pick it up later).
         try:
-            with _jobs_pool.connection() as conn:
+            with jobs.pool.connection() as conn:  # current pool (F-82 may replace it)
                 with conn.cursor() as cur:
                     cur.execute(
                         "DELETE FROM consultation_jobs WHERE source = 'test-script'"

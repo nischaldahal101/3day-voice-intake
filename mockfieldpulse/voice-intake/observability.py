@@ -35,6 +35,8 @@ Privacy decisions live here, not in callers (F-31..F-37):
     `trace` header (incoming baggage!) keeps only trace_id / sample_rate /
     sample_rand / sampled, with our own public_key / environment / release.
   * No trace headers on outgoing HTTP (trace_propagation_targets=[]).
+  * psycopg.pool WARNING+ log records (F-82) -> one report() message per 60 s with
+    FIXED text + the exception class name only (the record text can hold the DB host/user).
   * New fixed exception messages that should stay readable: _SAFE_VALUES /
     _SAFE_PREFIXES. New report() tags: _TAG_RULES.
 
@@ -52,6 +54,8 @@ import functools
 import logging
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -88,6 +92,7 @@ _SAFE_VALUES = [re.compile(p) for p in (
     r"R2 object is larger than \d{1,12} bytes",
     r"create_vendor_document needs a file_key",
     r"update_vendor_document: bad status '[a-z_]{1,32}'",
+    r"couldn't get a connection after \d{1,4}\.\d{2} sec",   # psycopg_pool.PoolTimeout (F-82)
 )]
 # Known-safe leading text; whatever follows it is replaced by [redacted].
 _SAFE_PREFIXES = [re.compile(p) for p in (
@@ -151,6 +156,13 @@ _TAG_RULES = {
     "status": {"fieldpulse_error", "config_error", "fieldpulse_unreachable", "fieldpulse_timeout"},
     "http_status": re.compile(r"\d{3}"),
     "route": lambda v: _known_route(v),                 # Flask URL rule template, not the path
+    # DB pool health (F-82): numeric psycopg_pool counters, a flag, an exception class name.
+    "pool_replaced": {"True", "False"},
+    "exc_class": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}"),
+    **{k: re.compile(r"\d{1,9}") for k in (
+        "pool_min", "pool_max", "pool_size", "pool_available", "requests_waiting",
+        "requests_num", "requests_queued", "requests_errors", "returns_bad",
+        "connections_num", "connections_errors", "connections_lost")},
 }
 
 # --- incoming routes / outgoing URLs (F-38) -----------------------------------------------
@@ -409,6 +421,7 @@ def init_sentry(component):
             )
         sentry_sdk.get_global_scope().set_tag("component", component)
         _remember_config()
+        _forward_pool_warnings()
     except Exception:  # noqa: BLE001 — a bad DSN must not stop the app booting
         logger.exception("Sentry init failed; monitoring off")
         return False
@@ -426,6 +439,45 @@ def _remember_config():
         request_started.connect(_remember_flask_app, weak=False)
     except ImportError:  # worker-only installs: no incoming requests to name
         pass
+
+
+# psycopg.pool WARNING+ records -> one Sentry message (F-82). Their text can hold
+# the DB host/user ("error connecting in 'pool-1': connection to server at ...
+# failed"), so only a FIXED text and the exception's class name are sent, at most
+# once per _POOL_LOG_EVERY_S (the pool's reconnect loop can log every second).
+_POOL_LOG_MESSAGE = "Database pool warning (psycopg.pool)"
+_POOL_LOG_EVERY_S = 60.0
+
+
+class _PoolLogForwarder(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self._last = None
+        self._lock_ = threading.Lock()
+
+    def emit(self, record):
+        try:
+            now = time.monotonic()
+            with self._lock_:
+                if self._last is not None and now - self._last < _POOL_LOG_EVERY_S:
+                    return
+                self._last = now
+            exc = record.exc_info[1] if record.exc_info and record.exc_info[1] else next(
+                (a for a in (record.args if isinstance(record.args, tuple) else ())
+                 if isinstance(a, BaseException)), None)
+            report(message=_POOL_LOG_MESSAGE,
+                   level="error" if record.levelno >= logging.ERROR else "warning",
+                   exc_class=type(exc).__name__ if exc is not None else "none")
+        except Exception:  # noqa: BLE001 — logging must never break the pool
+            pass
+
+
+def _forward_pool_warnings():
+    pool_logger = logging.getLogger("psycopg.pool")
+    if not any(isinstance(h, _PoolLogForwarder) for h in pool_logger.handlers):
+        pool_logger.addHandler(_PoolLogForwarder())
+    if pool_logger.level == logging.NOTSET or pool_logger.level > logging.WARNING:
+        pool_logger.setLevel(logging.WARNING)
 
 
 def traced_job(fn):

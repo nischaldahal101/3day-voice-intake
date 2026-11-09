@@ -50,6 +50,12 @@ mock service over HTTPS once deployed.
 | **Start Command** | `gunicorn orchestrator:app --bind 0.0.0.0:$PORT` |
 | **Health Check Path** | `/health` |
 
+> **Health Check Path (recommended, F-82, 2026-11-08):** check that the orchestrator's Render service really
+> has Health Check Path = `/health` (Settings → Health Checks). `/health` now runs `SELECT 1` through the DB
+> pool (public, answers within ~5 s, 503 when the DB/pool is stuck), so Render restarts a stuck instance
+> instead of every DB route failing with `PoolTimeout` until someone restarts it by hand. Production setting:
+> Nick changes it, not an agent.
+
 ### Environment variables
 
 | Name | Notes |

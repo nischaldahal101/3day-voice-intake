@@ -23,6 +23,7 @@ import os
 import re
 import select
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -33,7 +34,7 @@ from psycopg import errors as psycopg_errors
 from psycopg.pq import ExecStatus, TransactionStatus
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 _HERE = Path(__file__).resolve().parent
 
@@ -155,24 +156,166 @@ def _wait_not_busy(pgconn, deadline: float) -> None:
 # Surface psycopg_pool's own warnings (e.g. "error connecting in 'pool-1':
 # <real reason>") in the Render logs. Without a handler they are silently
 # dropped and a failure only shows up as a bare PoolTimeout.
+# (observability.py may add its own Sentry forwarder to this logger first, so
+# look for a stream handler rather than "any handler".)
 _pool_logger = logging.getLogger("psycopg.pool")
-if not _pool_logger.handlers:
+if not any(isinstance(h, logging.StreamHandler) for h in _pool_logger.handlers):
     _h = logging.StreamHandler(sys.stdout)
     _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     _pool_logger.addHandler(_h)
     _pool_logger.setLevel(logging.WARNING)
 
-pool = ConnectionPool(
-    DATABASE_URL,
-    min_size=1,
-    max_size=5,
-    open=False,
-    timeout=10.0,
-    max_idle=300.0,
-    max_lifetime=1800.0,
-    check=_check_connection,
-    kwargs={"row_factory": dict_row, "options": _SERVER_OPTIONS, **_CLIENT_TIMEOUTS},
-)
+def _new_pool() -> ConnectionPool:
+    """The one place the pool settings live (import-time pool and every
+    replacement made by note_pool_timeout). Not opened here."""
+    return ConnectionPool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        open=False,
+        timeout=10.0,
+        max_idle=300.0,
+        max_lifetime=1800.0,
+        check=_check_connection,
+        kwargs={"row_factory": dict_row, "options": _SERVER_OPTIONS, **_CLIENT_TIMEOUTS},
+    )
+
+
+# Every function below reads the module global `pool` at call time, so a
+# replacement (note_pool_timeout) is picked up by the next call. Other modules
+# and tests must use `jobs.pool`, never `from jobs import pool` (a stale copy).
+pool = _new_pool()
+
+
+# --- Pool self-repair + health (review-log F-82) ------------------------------
+#
+# Production (2026-11-05, 2026-11-08): every DB route failed with
+# "PoolTimeout: couldn't get a connection after 10.00 sec" until a manual
+# restart, even with the F-26/F-42/F-44 hardening above. The root cause is
+# still unknown (dead pool worker threads, a hung connect, ...). Whatever it
+# is, it lives inside one ConnectionPool object, so after repeated timeouts we
+# throw that object away and start a fresh one with the same settings.
+_REPAIR_THRESHOLD = 2          # PoolTimeouts ...
+_REPAIR_WINDOW_S = 60.0        # ... within this many seconds trigger a repair
+_REPAIR_COOLDOWN_S = 60.0      # at most one repair per this many seconds
+_OLD_POOL_CLOSE_S = 5.0        # background close of the replaced pool
+_HEALTH_CONN_TIMEOUT_S = 3.0   # /health: wait for a pooled connection
+_HEALTH_DEADLINE_S = 4.5       # /health never waits longer than this, whatever hangs
+# Numeric pool counters that may be logged / sent to Sentry (psycopg_pool names).
+POOL_STAT_KEYS = ("pool_min", "pool_max", "pool_size", "pool_available", "requests_waiting",
+                  "requests_num", "requests_queued", "requests_errors", "returns_bad",
+                  "connections_num", "connections_errors", "connections_lost")
+
+_repair_lock = threading.Lock()
+_timeouts: list = []           # monotonic times of recent PoolTimeouts
+_last_repair = None            # monotonic time of the last replacement
+_ping_lock = threading.Lock()
+_ping = None                   # (thread, result dict, pool) of the newest /health ping
+
+
+def pool_stats() -> dict:
+    """The current pool's numeric counters (POOL_STAT_KEYS only). Lock-free in
+    psycopg_pool, so it cannot hang on a stuck pool. {} if unavailable."""
+    try:
+        raw = pool.get_stats()
+    except Exception:  # noqa: BLE001 — stats must never break the caller
+        return {}
+    return {k: int(raw[k]) for k in POOL_STAT_KEYS
+            if isinstance(raw.get(k), int) and not isinstance(raw.get(k), bool)}
+
+
+def note_pool_timeout(seen_pool=None) -> dict:
+    """Record one PoolTimeout (a request or /health could not get a connection).
+
+    Logs the pool counters to stdout. After _REPAIR_THRESHOLD timeouts within
+    _REPAIR_WINDOW_S (and at most once per _REPAIR_COOLDOWN_S) the module-level
+    pool is replaced by a fresh one (opened without waiting: its connections
+    are made in the background) and the old one is closed in a daemon thread,
+    so a stuck old pool can never hang the caller. Thread-safe. Never raises.
+
+    seen_pool: the pool that timed out, when the caller knows it (db_ping). If
+    it is no longer the current pool (already replaced), the timeout is stale
+    and ignored: it must never count toward replacing the fresh pool (F-83).
+
+    Returns {"pool_replaced": bool, "stats": {counter: int}} (the counters of
+    the pool that timed out, taken before any replacement)."""
+    global pool, _last_repair
+    stats = pool_stats()
+    replaced, old = False, None
+    now = time.monotonic()
+    with _repair_lock:
+        if seen_pool is not None and seen_pool is not pool:
+            logger.info("DB pool timeout on an already replaced pool; ignored")
+            return {"pool_replaced": False, "stats": {}}
+        _timeouts[:] = [t for t in _timeouts if now - t <= _REPAIR_WINDOW_S] + [now]
+        cooling = _last_repair is not None and now - _last_repair < _REPAIR_COOLDOWN_S
+        if len(_timeouts) >= _REPAIR_THRESHOLD and not cooling:
+            try:
+                fresh = _new_pool()
+                fresh.open(wait=False)
+            except Exception:  # noqa: BLE001 — keep the old pool rather than none
+                logger.exception("DB pool replacement failed; keeping the current pool")
+            else:
+                old, pool = pool, fresh
+                _last_repair = now
+                _timeouts.clear()
+                replaced = True
+    logger.error("DB pool timeout: stats=%s pool_replaced=%s",
+                 " ".join(f"{k}={v}" for k, v in stats.items()) or "unavailable", replaced)
+    if old is not None:
+        threading.Thread(target=_close_quietly, args=(old,), daemon=True,
+                         name="jobs-old-pool-close").start()
+    return {"pool_replaced": replaced, "stats": stats}
+
+
+def _close_quietly(old) -> None:
+    try:
+        old.close(timeout=_OLD_POOL_CLOSE_S)
+        logger.info("Replaced DB pool closed")
+    except Exception as exc:  # noqa: BLE001 — a background thread; just log the class
+        logger.warning("Replaced DB pool did not close cleanly (%s)", type(exc).__name__)
+
+
+def db_ping() -> bool:
+    """True when the database answers SELECT 1 through the pool. For /health:
+    returns within _HEALTH_DEADLINE_S even if the pool or the socket hangs (the
+    ping runs in a daemon thread; while one is still running ON THE CURRENT
+    POOL, later calls wait on it instead of starting another). A pool timeout or
+    a hang counts as a PoolTimeout of the pool it ran on (note_pool_timeout), so
+    failing health checks can repair the pool too. A ping still hung on a pool
+    that has since been replaced is abandoned (F-83): it is neither waited on
+    nor counted, so at most one abandoned ping per replacement (<= 1/min).
+    Never raises."""
+    global _ping
+    with _ping_lock:
+        if _ping is None or not _ping[0].is_alive() or _ping[2] is not pool:
+            result, probed = {}, pool
+            t = threading.Thread(target=_ping_once, args=(probed, result), daemon=True,
+                                 name="jobs-db-ping")
+            t.start()
+            _ping = (t, result, probed)
+        t, result, probed = _ping
+    t.join(_HEALTH_DEADLINE_S)
+    if result.get("ok") is True:
+        return True
+    if t.is_alive() or result.get("error") == "PoolTimeout":
+        note_pool_timeout(seen_pool=probed)
+    else:
+        logger.error("DB health check failed (%s)", result.get("error") or "unknown")
+    return False
+
+
+def _ping_once(probed, result: dict) -> None:
+    try:
+        with probed.connection(timeout=_HEALTH_CONN_TIMEOUT_S) as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        result["ok"] = True
+    except PoolTimeout:
+        result["error"] = "PoolTimeout"
+    except Exception as exc:  # noqa: BLE001 — class name only (messages can hold the host)
+        result["error"] = type(exc).__name__
+
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS consultation_jobs (

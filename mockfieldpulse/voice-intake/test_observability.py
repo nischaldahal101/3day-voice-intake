@@ -38,6 +38,12 @@ PG_TEXT = ('null value in column "status" of relation "consultation_jobs" violat
            f'{PHONE}, {ADDRESS}, {TRANSCRIPT}).')
 
 
+# F-82: what a psycopg/psycopg_pool message can carry (kept away from raise lines,
+# because source context lines are sent).
+DB_HOST = "dpg-planted-host.oregon-postgres.render.com"
+DB_USER = "planted_db_user"
+
+
 def _memory_transport(options):
     """observability's real SafeTransport (sanitizer included); only the final
     HTTP delivery is replaced by an in-memory list."""
@@ -591,6 +597,74 @@ class ObservabilityPrivacyTest(unittest.TestCase):
                 self.assertTrue(sdk["name"].startswith("sentry.python"))
                 self.assertLessEqual(set(sdk), {"name", "version", "integrations"})
                 self.assertLessEqual(set(sdk["integrations"]), observability._PY_INTEGRATIONS)
+
+    # --- F-82: DB pool timeout + psycopg.pool warnings ------------------------------------
+
+    def test_f82_pool_timeout_report_keeps_message_and_numeric_stats_only(self):
+        from psycopg_pool import PoolTimeout
+        try:
+            raise PoolTimeout("couldn't get a connection after 10.00 sec")
+        except PoolTimeout as e:
+            # exactly what orchestrator._db_pool_timeout sends
+            report(e, "Database pool timeout", route="/documents/customers",
+                   pool_replaced=True, pool_size=5, pool_available=0, requests_waiting=3,
+                   connections_errors=2, pool_host=DB_HOST, requests_num="x" + DB_USER)
+        events = self.errors(self.sent())
+        blob = self.assert_clean(events)
+        self.assertNotIn(DB_HOST, blob)
+        self.assertNotIn(DB_USER, blob)
+        ev = events[0]
+        self.assertEqual(ev["exception"]["values"][-1]["type"], "PoolTimeout")
+        self.assertEqual(ev["exception"]["values"][-1]["value"],
+                         "couldn't get a connection after 10.00 sec")
+        self.assertEqual(ev["contexts"]["voice_intake"]["note"], "Database pool timeout")
+        tags = ev["tags"]
+        for k, v in (("pool_size", "5"), ("pool_available", "0"), ("requests_waiting", "3"),
+                     ("connections_errors", "2"), ("pool_replaced", "True")):
+            self.assertEqual(tags.get(k), v, k)
+        self.assertNotIn("pool_host", tags)      # no rule -> dropped
+        self.assertNotIn("requests_num", tags)   # not a number -> dropped
+
+    def test_f82_pool_timeout_with_other_text_is_redacted(self):
+        from psycopg_pool import PoolTimeout
+        try:
+            raise PoolTimeout(f"couldn't get a connection after 10.00 sec at {DB_HOST}")
+        except PoolTimeout as e:
+            report(e, "Database pool timeout")
+        blob = json.dumps(self.errors(self.sent()))
+        self.assertNotIn(DB_HOST, blob)
+
+    def test_f82_psycopg_pool_warning_forwarded_as_fixed_text_rate_limited(self):
+        from psycopg import OperationalError
+        fwd = [h for h in logging.getLogger("psycopg.pool").handlers
+               if isinstance(h, observability._PoolLogForwarder)]
+        self.assertEqual(len(fwd), 1, "init_sentry did not install exactly one forwarder")
+        fwd[0]._last = None
+        log = logging.getLogger("psycopg.pool")
+        ex = OperationalError(f'connection to server at "{DB_HOST}" (10.0.0.9), port 5432 '
+                              f'failed: FATAL: password authentication failed for user '
+                              f'"{DB_USER}"')
+        log.warning("error connecting in %r: %s", "pool-1", ex)
+        log.warning("error connecting in %r: %s", "pool-1", ex)      # within 60 s: dropped
+        log.warning(f"discarding broken connection: {DB_HOST} {DB_USER}")
+        events = self.errors(self.sent())
+        blob = json.dumps(events)
+        self.assertNotIn(DB_HOST, blob)
+        self.assertNotIn(DB_USER, blob)
+        self.assertNotIn("10.0.0.9", blob)
+        self.assertNotIn("password", blob)
+        msgs = [e for e in events if e.get("message") == observability._POOL_LOG_MESSAGE]
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["tags"]["exc_class"], "OperationalError")
+        self.assertEqual(msgs[0]["level"], "warning")
+        # after the window: forwarded again; no exception -> "none"
+        fwd[0]._last -= observability._POOL_LOG_EVERY_S + 1
+        log.error(f"pool worker died at {DB_HOST}")
+        events = [e for e in self.errors(self.sent())
+                  if e.get("message") == observability._POOL_LOG_MESSAGE]
+        self.assertEqual([e["tags"]["exc_class"] for e in events], ["OperationalError", "none"])
+        self.assertEqual(events[-1]["level"], "error")
+        self.assertNotIn(DB_HOST, json.dumps(self.sent()))
 
 
 if __name__ == "__main__":
