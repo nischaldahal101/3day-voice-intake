@@ -25,6 +25,24 @@ export function isReading(doc) {
   return !!doc && BUSY.has(doc.status) && !doc.stuck
 }
 
+// May this document be deleted now? Same rule as the server (documents_panel._can_delete):
+// not while queued/processing, unless stuck. Uses the server's can_delete when present.
+export function canDeleteDocument(doc) {
+  if (!doc || typeof doc !== 'object') return false
+  if (typeof doc.can_delete === 'boolean') return doc.can_delete
+  return !BUSY.has(doc.status) || doc.stuck === true
+}
+
+// The confirm-dialog text for deleting one document (detail screen and customer page).
+export function deleteDocumentPrompt(filename, customerName) {
+  const f = typeof filename === 'string' && filename.trim() ? filename : 'unknown'
+  const c = typeof customerName === 'string' && customerName.trim() ? customerName : 'none'
+  return 'Delete this vendor document?\n\n' +
+    `File: ${f}\n` +
+    `Customer: ${c}\n\n` +
+    'This removes the PDF and what was read from it from this app. It cannot be undone.'
+}
+
 export function docTypeLabel(t) {
   return (typeof t === 'string' && DOC_TYPE_LABEL[t]) || DOC_TYPE_LABEL.other
 }

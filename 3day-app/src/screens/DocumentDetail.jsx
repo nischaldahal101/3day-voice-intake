@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { deleteDocument, fetchDocument } from '../lib/api.js'
 import { fmtDateTime, isObj, str } from '../lib/admin.js'
 import {
-  DASH, DOC_STATUS_LABEL, docTypeLabel, isReading, money, qty, textOr,
+  DASH, DOC_STATUS_LABEL, canDeleteDocument, deleteDocumentPrompt, docTypeLabel, isReading, money,
+  qty, textOr,
 } from '../lib/documents.js'
 
 const REFRESH_MS = 5000
@@ -128,7 +129,7 @@ function Totals({ totals }) {
 // Body (exported so it can be rendered with fixture data).
 export function DocumentDetailBody({ d, onDelete, deleting, deleteNote }) {
   const r = isObj(d.result) ? d.result : null
-  const canDelete = d.can_delete === true
+  const canDelete = canDeleteDocument(d)
   return (
     <div className="admin-detail">
       <div className="admin-col">
@@ -197,12 +198,7 @@ export default function DocumentDetail({ docId, onBack, onDeleted }) {
 
   const onDelete = async () => {
     if (!d) return
-    const ok = window.confirm(
-      'Delete this vendor document?\n\n' +
-      `File: ${str(d.filename) || 'unknown'}\n` +
-      `Customer: ${str(d.customer_name) || 'none'}\n\n` +
-      'This removes the PDF and what was read from it from this app. It cannot be undone.',
-    )
+    const ok = window.confirm(deleteDocumentPrompt(str(d.filename), str(d.customer_name)))
     if (!ok) return
     setDeleting(true)
     setDeleteNote(null)
@@ -212,7 +208,6 @@ export default function DocumentDetail({ docId, onBack, onDeleted }) {
     } catch (e) {
       if (!mounted.current) return
       setDeleting(false)
-      if (e && e.status === 404) { onDeleted(docId); return } // already gone
       setDeleteNote((e && e.message) || String(e))
       load().catch(() => { /* keep the current view */ })
     }

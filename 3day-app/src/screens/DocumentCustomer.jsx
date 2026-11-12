@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchDocumentCustomer, requestVendorListSend } from '../lib/api.js'
+import { deleteDocument, fetchDocumentCustomer, requestVendorListSend } from '../lib/api.js'
 import { fmtDateTime, isObj, str } from '../lib/admin.js'
 import {
-  DASH, DOC_STATUS_LABEL, count, customerPageNeedsRefresh, docTypeLabel, listStatusLabel, money,
-  qty, textOr,
+  DASH, DOC_STATUS_LABEL, canDeleteDocument, count, customerPageNeedsRefresh, deleteDocumentPrompt,
+  docTypeLabel, listStatusLabel, money, qty, textOr,
 } from '../lib/documents.js'
 import CustomerProfileCard from './CustomerProfileCard.jsx'
 
 const REFRESH_MS = 5000
 const SEND_POLL_MS = 3000
-const SEND_POLL_MAX = 40 // ~2 min waiting for the worker to record the send
+const SEND_POLL_MAX = 40 // ~2 min waiting for the worker to record the send / list rebuild
 
 function cssToken(s) {
   return String(s || '').replace(/[^a-z_]/g, '')
@@ -48,8 +48,9 @@ function FieldPulseCard({ fp, onSend, onRefresh, sending, sendNote }) {
   )
 }
 
-function Documents({ docs, onOpen }) {
+function Documents({ docs, onOpen, onDelete, deletingId, rowErrors }) {
   const list = Array.isArray(docs) ? docs.filter((d) => isObj(d) && typeof d.id === 'string') : []
+  const errs = isObj(rowErrors) ? rowErrors : {}
   return (
     <div className="admin-card">
       <h3 className="admin-card-title">Documents ({list.length})</h3>
@@ -62,12 +63,22 @@ function Documents({ docs, onOpen }) {
             <span role="columnheader">File</span>
             <span role="columnheader">Status</span>
             <span role="columnheader">Lines</span>
+            <span role="columnheader"><span className="visually-hidden">Delete</span></span>
           </div>
           {list.map((d) => {
             const warns = count(d.warn_count) || 0
             const lines = count(d.line_count)
+            const canDelete = canDeleteDocument(d)
+            const isDeleting = deletingId === d.id
+            // A focusable row (not a <button>: the Delete button sits inside it).
+            const open = () => onOpen(d.id)
+            const onKey = (e) => {
+              if (e.target !== e.currentTarget) return // keys on the Delete button stay there
+              if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() }
+            }
             return (
-              <button key={d.id} role="row" onClick={() => onOpen(d.id)}
+              <div key={d.id} role="row" tabIndex={0} onClick={open} onKeyDown={onKey}
+                aria-label={`Open ${str(d.filename) || 'document'}`}
                 className={`admin-tr admin-row${d.status === 'failed' ? ' is-attention' : ''}`}>
                 <span className="admin-td admin-td-date" role="cell">{fmtDateTime(d.created_at) || DASH}</span>
                 <span className="admin-td" role="cell"><span className="admin-cell-label">Vendor </span>{str(d.vendor) || DASH}</span>
@@ -83,7 +94,23 @@ function Documents({ docs, onOpen }) {
                   <span className="admin-cell-label">Lines </span>{lines !== null ? lines : DASH}
                   {warns > 0 && <span className="pill doc-warn-badge">{warns} warning{warns === 1 ? '' : 's'}</span>}
                 </span>
-              </button>
+                <span className="admin-td doc-td-delete" role="cell">
+                  <button type="button" className="btn btn-danger btn-row-delete"
+                    disabled={!canDelete || !!deletingId}
+                    title={canDelete ? undefined : 'Still being read. Wait until it is done or failed.'}
+                    aria-label={`Delete ${str(d.filename) || 'document'}`}
+                    onClick={(e) => { e.stopPropagation(); onDelete(d) }}
+                    onKeyDown={(e) => e.stopPropagation()}>
+                    {isDeleting ? 'Deleting…' : 'Delete'}
+                  </button>
+                </span>
+                {errs[d.id] && (
+                  <span className="admin-note is-error doc-row-error" role="alert"
+                    onClick={(e) => e.stopPropagation()}>
+                    {errs[d.id]}
+                  </span>
+                )}
+              </div>
             )
           })}
         </div>
@@ -175,7 +202,10 @@ function Troubleshooting({ fp }) {
 }
 
 // Body (exported so it can be rendered with fixture data).
-export function DocumentCustomerBody({ d, onOpenDocument, onUpload, onSend, onRefresh, sending, sendNote }) {
+export function DocumentCustomerBody({
+  d, onOpenDocument, onUpload, onSend, onRefresh, sending, sendNote, onDeleteDocument, deletingId,
+  rowErrors,
+}) {
   return (
     <div className="admin-detail">
       <div className="admin-col">
@@ -193,7 +223,8 @@ export function DocumentCustomerBody({ d, onOpenDocument, onUpload, onSend, onRe
           sendNote={sendNote} />
       </div>
       <div className="admin-col admin-col-full">
-        <Documents docs={d.documents} onOpen={onOpenDocument} />
+        <Documents docs={d.documents} onOpen={onOpenDocument} onDelete={onDeleteDocument}
+          deletingId={deletingId} rowErrors={rowErrors} />
         <Preview preview={d.preview} />
         <Troubleshooting fp={d.fieldpulse} />
       </div>
@@ -207,21 +238,54 @@ export default function DocumentCustomer({ customerId, onBack, onOpenDocument, o
   const [d, setD] = useState(null)
   const [error, setError] = useState(null)
   const [tick, setTick] = useState(0)
-  const [sending, setSending] = useState(false)
+  // null | 'send' (manual send pending) | 'list' (list rebuild after a delete pending)
+  const [waiting, setWaiting] = useState(null)
+  const sending = waiting === 'send'
   const [sendNote, setSendNote] = useState(null)
+  const [deletingId, setDeletingId] = useState(null)
+  const [rowErrors, setRowErrors] = useState({})
+  const [gone, setGone] = useState(false) // every document deleted, nothing left to show
   const mounted = useRef(true)
-  const waitRef = useRef(null) // {since, polls} while a manual send is pending
+  const waitRef = useRef(null) // {since, polls, kind} while waiting for the worker
+  const deletedRef = useRef(new Set()) // ids deleted here; an in-flight older load can't bring them back
+  const loadSeq = useRef(0) // only the newest load applies (F-86)
 
+  // Resolves to the data, or null when a newer load started meanwhile (its answer is
+  // stale: dropped whole, success or error, so it can't undo a delete or a newer status).
   const load = useCallback(async () => {
-    const data = await fetchDocumentCustomer(customerId)
+    const seq = ++loadSeq.current
+    let data
+    try {
+      data = await fetchDocumentCustomer(customerId)
+    } catch (e) {
+      if (seq !== loadSeq.current) return null
+      throw e
+    }
+    if (seq !== loadSeq.current) return null
+    if (isObj(data) && Array.isArray(data.documents) && deletedRef.current.size) {
+      data.documents = data.documents.filter((x) => !(isObj(x) && deletedRef.current.has(x.id)))
+    }
     if (mounted.current) setD(data)
     return data
   }, [customerId])
+
+  // After a delete the customer may have nothing left (404): show that, stop waiting.
+  const onLoadError = useCallback((e) => {
+    if (!mounted.current) return
+    if (e && e.status === 404 && deletedRef.current.size) {
+      waitRef.current = null
+      setWaiting(null)
+      setGone(true)
+      return
+    }
+    setTick((n) => n + 1)
+  }, [])
 
   useEffect(() => {
     mounted.current = true
     setD(null)
     setError(null)
+    setGone(false)
     load().catch((e) => {
       if (!mounted.current) return
       setError(e && e.status === 404 ? 'This customer has no vendor documents any more.'
@@ -231,31 +295,62 @@ export default function DocumentCustomer({ customerId, onBack, onOpenDocument, o
   }, [load])
 
   // Refresh while a document is being read, an automatic list sync is on its way or
-  // sending (customerPageNeedsRefresh, F-80), or a manual send is pending (until the
-  // worker records it: fieldpulse.updated_at changes).
+  // sending (customerPageNeedsRefresh, F-80), or a manual send / the list rebuild after a
+  // delete is pending (until the worker records it: fieldpulse.updated_at changes).
   const reading = customerPageNeedsRefresh(d)
   useEffect(() => {
-    if (!d || (!reading && !sending)) return undefined
+    if (!d || gone || (!reading && !waiting)) return undefined
     const t = setTimeout(() => {
       load().then((data) => {
         const w = waitRef.current
-        if (!w || !mounted.current) return
+        if (!data || !w || !mounted.current) return // stale: the newer load drives the next step
         const fp = isObj(data.fieldpulse) ? data.fieldpulse : {}
         w.polls += 1
         if (fp.updated_at !== w.since && fp.raw_status !== 'sending') {
           waitRef.current = null
-          setSending(false)
-          setSendNote(fp.status === 'attention' ? 'Finished with a problem (see above).'
-            : `Done: ${listStatusLabel(fp.status)}.`)
+          setWaiting(null)
+          if (w.kind === 'send') {
+            setSendNote(fp.status === 'attention' ? 'Finished with a problem (see above).'
+              : `Done: ${listStatusLabel(fp.status)}.`)
+          }
         } else if (w.polls >= SEND_POLL_MAX) {
           waitRef.current = null
-          setSending(false)
-          setSendNote('Still waiting for the worker. Refresh this page in a minute.')
+          setWaiting(null)
+          if (w.kind === 'send') setSendNote('Still waiting for the worker. Refresh this page in a minute.')
         }
-      }).catch(() => { if (mounted.current) setTick((n) => n + 1) })
-    }, sending ? SEND_POLL_MS : REFRESH_MS)
+      }).catch(onLoadError)
+    }, waiting ? SEND_POLL_MS : REFRESH_MS)
     return () => clearTimeout(t)
-  }, [d, reading, sending, load, tick])
+  }, [d, gone, reading, waiting, load, onLoadError, tick])
+
+  const onDeleteDocument = async (doc) => {
+    if (!d || deletingId || !isObj(doc) || !canDeleteDocument(doc)) return
+    if (!window.confirm(deleteDocumentPrompt(str(doc.filename), str(d.customer_name)))) return
+    setDeletingId(doc.id)
+    setRowErrors((m) => ({ ...m, [doc.id]: null }))
+    const since = isObj(d.fieldpulse) ? d.fieldpulse.updated_at : null
+    try {
+      const out = await deleteDocument(doc.id)
+      if (!mounted.current) return
+      deletedRef.current.add(doc.id)
+      loadSeq.current += 1 // any load started before the delete is now stale
+      setD((cur) => (isObj(cur) && Array.isArray(cur.documents)
+        ? { ...cur, documents: cur.documents.filter((x) => !(isObj(x) && x.id === doc.id)) } : cur))
+      // The server queued the vendor list rebuild: poll until it is recorded (a pending
+      // manual send already waits for the same change).
+      if (out && out.materials === 'queued' && !waitRef.current) {
+        waitRef.current = { since, polls: 0, kind: 'list' }
+        setWaiting('list')
+      }
+      load().catch(onLoadError)
+    } catch (e) {
+      if (!mounted.current) return
+      setRowErrors((m) => ({ ...m, [doc.id]: (e && e.message) || String(e) }))
+      load().catch(() => { /* keep the current view */ })
+    } finally {
+      if (mounted.current) setDeletingId(null)
+    }
+  }
 
   const onSend = async () => {
     if (!d || sending) return
@@ -267,15 +362,17 @@ export default function DocumentCustomer({ customerId, onBack, onOpenDocument, o
       "The worker's write mode still decides: in a dry run nothing is sent.",
     )
     if (!ok) return
-    setSending(true)
+    waitRef.current = null // the send's own wait replaces a pending list-rebuild wait
+    setWaiting('send')
     setSendNote('Queued. Waiting for the worker…')
     try {
       await requestVendorListSend(customerId)
-      waitRef.current = { since: isObj(d.fieldpulse) ? d.fieldpulse.updated_at : null, polls: 0 }
+      waitRef.current = { since: isObj(d.fieldpulse) ? d.fieldpulse.updated_at : null, polls: 0, kind: 'send' }
       setTick((n) => n + 1)
     } catch (e) {
       if (!mounted.current) return
-      setSending(false)
+      waitRef.current = null
+      setWaiting(null)
       setSendNote((e && e.message) || String(e))
     }
   }
@@ -300,11 +397,21 @@ export default function DocumentCustomer({ customerId, onBack, onOpenDocument, o
             }}>Retry</button>
           </div>
         )}
-        {!error && !d && <div className="state loading">Loading…</div>}
-        {!error && d && (
+        {!error && gone && (
+          <div className="state">
+            <p><strong>No vendor documents left for this customer.</strong></p>
+            <p className="state-detail">
+              The last one was deleted. Anything already sent to FieldPulse stays there.
+            </p>
+            <button className="btn btn-secondary" onClick={onBack}>Back to vendor documents</button>
+          </div>
+        )}
+        {!error && !gone && !d && <div className="state loading">Loading…</div>}
+        {!error && !gone && d && (
           <DocumentCustomerBody d={d} onOpenDocument={onOpenDocument}
             onUpload={() => onUpload(d.customer)} onSend={onSend} sending={sending} sendNote={sendNote}
-            onRefresh={() => load().catch(() => setTick((n) => n + 1))} />
+            onDeleteDocument={onDeleteDocument} deletingId={deletingId} rowErrors={rowErrors}
+            onRefresh={() => load().catch(onLoadError)} />
         )}
       </div>
     </section>

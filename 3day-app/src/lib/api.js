@@ -413,13 +413,16 @@ export async function fetchDocument(docId) {
   return data
 }
 
-// Delete the document (our database + its PDF in R2). 409 while it is still
-// being read; 404 = already gone.
+// Delete the document (our database + its PDF in R2). 409 (thrown, server's message)
+// while it is still being read. 404 = already gone: treated as deleted
+// ({deleted: true, already_gone: true}). On success the server queues the customer's
+// vendor list rebuild: materials 'queued' | 'not_queued'.
 export async function deleteDocument(docId) {
   const resp = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}`, {
     method: 'DELETE',
     headers: await authHeaders(),
   })
+  if (resp.status === 404) return { deleted: true, id: docId, already_gone: true }
   await assertOk(resp, 'Delete document')
   return resp.json()
 }
