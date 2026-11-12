@@ -384,6 +384,83 @@ class TestSyncSend(SyncBase):
                          [("PUT", "/material-lists/7001"), ("POST", "/material-lists")])
         self.assertEqual((out["status"], self.store.row["fieldpulse_list_id"]), ("sent", 7002))
 
+    # F-88: a list deleted in the FieldPulse UI is soft-deleted; PUT on it answers 500.
+    def _put_500(self, *after):
+        self.store.row = {"customer_id": CID, "fieldpulse_list_id": 7001, "status": "sent"}
+        self.responses = [(500, {"error": True, "message": "Server Error"}), *after]
+        return self.sync()
+
+    def test_f88_put_500_list_deleted_creates_a_new_list(self):
+        out = self._put_500((200, {"error": False, "response": {
+                                "id": 7001, "customer_id": int(CID),
+                                "deleted_at": "2026-11-10 14:02:11"}}),
+                            (201, {"error": False, "response": {"id": 7002}}))
+        self.assertEqual([s[:2] for s in self.sent],
+                         [("PUT", "/material-lists/7001"), ("GET", "/material-lists/7001"),
+                          ("POST", "/material-lists")])
+        self.assertIsNone(self.sent[1][2])                           # GET has no body
+        self.assertEqual((out["status"], out["list_id"]), ("sent", 7002))
+        self.assertEqual(self.store.row["fieldpulse_list_id"], 7002)
+        self.assertFalse(self.store.row["create_pending"])
+
+    def test_f88_put_500_get_404_creates_a_new_list(self):
+        out = self._put_500((404, {"error": True, "message": "Not found"}),
+                            (201, {"error": False, "response": {"id": 7002}}))
+        self.assertEqual([s[0] for s in self.sent], ["PUT", "GET", "POST"])
+        self.assertEqual((out["status"], self.store.row["fieldpulse_list_id"]), ("sent", 7002))
+
+    def test_f88_put_500_list_of_another_customer_creates_a_new_list(self):
+        out = self._put_500((200, {"error": False, "response": {
+                                "id": 7001, "customer_id": 555, "deleted_at": None}}),
+                            (201, {"error": False, "response": {"id": 7002}}))
+        self.assertEqual([s[0] for s in self.sent], ["PUT", "GET", "POST"])
+        self.assertEqual(out["status"], "sent")
+
+    def test_f88_put_500_live_list_is_needs_attention_no_post(self):
+        for live in ({"id": 7001, "customer_id": int(CID), "deleted_at": None},
+                     {"id": 7001, "customer_id": CID},              # string id, no deleted_at
+                     {"id": 7001, "deleted_at": None},              # owner unknown: not gone
+                     {"id": 7001, "customer_id": "junk", "deleted_at": None}):
+            with self.subTest(header=live):
+                self.sent.clear()
+                out = self._put_500((200, {"error": False, "response": live}))
+                self.assertEqual([s[0] for s in self.sent], ["PUT", "GET"])
+                self.assertEqual(out["status"], "failed")
+                self.assertEqual(dp.list_status("failed"), "attention")
+                self.assertIn("HTTP 500", out["error"])
+                self.assertEqual(self.store.row["fieldpulse_list_id"], 7001)
+                self.assertFalse(self.store.row.get("create_pending"))
+
+    def test_f88_put_500_get_error_no_post(self):
+        for bad in ((500, {"error": True}), (403, "Forbidden"),
+                    (200, {"error": True, "message": "x"}), (200, "not json"),
+                    (200, {"error": False, "response": {"deleted_at": None}}),
+                    fs._OutcomeUnknown("ReadTimeout: no response"),
+                    fs._NotDelivered("connect timeout")):
+            with self.subTest(get=bad):
+                self.sent.clear()
+                out = self._put_500(bad)
+                self.assertEqual([s[0] for s in self.sent], ["PUT", "GET"])
+                self.assertEqual(out["status"], "failed")
+                self.assertEqual(self.store.row["fieldpulse_list_id"], 7001)
+
+    def test_f88_put_no_answer_or_422_never_gets(self):
+        self.store.row = {"customer_id": CID, "fieldpulse_list_id": 7001, "status": "sent"}
+        self.responses = [fs._OutcomeUnknown("x")]
+        self.assertEqual(self.sync()["status"], "failed")
+        self.responses = [fs._NotDelivered("connect timeout")]
+        self.assertEqual(self.sync()["status"], "failed")
+        self.assertEqual([s[0] for s in self.sent], ["PUT", "PUT"])
+
+    def test_f88_dry_run_and_gate_send_nothing(self):
+        self.store.row = {"customer_id": CID, "fieldpulse_list_id": 7001, "status": "sent"}
+        with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "dry_run"}):
+            self.assertEqual(self.sync(manual=True)["status"], "dry_run")
+        with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "test_customer_only",
+                                          "FIELDPULSE_TEST_CUSTOMER_ID": "424242"}):
+            self.assertEqual(self.sync(manual=True)["status"], "skipped")
+        self.assertEqual(self.sent, [])
+
     def test_put_404_then_post_no_answer_is_held(self):
         self.store.row = {"customer_id": CID, "fieldpulse_list_id": 7001, "status": "sent"}
         self.responses = [(404, {}), fs._OutcomeUnknown("ReadTimeout: no response")]
@@ -492,17 +569,37 @@ class TestRealSend(unittest.TestCase):
         resp = mock.Mock(status_code=200)
         resp.json.return_value = {"error": False}
         with mock.patch.object(requests, "put", return_value=resp) as put, \
+                mock.patch.object(requests, "get", return_value=resp) as get, \
                 mock.patch.object(requests, "post", side_effect=AssertionError("no POST")):
             self.assertEqual(fs._send({"method": "PUT", "path": "/material-lists/77",
                                        "body": {}}, self.cfg())[0], 200)
             self.assertEqual(put.call_args[0][0], "https://fp.invalid/material-lists/77")
-            for method, path in (("PUT", "/comments/1"), ("PUT", "/material-lists/0"),
-                                 ("PUT", "/material-lists/1/x"), ("DELETE", "/material-lists/1"),
-                                 ("GET", "/material-lists/1")):
+            # F-88: a body-less GET of exactly our list path, same write target and key.
+            self.assertEqual(fs._send({"method": "GET", "path": "/material-lists/77",
+                                       "body": None}, self.cfg())[0], 200)
+            args, kw = get.call_args
+            self.assertEqual(args[0], "https://fp.invalid/material-lists/77")
+            self.assertEqual(kw["headers"]["x-api-key"], "k")
+            self.assertIs(kw["allow_redirects"], False)
+            self.assertNotIn("json", kw)
+            for method, path, body in (("PUT", "/comments/1", {}),
+                                       ("PUT", "/material-lists/0", {}),
+                                       ("PUT", "/material-lists/1/x", {}),
+                                       ("DELETE", "/material-lists/1", {}),
+                                       ("GET", "/material-lists/1", {}),
+                                       ("GET", "/customers/1", None),
+                                       ("GET", "/material-lists", None),
+                                       ("GET", "/material-lists/1/x", None),
+                                       ("GET", "/material-lists/0", None)):
                 with self.subTest(method=method, path=path), \
                         self.assertRaises(fs._NotDelivered):
-                    fs._send({"method": method, "path": path, "body": {}}, self.cfg())
-        self.assertEqual(put.call_count, 1)
+                    fs._send({"method": method, "path": path, "body": body}, self.cfg())
+            for mode in ("dry_run", "off"):
+                c = self.cfg()
+                c["mode"] = mode
+                with self.assertRaises(fs._NotDelivered):
+                    fs._send({"method": "GET", "path": "/material-lists/1", "body": None}, c)
+        self.assertEqual((put.call_count, get.call_count), (1, 1))
 
 
 class TestRound2Regressions(SyncBase):

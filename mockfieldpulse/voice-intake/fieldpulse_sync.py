@@ -1081,28 +1081,37 @@ class _OutcomeUnknown(Exception):
     """The request may have reached FieldPulse (never auto-retry)."""
 
 
-# The one PUT this module makes: replacing OUR vendor material list (stage P2).
+# The one PUT this module makes: replacing OUR vendor material list (stage P2). The same
+# path is the one GET it makes (F-88): reading that list's header after a failed PUT.
 _VENDOR_PUT_PATH = re.compile(r"/material-lists/[1-9][0-9]{0,17}")
 
 
 def _send(request, cfg):
-    """POST (or PUT our vendor list) to the real FieldPulse write target. Returns
-    (http_status, parsed JSON or text). Only reachable through the send gate."""
+    """POST (or PUT / body-less GET of our vendor list) to the real FieldPulse write
+    target. Returns (http_status, parsed JSON or text). Only reachable through the
+    send gate."""
     if cfg["mode"] not in SEND_MODES or not cfg["base_url"] or not cfg["api_key"]:
         raise _NotDelivered("send refused: not in a send mode")   # belt and braces
-    if not (request["method"] == "POST" or (request["method"] == "PUT"
-                                             and _VENDOR_PUT_PATH.fullmatch(request["path"]))):
-        raise _NotDelivered("only POST (and PUT of our vendor material list) is used")
+    method = request["method"]
+    ours = bool(_VENDOR_PUT_PATH.fullmatch(request["path"]))
+    if not (method == "POST" or (method == "PUT" and ours)
+            or (method == "GET" and ours and request.get("body") is None)):
+        raise _NotDelivered("only POST (and PUT / GET of our vendor material list) is used")
     import requests  # local import: dry_run/off never touch the HTTP stack
+    headers = {"x-api-key": cfg["api_key"], "Accept": "application/json"}
     try:
-        resp = (requests.post if request["method"] == "POST" else requests.put)(
-            cfg["base_url"] + request["path"],
-            json=request["body"],
-            headers={"x-api-key": cfg["api_key"], "Accept": "application/json",
-                     "Content-Type": "application/json"},
-            timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-            allow_redirects=False,
-        )
+        if method == "GET":
+            resp = requests.get(cfg["base_url"] + request["path"], headers=headers,
+                                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                                allow_redirects=False)
+        else:
+            resp = (requests.post if method == "POST" else requests.put)(
+                cfg["base_url"] + request["path"],
+                json=request["body"],
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                allow_redirects=False,
+            )
     except requests.ConnectTimeout as exc:
         raise _NotDelivered(f"connect timeout: {type(exc).__name__}") from None
     except requests.RequestException as exc:
@@ -1371,6 +1380,9 @@ def _summarize(base, cfg, plan, rows, allowed, why):
 #
 #   - no stored list id -> POST /material-lists, store response.id
 #   - stored id -> PUT the full body; PUT 404 -> (create_pending + id cleared) -> POST
+#   - PUT answered non-2xx, not 404 (FieldPulse answers 500 for a list deleted in its UI,
+#     F-88) -> ONE GET /material-lists/<id> (same write target): 404, `deleted_at` set or
+#     another customer_id = gone -> the PUT 404 path; anything else -> 'failed', no POST
 #   - a PUT with no answer is just 'failed': replacing again is harmless
 #   - FIELDPULSE_MATERIAL_ITEM_ID unset -> 'needs_config' (every line needs an item_id)
 #   - no read documents left -> an existing list is PUT empty ("No vendor documents");
@@ -1541,6 +1553,10 @@ def _vendor_attempt(cfg, cid, customer, docs, row, manual):
         extra["held"] = False        # the explicit manual Send releases the dry-run hold
 
     status_code, payload, err = _vendor_send(cid, request, cfg, manual)
+    if (request["method"] == "PUT" and status_code is not None and status_code != 404
+            and not 200 <= status_code < 300
+            and _vendor_list_gone(cid, list_id, int_cid, cfg)):
+        status_code = 404            # F-88: deleted in FieldPulse (PUT answers 500) = gone
     if request["method"] == "PUT" and status_code == 404:
         logger.info("[%s] vendor list %s gone in FieldPulse (404): creating a new one",
                     cid, list_id)
@@ -1576,6 +1592,34 @@ def _vendor_attempt(cfg, cid, customer, docs, row, manual):
     return done("sent", f"Created the vendor material list in FieldPulse "
                 f"({built['line_count']} lines).", request=req, response=response,
                 http_status=status_code)
+
+
+def _vendor_list_gone(cid, list_id, int_cid, cfg):
+    """F-88: after a PUT of our list failed with an answer (not 404), ONE read-only GET of
+    that list's header through the same write target. True only on clear evidence: GET 404,
+    or a 2xx header with `deleted_at` set (FieldPulse soft-deletes; a PUT on a deleted list
+    answers 500) or another customer's `customer_id`. Anything else (live list, error, no
+    answer, odd shape) -> False: keep 'failed', never risk a second list. Never raises."""
+    try:
+        status, payload = _send({"method": "GET", "path": f"/material-lists/{int(list_id)}",
+                                 "body": None}, cfg)
+    except Exception as exc:  # noqa: BLE001 — _NotDelivered / _OutcomeUnknown / anything
+        logger.info("[%s] vendor list check: no answer (%s)", cid, type(exc).__name__)
+        return False
+    gone, why = False, "exists or unclear"
+    if status == 404:
+        gone, why = True, "not found"
+    elif 200 <= status < 300 and isinstance(payload, dict) \
+            and payload.get("error") in (None, False):
+        header = payload.get("response") if isinstance(payload.get("response"), dict) \
+            else payload
+        owner = header.get("customer_id")
+        if header.get("deleted_at") not in (None, "", False):
+            gone, why = True, "deleted"
+        elif _int_id(owner) is not None and _int_id(owner) != int_cid:
+            gone, why = True, "another customer's list"
+    logger.info("[%s] vendor list %s check: HTTP %s, %s", cid, list_id, status, why)
+    return gone
 
 
 def _vendor_send(cid, request, cfg, manual):
