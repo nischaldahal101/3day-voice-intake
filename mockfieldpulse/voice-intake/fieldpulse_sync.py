@@ -1684,6 +1684,10 @@ def _vendor_send(cid, request, cfg, manual):
 
 CART_TARGETS = (("estimate", "estimate", "/estimates"),
                 ("material_list", "list", "/material-lists"))
+# The estimate body carries no "notes" (customer-visible; nothing from us goes there). A PUT
+# is a full replace, so it sends "notes": "" to clear a note an older version wrote.
+# UNVERIFIED that FieldPulse accepts "" (if it answers 4xx, the PUT shows as failed).
+CART_PUT_EXTRA = {"estimate": {"notes": ""}}
 CART_NOT_READ = ("Not sent: this cart couldn't be read completely. Fix the project in "
                  "Ferguson and forward the cart again.")
 CART_CREATE_PENDING = ("Needs attention: a create may not have finished. Check the "
@@ -1838,7 +1842,8 @@ def _cart_attempt(cfg, ctx, cart, slot, bodies, manual):
         pending = bool(slot.get(f"{col}_create_pending"))
         body = bodies[target]
         post = {"method": "POST", "path": base_path, "body": body}
-        request = ({"method": "PUT", "path": f"{base_path}/{int(tid)}", "body": body}
+        request = ({"method": "PUT", "path": f"{base_path}/{int(tid)}",
+                    "body": {**body, **CART_PUT_EXTRA.get(target, {})}}
                    if tid else post)
         stamp = {"mode": mode, "at": now}
         if (slot.get(f"{col}_status") == "sent" and slot.get(f"{col}_cart_id") == cart_id

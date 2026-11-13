@@ -3,7 +3,7 @@ import { deleteCart, fetchCart, linkCartCustomer, requestCartSend, retryCartMatc
 import { fmtDateTime, isObj, str } from '../lib/admin.js'
 import {
   DASH, cartBadge, cartMoney, deleteCartPrompt, expiryText, fpBusy, fpStateLabel, groupByRoom,
-  itemTitle, lineTotal, matchPending, matchText, qtyText, safeLink, sendButtonText, sendCartPrompt,
+  itemTitle, itemTypeView, lineTotal, matchPending, matchText, qtyText, safeLink, sendButtonText, sendCartPrompt,
 } from '../lib/carts.js'
 import CustomerPicker from './CustomerPicker.jsx'
 
@@ -192,7 +192,7 @@ function Warnings({ warnings }) {
   )
 }
 
-function Rooms({ items }) {
+function Rooms({ items, typesInfo }) {
   const groups = groupByRoom(items)
   if (!groups.length) {
     return (
@@ -209,16 +209,20 @@ function Rooms({ items }) {
         <table className="doc-lines">
           <thead>
             <tr>
-              <th>Item</th><th>Finish</th><th className="num">Qty</th>
+              <th>Item</th><th>Type</th><th>Finish</th><th className="num">Qty</th>
               <th className="num">Unit price</th><th className="num">Line total</th><th>Link</th>
             </tr>
           </thead>
           <tbody>
             {g.items.map((it, i) => {
               const href = safeLink(it.product_url)
+              const type = itemTypeView(it, typesInfo)
               return (
                 <tr key={i}>
                   <td data-label="Item">{itemTitle(it)}</td>
+                  <td data-label="Type">
+                    {type.flag ? <span className="cart-type-flag">{type.text}</span> : type.text}
+                  </td>
                   <td data-label="Finish">{str(it.finish) || DASH}</td>
                   <td data-label="Qty" className="num">{qtyText(it.quantity)}</td>
                   <td data-label="Unit price" className="num">{cartMoney(it.unit_price)}</td>
@@ -417,7 +421,8 @@ export default function CartDetail({ cartId, onBack, onDeleted }) {
               <Warnings warnings={d.warnings} />
             </div>
             <div className="admin-col admin-col-full">
-              <Rooms items={isObj(d.cart) ? d.cart.items : []} />
+              <Rooms items={isObj(d.cart) ? d.cart.items : []}
+                     typesInfo={isObj(d.cart) && isObj(d.cart.item_types) ? d.cart.item_types : null} />
               <Troubleshooting fp={d.fieldpulse} />
               <div className="admin-card admin-delete">
                 <h3 className="admin-card-title">Delete</h3>

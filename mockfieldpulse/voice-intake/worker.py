@@ -375,6 +375,12 @@ def send_cart_to_fieldpulse(user_id, cart_id, manual=False):
     (fieldpulse_sync.sync_cart; never raises, FIELDPULSE_WRITE_MODE-gated). A run that
     found the project's slot busy is picked up here as ONE follow-up run for the newest
     cart that asked (its request stays flagged in the DB until a run claims it)."""
+    import carts_panel   # here, not at import: the worker boots without the cart chain
+    # Product types for the "<Type> - <Room>" titles: decided ONCE per cart (one Claude call,
+    # stored on the cart) BEFORE anything is built, so every send/PUT of this cart uses the
+    # same titles. AI trouble -> null types, the send still goes ahead; only a DB error
+    # raises here (nothing sent; the same DB error would stop the send anyway).
+    carts_panel.ensure_item_types(user_id, cart_id)
     out = sync_cart(user_id, cart_id, manual=manual)
     logger.info("[%s] cart FieldPulse send: %s (%s)", cart_id, out.get("status"),
                 "manual" if manual else "automatic")

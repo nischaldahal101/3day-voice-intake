@@ -1703,6 +1703,26 @@ def set_cart_customer(user_id: str, cart_id: str, customer: dict | None, match: 
     return _serialize_cart(row)
 
 
+def set_cart_item_types(user_id: str, cart_id: str, parsed: dict) -> bool:
+    """Store the cart's product types (carts_panel.ensure_item_types): `parsed` = the
+    cart's parsed JSON with items[i].item_type + "item_types" marker. ONE conditional write,
+    only while no marker is stored yet (the first result wins, so every send reuses the
+    same titles). True if written."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ferguson_carts SET parsed = %s
+                 WHERE id = %s AND clerk_user_id = %s AND parsed IS NOT NULL
+                   AND NOT (parsed ? 'item_types')
+                """,
+                [Jsonb(parsed), cart_id, user_id],
+            )
+            n = cur.rowcount
+        conn.commit()
+    return n == 1
+
+
 # --- Ferguson cart -> FieldPulse (stage E4; fieldpulse_sync.sync_cart is the only caller) --
 #
 # cart_fieldpulse_slots: one row per (user, customer, project key) = ONE draft estimate +

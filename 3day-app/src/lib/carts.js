@@ -89,6 +89,16 @@ export function itemTitle(it) {
   return parts.length ? parts.join(' ') : DASH
 }
 
+// The line's product type (E4 layout: FieldPulse title "<Type> - <Room>"). `typesInfo` is the
+// cart's item_types marker: null = not decided yet (the worker decides right before the first
+// send) -> { text: DASH }; decided but no type for this line -> flagged.
+export const TYPE_UNKNOWN = "Type couldn't be identified"
+export function itemTypeView(it, typesInfo) {
+  if (!typesInfo || typeof typesInfo !== 'object') return { text: DASH, flag: false }
+  const t = it && typeof it.item_type === 'string' ? it.item_type.trim() : ''
+  return t ? { text: t, flag: false } : { text: TYPE_UNKNOWN, flag: true }
+}
+
 // Items grouped by room, rooms in the order they first appear; no room -> "Other".
 export function groupByRoom(items) {
   const groups = []

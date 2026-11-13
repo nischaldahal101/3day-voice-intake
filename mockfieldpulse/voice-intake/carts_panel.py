@@ -508,6 +508,7 @@ def cart_detail(user_id, cart_id):
 def _detail(cart):
     p = cart.get("parsed") or {}
     items = [it for it in p.get("items") or [] if isinstance(it, dict)]
+    types = p.get("item_types")
     m = cart.get("customer_match") if isinstance(cart.get("customer_match"), dict) else {}
     c = cart.get("customer") if isinstance(cart.get("customer"), dict) else None
     status = cart.get("status")
@@ -525,9 +526,13 @@ def _detail(cart):
         "superseded_by": cart.get("superseded_by"),
         "fieldpulse": _fp_view(cart),
         "cart": {"pricing_expires": p.get("pricing_expires"), "subtotal": p.get("subtotal"),
+                 # item_types: None until the worker decided the types (right before the
+                 # first send); then {source: ai|unavailable, at} and each item_type is a
+                 # type or None (= "Type couldn't be identified").
+                 "item_types": types if isinstance(types, dict) else None,
                  "items": [{k: it.get(k) for k in (
                      "room", "brand", "model", "finish", "quantity", "unit_price",
-                     "product_url", "image_url")} for it in items]},
+                     "product_url", "image_url", "item_type")} for it in items]},
     })
 
 
@@ -663,6 +668,60 @@ def match_cart(user_id, cart_id):
     if found:
         _queue_send(user_id, cart_id, manual=False)    # E4: the worker sends (mode-gated)
     return outcome
+
+
+def _url_slug(url):
+    """'https://www.fergusonhome.com/some-product-name/p123' -> 'some-product-name'."""
+    if not isinstance(url, str):
+        return None
+    m = re.match(r"^https://[^/]+/([^/?#]{1,200})/p\d+/?$", url)
+    return m.group(1) if m else None
+
+
+def ensure_item_types(user_id, cart_id):
+    """The worker's product-type step (E4 layout), run right before every cart send.
+
+    ONCE per cart: one Claude call (extractor.classify_product_types) with ONLY each line's
+    brand, model, finish and product-URL slug (never the project, customer or email text),
+    answers limited to ferguson_cart.ITEM_TYPES or null. The result is stored on the cart
+    (parsed.items[i].item_type + parsed.item_types {source: ai|unavailable, at}) in one
+    conditional write (only while no result is stored), so every later send / PUT reuses
+    exactly the same titles. AI failure / no API key / timeout -> every type null,
+    source 'unavailable' (titles fall back to the model; the send still goes ahead).
+    Only for a cart that could be sent (linked or sent, readable, not replaced).
+    Returns 'stored' | 'exists' | 'skipped'. NEVER raises except DB errors / RQ's deadline."""
+    import ferguson_cart
+    from fieldpulse_sync import cart_send_problem
+    cart = jobs.get_ferguson_cart(user_id, cart_id)
+    if cart is None or cart.get("status") not in ("linked", "sent") or cart.get("superseded_by"):
+        return "skipped"
+    parsed = cart.get("parsed") if isinstance(cart.get("parsed"), dict) else None
+    if parsed is None:
+        return "skipped"
+    if isinstance(parsed.get("item_types"), dict):
+        return "exists"
+    if cart_send_problem(cart):
+        return "skipped"
+    items = [it if isinstance(it, dict) else {} for it in parsed.get("items") or []]
+    lines = [{"brand": it.get("brand"), "model": it.get("model"), "finish": it.get("finish"),
+              "url_slug": _url_slug(it.get("product_url"))} for it in items]
+    types = None
+    try:
+        import extractor     # here: needs ANTHROPIC_API_KEY (missing -> unavailable)
+        types = extractor.classify_product_types(lines, ferguson_cart.ITEM_TYPES)
+    except Exception as exc:  # noqa: BLE001 - never blocks the send
+        if type(exc).__name__ == "JobTimeoutException":
+            raise
+        logger.warning("[%s] product types unavailable (%s)", cart_id, type(exc).__name__)
+    ok = isinstance(types, list) and len(types) == len(items)
+    new_items = [{**it, "item_type": ferguson_cart.item_type(types[i]) if ok else None}
+                 for i, it in enumerate(items)]
+    marker = {"source": "ai" if ok else "unavailable", "at": _now()}
+    saved = jobs.set_cart_item_types(user_id, cart_id,
+                                     {**parsed, "items": new_items, "item_types": marker})
+    logger.info("[%s] product types: %s (%s)", cart_id, "stored" if saved else "exists",
+                marker["source"])
+    return "stored" if saved else "exists"
 
 
 def _own_cart(user_id, cart_id):

@@ -141,6 +141,21 @@ class TestCartsDB(unittest.TestCase):
         with self.assertRaises(J.JobError):
             J.set_cart_customer(self.ua, c["id"], {"id": None}, manual, ("linked",))
 
+    def test_item_types_written_once_and_scoped(self):                 # E4 layout
+        J = self.jobs
+        a, _ = self.new(self.ua)
+        typed = {**a["parsed"], "items": [{"model": "TB-1", "item_type": "Faucet"},
+                                          {"model": "TB-2", "item_type": None}],
+                 "item_types": {"source": "ai", "at": "2026-11-12T00:00:00Z"}}
+        self.assertFalse(J.set_cart_item_types(self.ub, a["id"], typed))       # other user
+        self.assertTrue(J.set_cart_item_types(self.ua, a["id"], typed))
+        other = {**typed, "item_types": {"source": "unavailable", "at": "x"}}
+        self.assertFalse(J.set_cart_item_types(self.ua, a["id"], other))       # first wins
+        got = J.get_ferguson_cart(self.ua, a["id"])["parsed"]
+        self.assertEqual(got["item_types"]["source"], "ai")
+        self.assertEqual([i["item_type"] for i in got["items"]], ["Faucet", None])
+        self.assertEqual(got["subtotal"], "12.50")
+
     def test_e3_columns_added_to_an_e2_table(self):
         """An E2-shaped ferguson_carts (no E3 columns) gets them from the bootstrap DDL."""
         J = self.jobs

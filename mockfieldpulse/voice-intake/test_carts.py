@@ -150,6 +150,14 @@ class FakeCartDB:
                  customer_match=dict(match))
         return dict(c)
 
+    def set_cart_item_types(self, user_id, cart_id, parsed):
+        c = self.carts.get(cart_id)
+        if (not c or c["clerk_user_id"] != user_id or c["parsed"] is None
+                or "item_types" in c["parsed"]):
+            return False
+        c["parsed"] = json.loads(json.dumps(parsed))
+        return True
+
     # --- E4: jobs.py's cart_fieldpulse_slots rules (claim takes the lease and consumes the
     # resync flags; busy flags resync with the newest asking cart; mark makes the cart
     # 'sent' only while linked to that customer and, for a POST, sets create_pending +
@@ -228,7 +236,7 @@ class FakeCartDB:
                      "find_cart_by_sha", "create_ferguson_cart", "list_ferguson_carts",
                      "get_ferguson_cart", "delete_ferguson_cart", "set_cart_customer",
                      "claim_cart_slot", "mark_cart_sending", "set_cart_fieldpulse",
-                     "finish_cart_slot"):
+                     "finish_cart_slot", "set_cart_item_types"):
             stack.enter_context(mock.patch.object(cp.jobs, name, getattr(self, name),
                                                   create=True))
         return stack
@@ -762,7 +770,9 @@ class TestCartsForUsers(Base):
             "room": "Kitchen", "brand": "Otherbrand Co", "model": "OB-200-NODRAIN",
             "finish": "Polished White", "quantity": 2, "unit_price": "46.67",
             "product_url": "https://www.fergusonhome.com/otherbrand-ob-200-nodrain/p1000002",
-            "image_url": "https://images.example.invalid/madeup/otherbrand-ob-200-nodrain.jpg"})
+            "image_url": "https://images.example.invalid/madeup/otherbrand-ob-200-nodrain.jpg",
+            "item_type": None})
+        self.assertIsNone(d["cart"]["item_types"])      # not decided yet (worker, before send)
         for key in ("raw_key", "sender", "clerk_user_id", "raw_sha256", "message_id"):
             self.assertNotIn(key, d)
         with self.as_user(USER_B):

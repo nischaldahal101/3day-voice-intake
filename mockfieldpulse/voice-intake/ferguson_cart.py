@@ -10,6 +10,10 @@ Two entry points:
   build_estimate_body(cart, customer_id, item_id) -> dict
       The exact POST/PUT /estimates body (docs/FIELDPULSE_API.md "Estimates - VERIFIED"):
       one group line per room, items as that group's components, cost = price = cart price.
+      Item title "<Type> - <Room>" when the item carries a valid `item_type` (ITEM_TYPES; set
+      once by the worker's AI step, carts_panel.ensure_item_types), else "<Brand> <Model> - <Room>".
+      Description "MODEL - <Brand> <Model> COLOR - <finish | Not listed> NOTES -". No estimate
+      `notes` key at all (nothing customer-visible from us; the PUT clears an old note).
 
 E4 helpers (still pure):
   normalize_name(text) / project_key(name)   exact-compare form of a name (E3 match, E4 slot)
@@ -43,6 +47,16 @@ TITLE_CHARS = 255          # FieldPulse max for estimate title / line titles
 NOTES_CHARS = 4000         # FieldPulse max for estimate notes
 DESC_CHARS = 1000          # our cap for one component description (API max unknown)
 OTHER_ROOM = "Other"
+# Item types for the "<Type> - <Room>" title (Mike's own estimate wording). The AI may only
+# answer one of these or null; anything else is treated as null (title falls back to the model).
+ITEM_TYPES = (
+    "Faucet", "Toilet", "Toilet Seat", "Sink", "Vanity", "Vanity Top", "Countertops", "Mirror",
+    "Medicine Cabinet", "Shower Door", "Shower System", "Shower Valve", "Showerhead",
+    "Hand Shower", "Tub", "Tub Filler", "Drain", "Lighting", "Exhaust Fan", "Cabinet Hardware",
+    "Grab Bar", "Bath Accessory", "Garbage Disposal", "Water Heater", "Range Hood", "Appliance",
+    "Tile",
+)
+_ITEM_TYPE_BY_KEY = {t.casefold(): t for t in ITEM_TYPES}
 CENT = Decimal("0.01")
 MAX_AMOUNT = Decimal("999999999.99")   # larger dollar amounts are "unreadable", never parsed
 MAX_QUANTITY = 9999                    # larger quantities are "unreadable"
@@ -136,7 +150,6 @@ def build_estimate_body(cart, customer_id, item_id):
         if not it.get("model"):
             raise ValueError(f"Item {n} has no readable model.")
 
-    expires = _mmddyyyy(cart.get("pricing_expires"))
     groups = {}
     for it in items:
         room = (it.get("room") or "").strip() or OTHER_ROOM
@@ -152,20 +165,15 @@ def build_estimate_body(cart, customer_id, item_id):
             "line_quantity": 1,
             "line_price_visibility": "group",
             "line_visibility": "all",
-            "line_components": [_component(it, room, project, expires, item_id)
-                                for it in room_items],
+            "line_components": [_component(it, room, item_id) for it in room_items],
         })
 
-    notes = f'Draft from Ferguson Home cart "{project}"'
-    if expires:
-        notes += f" (pricing expires {expires})"
-    notes += (f". {len(items)} item(s), lines total ${_lines_total(items):,.2f}. "
-              "Unit price and unit cost are the cart price.")
+    # No "notes": the estimate's notes are customer-visible ("appears on estimate"), and
+    # nothing from us belongs there. (A PUT sends "notes": "" to clear an older note.)
     return {
         "customer_id": customer_id,
         "tax_rate": "0.00",
         "title": _cap(f"Ferguson cart: {project}", TITLE_CHARS),
-        "notes": _cap(notes, NOTES_CHARS),
         "line_items": line_items,
     }
 
@@ -194,7 +202,15 @@ def build_material_list_body(cart, customer_id, item_id):
                             "unit_cost": c["unit_cost"], "type": "product"}
                            for c in group["line_components"]],
         })
-    notes = est["notes"] + " This list is replaced when the cart is forwarded again."
+    # The list's notes are internal ("Transfer Notes"), so project + expiry may stay here.
+    items = cart["items"]
+    expires = _mmddyyyy(cart.get("pricing_expires"))
+    notes = f'Draft from Ferguson Home cart "{cart["project_name"]}"'
+    if expires:
+        notes += f" (pricing expires {expires})"
+    notes += (f". {len(items)} item(s), lines total ${_lines_total(items):,.2f}. "
+              "Unit price and unit cost are the cart price. "
+              "This list is replaced when the cart is forwarded again.")
     return {"customer_id": est["customer_id"], "is_template": False, "title": est["title"],
             "notes": _cap(notes, NOTES_CHARS), "groupings": groupings}
 
@@ -685,19 +701,24 @@ def _mmddyyyy(iso):
         return None
 
 
-def _component(it, room, project, expires, item_id):
+def item_type(value):
+    """The canonical ITEM_TYPES entry for value (case-insensitive), else None."""
+    if not isinstance(value, str):
+        return None
+    return _ITEM_TYPE_BY_KEY.get(" ".join(value.split()).casefold())
+
+
+def _component(it, room, item_id):
     brand, model = it.get("brand"), it.get("model") or ""
     name = f"{brand} {model}" if brand else model
-    desc = (f"MODEL - {name} COLOR - {it.get('finish') or 'Not listed'} "
-            f'NOTES - Ferguson cart "{project}"')
-    if expires:
-        desc += f", pricing expires {expires}"
+    desc = f"MODEL - {name} COLOR - {it.get('finish') or 'Not listed'} NOTES -"
+    kind = item_type(it.get("item_type"))
     price = float(it["unit_price"].quantize(CENT))
     return {
         "id": item_id,
         "item_id": item_id,
         "type": "product",
-        "title": _cap(f"{name} - {room}", TITLE_CHARS),
+        "title": _cap(f"{kind or name} - {room}", TITLE_CHARS),
         "description": _cap(desc, DESC_CHARS),
         "sku": _cap(model, TITLE_CHARS),
         "quantity": it["quantity"],

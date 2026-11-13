@@ -7,6 +7,7 @@ All data is MADE UP. The real SQL is in test_carts_db.py.
 Run: /tmp/vi-f88/bin/python -m unittest test_cart_send
 """
 
+import json
 import os
 import unittest
 from unittest import mock
@@ -212,6 +213,11 @@ class TestSend(Base):
         self.assertEqual(self.methods()[2:], [("PUT", "/estimates/5001"),
                                               ("PUT", "/material-lists/6001")])
         self.assertEqual(len(self.sent[2][2]["line_items"][0]["line_components"]), 1)
+        # Estimate notes: none on the POST, "" on the PUT (clears an older note); the
+        # material list keeps its internal notes on both.
+        self.assertNotIn("notes", self.sent[0][2])
+        self.assertEqual(self.sent[2][2]["notes"], "")
+        self.assertIn('"Testproject"', self.sent[3][2]["notes"])
         self.assertEqual(self.cart()["superseded_by"], c2)
         self.assertEqual(self.cart(c2)["fieldpulse"]["replaces"], self.c1)
         self.assertEqual(self.slot()["cart_id"], c2)
@@ -415,6 +421,155 @@ class TestRoutesAndLinking(Base):
                 self.as_user(tc.USER_A):
             r = self.client.post(f"/carts/{self.c1}/send")
         self.assertEqual(r.status_code, 503)
+
+
+class FakeAIResponse:
+    def __init__(self, text):
+        self.content = [type("B", (), {"type": "text", "text": text})()]
+
+
+class TestItemTypes(Base):
+    """The worker's product-type step (carts_panel.ensure_item_types): ONE Claude call per
+    cart, only brand/model/finish/url slug sent, result stored and reused; AI trouble ->
+    null types + flag, the send still goes ahead. Claude is always mocked."""
+
+    def setUp(self):
+        super().setUp()
+        import extractor
+        self.ex = extractor
+        self.calls = []
+
+    def ai(self, answer):
+        """Patch the shared client's one-shot call; answer = JSON text or an Exception."""
+        def create(**kw):
+            self.calls.append(kw)
+            if isinstance(answer, Exception):
+                raise answer
+            return FakeAIResponse(answer)
+
+        def with_options(**kw):
+            assert kw == {"max_retries": 0, "timeout": self.ex._TYPE_TIMEOUT_S}, kw
+            return mock.Mock(messages=mock.Mock(create=create))
+        return mock.patch.object(self.ex._client, "with_options", with_options)
+
+    def ensure(self, cart_id=None):
+        return tc.cp.ensure_item_types(tc.USER_A, cart_id or self.c1)
+
+    GOOD = '{"types": [{"index": 0, "type": "Faucet"}, {"index": 1, "type": "toilet"}]}'
+
+    def test_types_stored_once_and_used_in_titles(self):
+        with self.ai(self.GOOD):
+            self.assertEqual(self.ensure(), "stored")
+            self.assertEqual(self.ensure(), "exists")            # no second call
+        self.assertEqual(len(self.calls), 1)
+        parsed = self.cart()["parsed"]
+        self.assertEqual([it["item_type"] for it in parsed["items"]], ["Faucet", "Toilet"])
+        self.assertEqual(parsed["item_types"]["source"], "ai")
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync()["status"], "sent")
+        est, lst = self.sent[0][2], self.sent[1][2]
+        comps = [c for g in est["line_items"] for c in g["line_components"]]
+        self.assertEqual([c["title"] for c in comps], ["Faucet - bathroom", "Toilet - Kitchen"])
+        self.assertEqual(comps[0]["description"],
+                         "MODEL - Testbrand TB-100 COLOR - White NOTES -")
+        self.assertEqual([ln["title"] for g in lst["groupings"] for ln in g["line_items"]],
+                         ["Faucet - bathroom", "Toilet - Kitchen"])
+        # Same stored types on the next send/PUT of the same project: identical titles.
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/12/2026"))
+        self.assertNotEqual(c2, self.c1)
+        with self.ai('{"types": [{"index": 0, "type": "Faucet"}, {"index": 1, "type": "Toilet"}]}'):
+            self.ensure(c2)
+        self.responses = [PUT_OK, PUT_OK]
+        self.sync(c2)
+        self.assertEqual(self.sent[2][2]["line_items"], est["line_items"])
+        with self.as_user(tc.USER_A):
+            d = self.client.get(f"/carts/{self.c1}").get_json()
+        self.assertEqual([it["item_type"] for it in d["cart"]["items"]], ["Faucet", "Toilet"])
+        self.assertEqual(d["cart"]["item_types"]["source"], "ai")
+
+    def test_only_brand_model_finish_slug_reach_claude(self):
+        with self.ai(self.GOOD):
+            self.ensure()
+        sent = json.loads(self.calls[0]["messages"][0]["content"])
+        self.assertEqual(set(sent), {"types", "lines"})
+        self.assertEqual(sent["types"], list(ferguson_cart.ITEM_TYPES))
+        for ln in sent["lines"]:
+            self.assertEqual(set(ln), {"index", "brand", "model", "finish", "url_slug"})
+        self.assertEqual(sent["lines"][0], {"index": 0, "brand": "Testbrand", "model": "TB-100",
+                                            "finish": "White", "url_slug": "testbrand-tb-100"})
+        everything = json.dumps(self.calls[0])
+        for secret in ("Testproject", "testproject", "fergusonhome.com", tc.USER_A, "101"):
+            self.assertNotIn(secret, everything)
+
+    def test_unknown_or_unsure_type_is_null_and_flagged(self):
+        with self.ai('{"types": [{"index": 0, "type": "Spaceship"}, {"index": 1, "type": null}]}'):
+            self.ensure()
+        parsed = self.cart()["parsed"]
+        self.assertEqual([it["item_type"] for it in parsed["items"]], [None, None])
+        self.assertEqual(parsed["item_types"]["source"], "ai")
+        self.responses = [ok(5001), ok(6001)]
+        self.sync()
+        comps = [c for g in self.sent[0][2]["line_items"] for c in g["line_components"]]
+        self.assertEqual([c["title"] for c in comps],
+                         ["Testbrand TB-100 - bathroom", "Otherbrand Co OB-200-NODRAIN - Kitchen"])
+
+    def test_ai_failure_all_null_send_goes_ahead(self):
+        import anthropic
+        for answer in (anthropic.APIConnectionError(request=mock.Mock()), "not json",
+                       '{"types": "x"}'):
+            with self.subTest(answer=str(answer)[:20]):
+                self.cart()["parsed"].pop("item_types", None)
+                with self.ai(answer):
+                    self.assertEqual(self.ensure(), "stored")
+                parsed = self.cart()["parsed"]
+                self.assertEqual(parsed["item_types"]["source"], "unavailable")
+                self.assertEqual([it["item_type"] for it in parsed["items"]], [None, None])
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync()["status"], "sent")
+
+    def test_no_api_key_is_unavailable(self):
+        import sys
+        with mock.patch.dict(sys.modules, {"extractor": None}):    # import fails
+            self.assertEqual(self.ensure(), "stored")
+        self.assertEqual(self.cart()["parsed"]["item_types"]["source"], "unavailable")
+
+    def test_job_deadline_is_not_swallowed(self):
+        class JobTimeoutException(Exception):
+            pass
+        with self.ai(JobTimeoutException("deadline")):
+            with self.assertRaises(JobTimeoutException):
+                self.ensure()
+        self.assertNotIn("item_types", self.cart()["parsed"])
+
+    def test_first_result_wins(self):
+        with self.ai(self.GOOD):
+            self.ensure()
+        stored = json.loads(json.dumps(self.cart()["parsed"]))
+        self.cart()["parsed"].pop("item_types")
+        self.cart()["parsed"]["item_types"] = stored["item_types"]
+        self.assertFalse(self.db.set_cart_item_types(tc.USER_A, self.c1, {"items": []}))
+        self.assertEqual(self.cart()["parsed"]["items"], stored["items"])
+
+    def test_unsendable_carts_never_call_claude(self):
+        unlinked = self.new_cart(customer=None)
+        bad = self.new_cart(cart_html(project="Testproject", subtotal="$1.00"))
+        self.cart(bad)["ok"] = False
+        self.cart()["superseded_by"] = unlinked
+        with self.ai(self.GOOD):
+            for cid in (unlinked, bad, self.c1, "cart_000000000fff"):
+                self.assertEqual(self.ensure(cid), "skipped")
+        self.assertEqual(self.calls, [])
+
+    def test_worker_types_before_sending(self):
+        import worker
+        order = []
+        with mock.patch.object(tc.cp, "ensure_item_types",
+                               side_effect=lambda *a: order.append("types")), \
+                mock.patch.object(worker, "sync_cart",
+                                  side_effect=lambda *a, **k: order.append("send") or
+                                  {"status": "sent"}):
+            worker.send_cart_to_fieldpulse(tc.USER_A, self.c1)
+        self.assertEqual(order, ["types", "send"])
 
 
 class TestPure(unittest.TestCase):

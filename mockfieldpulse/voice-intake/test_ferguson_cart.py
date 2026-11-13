@@ -385,14 +385,11 @@ class EstimateBody(unittest.TestCase):
 
     def test_exact_shape(self):
         body = fc.build_estimate_body(self.cart, "19000001", 900001)
-        desc = ('NOTES - Ferguson cart "Testproject", pricing expires 12/10/2026')
+        desc = "NOTES -"     # Mike's layout: nothing after NOTES, no project / expiry
         self.assertEqual(body, {
             "customer_id": 19000001,
             "tax_rate": "0.00",
             "title": "Ferguson cart: Testproject",
-            "notes": ('Draft from Ferguson Home cart "Testproject" (pricing expires 12/10/2026). '
-                      "2 item(s), lines total $1,502.76. Unit price and unit cost are the "
-                      "cart price."),
             "line_items": [
                 {"line_number": 1, "line_type": "group", "group_number": 1,
                  "line_title": "bathroom", "line_quantity": 1,
@@ -445,10 +442,40 @@ class EstimateBody(unittest.TestCase):
                          [("Kitchen", ["M1", "M4"]), ("Other", ["M2", "M5"]), ("Bath", ["M3"])])
         self.assertEqual([li["line_number"] for li in body["line_items"]], [1, 2, 3])
         c0 = body["line_items"][0]["line_components"][0]
-        self.assertEqual(c0["description"], 'MODEL - B M1 COLOR - Not listed NOTES - Ferguson cart "P"')
+        self.assertEqual(c0["description"], "MODEL - B M1 COLOR - Not listed NOTES -")
         other = body["line_items"][1]["line_components"][0]
         self.assertEqual(other["title"], "M2 - Other")
-        self.assertNotIn("pricing expires", body["notes"])
+        self.assertNotIn("notes", body)
+
+    def test_item_type_titles_and_list_notes(self):
+        cart = {"project_name": "P", "pricing_expires": "2026-12-10", "items": [
+            {"room": "Bath", "brand": "B", "model": "M1", "finish": "W", "item_type": "faucet",
+             "quantity": 1, "unit_price": Decimal("1.00")},
+            {"room": None, "brand": "B", "model": "M2", "finish": "W", "item_type": "Vanity Top",
+             "quantity": 1, "unit_price": Decimal("2.00")},
+            {"room": "Bath", "brand": "B", "model": "M3", "finish": None, "item_type": "Rocket",
+             "quantity": 1, "unit_price": Decimal("3.00")},
+            {"room": "Bath", "brand": None, "model": "M4", "finish": "W", "item_type": None,
+             "quantity": 1, "unit_price": Decimal("4.00")},
+        ]}
+        body = fc.build_estimate_body(cart, 1, 2)
+        titles = [c["title"] for li in body["line_items"] for c in li["line_components"]]
+        self.assertEqual(titles, ["Faucet - Bath", "B M3 - Bath", "M4 - Bath",
+                                  "Vanity Top - Other"])
+        descs = [c["description"] for li in body["line_items"] for c in li["line_components"]]
+        self.assertEqual(descs[1], "MODEL - B M3 COLOR - Not listed NOTES -")
+        for d in descs:
+            self.assertTrue(d.endswith(" NOTES -"))
+            self.assertNotIn("P\"", d)
+        self.assertNotIn("notes", body)
+        lst = fc.build_material_list_body(cart, 1, 2)
+        self.assertEqual(lst["notes"],
+                         'Draft from Ferguson Home cart "P" (pricing expires 12/10/2026). '
+                         "4 item(s), lines total $10.00. Unit price and unit cost are the "
+                         "cart price. This list is replaced when the cart is forwarded again.")
+        self.assertEqual(fc.item_type("  shower   door "), "Shower Door")
+        for bad in (None, 3, "", "Faucets", "Faucet; drop table"):
+            self.assertIsNone(fc.item_type(bad))
 
     def test_caps(self):
         long = "X" * 600
@@ -457,7 +484,9 @@ class EstimateBody(unittest.TestCase):
              "quantity": 1, "unit_price": Decimal("1.00")}]}
         body = fc.build_estimate_body(cart, 1, 2)
         self.assertEqual(len(body["title"]), fc.TITLE_CHARS)
-        self.assertLessEqual(len(body["notes"]), fc.NOTES_CHARS)
+        self.assertNotIn("notes", body)
+        lst = fc.build_material_list_body(cart, 1, 2)
+        self.assertLessEqual(len(lst["notes"]), fc.NOTES_CHARS)
         li = body["line_items"][0]
         comp = li["line_components"][0]
         self.assertEqual(len(li["line_title"]), fc.TITLE_CHARS)

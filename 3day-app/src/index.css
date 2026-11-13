@@ -1477,6 +1477,7 @@ code { font-size: 12px; overflow-wrap: anywhere; }
   background: var(--bg); border: 1px solid var(--border);
 }
 .doc-check-warn { background: #fbf2cf; color: #856404; border-color: #f0dc8c; }
+.cart-type-flag { color: #856404; font-style: italic; }
 .doc-check-ok { color: #1e7a45; }
 .doc-check-info { color: var(--text-secondary); }
 .doc-lines-wrap { overflow-x: auto; }

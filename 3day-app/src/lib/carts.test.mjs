@@ -2,7 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  FP_STATE_LABEL, cartBadge, cartMoney, cartStatusLabel, fpBusy, fpStateLabel, sendButtonText, sendCartPrompt, matchPending, matchText, count, deleteCartPrompt, expiryText, groupByRoom, itemTitle,
+  FP_STATE_LABEL, cartBadge, cartMoney, cartStatusLabel, fpBusy, fpStateLabel, sendButtonText, sendCartPrompt, matchPending, matchText, count, deleteCartPrompt, expiryText, groupByRoom, itemTitle, itemTypeView, TYPE_UNKNOWN,
   lineTotal, parseCartsHash, qtyText, safeLink, toCents,
 } from './carts.js'
 
@@ -98,4 +98,14 @@ test('E4: FieldPulse state labels, button, busy, prompt', () => {
   const p = sendCartPrompt('Testproject', 'Pat Example')
   assert.ok(p.includes('Testproject') && p.includes('Pat Example') && p.includes("can't be changed"))
   assert.ok(sendCartPrompt(null, null).includes('unknown'))
+})
+
+test('item type view: not decided / typed / flagged', () => {
+  assert.deepEqual(itemTypeView({ item_type: 'Faucet' }, null), { text: '—', flag: false })
+  const info = { source: 'ai', at: '2026-11-12T00:00:00Z' }
+  assert.deepEqual(itemTypeView({ item_type: 'Faucet' }, info), { text: 'Faucet', flag: false })
+  for (const it of [{ item_type: null }, { item_type: '  ' }, { item_type: 3 }, {}, null]) {
+    assert.deepEqual(itemTypeView(it, info), { text: TYPE_UNKNOWN, flag: true })
+  }
+  assert.deepEqual(itemTypeView({ item_type: null }, { source: 'unavailable' }), { text: TYPE_UNKNOWN, flag: true })
 })
