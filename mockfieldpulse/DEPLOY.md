@@ -81,6 +81,25 @@ mock service over HTTPS once deployed.
 > `CREATE TABLE IF NOT EXISTS fieldpulse_writes (...)` (one row per job + FieldPulse write step),
 > under the same advisory lock. Old rows are untouched.
 
+### Ferguson cart inbox (stage E2) — ORCHESTRATOR ONLY
+
+Production settings: the owner (Nick) sets these on Render; agents only document them.
+Until `INBOUND_EMAIL_SECRET` is set, `POST /inbound/cart` answers 503 and accepts nothing (the rest of the app
+is unaffected). The Cloudflare Email Worker (stage E5) must send the same value.
+
+| Name | Notes |
+|---|---|
+| `INBOUND_EMAIL_SECRET` | Shared secret our Cloudflare Email Worker sends as `X-Inbound-Secret`. Long random value (e.g. `openssl rand -hex 32`). Secret. Unset = inbound cart email disabled (503). |
+| `INBOUND_EMAIL_DOMAIN` | *Optional.* Default `voiceconsult.app`. The domain of the cart addresses (`<alias>@<domain>`); mail to any other domain is dropped. |
+| `INBOUND_AUTHSERV_ID` | *Optional.* Default `mx.cloudflare.net`. The authserv-id of the `Authentication-Results` header our receiver adds; only the topmost header with this id is trusted. **UNVERIFIED**: confirm against a real Cloudflare-received message in E5. |
+
+Also needs: the R2 bucket (raw emails go under `ferguson-carts/`) and `CLERK_SECRET_KEY` (already set; used to read
+each user's first name and verified emails). No CORS change: the Worker calls server-to-server.
+
+**Cloudflare Email Worker (stage E5):** `mockfieldpulse/email-worker/` (`voiceconsult-cart-email`). Step-by-step
+setup (secret, Email Routing, deploy, catch-all, first real test, troubleshooting) is in
+`mockfieldpulse/email-worker/README.md`. Its `INBOUND_EMAIL_SECRET` (Worker secret) must equal the Render one.
+
 ---
 
 ## Service 3 — Consultation worker (`voice-intake/`, RQ)

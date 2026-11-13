@@ -24,7 +24,9 @@ Also runs the admin panel's manual "Send to FieldPulse" for a finished job
 reads uploaded vendor PDFs (process_vendor_document, stage P1b, queued by
 documents_panel.submit; no FieldPulse call), and rebuilds each customer's combined
 vendor material list (sync_vendor_materials_job, stage P2: queued after a document is
-read, after one is deleted, and by the manual send; fieldpulse_sync does the write).
+read, after one is deleted, and by the manual send; fieldpulse_sync does the write),
+and matches Ferguson carts to FieldPulse customers by name (match_cart_customer, stage
+E3, queued by carts_panel; a read only).
 
 The worker no longer calls the mock writer (consultation_writer); that module
 stays only for the deprecated sync route until stage 6 removes the mock.
@@ -46,7 +48,8 @@ import vendor_documents
 from customer_source import list_catalog_items
 from documents_panel import customer_display_name
 from extractor import ExtractionError, extract_consultation, match_catalog_items
-from fieldpulse_sync import consultation_reference, sync_consultation, sync_vendor_materials
+from fieldpulse_sync import (consultation_reference, sync_cart, sync_consultation,
+                             sync_vendor_materials)
 from jobs import (JobError, get_job, get_vendor_document, save_manual_send,
                   update_job_status, update_vendor_document)
 from observability import init_sentry, report, traced_job
@@ -342,6 +345,42 @@ def sync_vendor_materials_job(customer_id, manual=False, customer=None):
         logger.info("[customer %s] vendor material list: queueing the follow-up run",
                     customer_id)
         queue_vendor_materials(customer_id)
+    return out.get("status")
+
+
+@traced_job
+def match_cart_customer(user_id, cart_id):
+    """Stage E3: match one Ferguson cart to a FieldPulse customer by its project name
+    (carts_panel.match_cart: one READ-ONLY customer list through customer_source, then
+    one conditional write that never overrides a manual link). A search failure leaves
+    the cart needs_customer with a readable reason; only DB errors raise."""
+    import carts_panel   # here, not at import: the worker boots without the cart chain
+    return carts_panel.match_cart(user_id, cart_id)
+
+
+def queue_cart_send(user_id, cart_id, manual=False):
+    """Queue one cart's FieldPulse send (stage E4). Best effort: True if queued."""
+    try:
+        queue_setup.enqueue_cart_send(user_id, cart_id, manual)
+        return True
+    except Exception as exc:  # noqa: BLE001 — Redis down etc.
+        logger.error("[%s] could not queue the cart send: %s", cart_id, type(exc).__name__)
+        report(exc, "Could not queue cart send", job_id=cart_id)
+        return False
+
+
+@traced_job
+def send_cart_to_fieldpulse(user_id, cart_id, manual=False):
+    """Stage E4: send one linked Ferguson cart as a DRAFT estimate + a material list
+    (fieldpulse_sync.sync_cart; never raises, FIELDPULSE_WRITE_MODE-gated). A run that
+    found the project's slot busy is picked up here as ONE follow-up run for the newest
+    cart that asked (its request stays flagged in the DB until a run claims it)."""
+    out = sync_cart(user_id, cart_id, manual=manual)
+    logger.info("[%s] cart FieldPulse send: %s (%s)", cart_id, out.get("status"),
+                "manual" if manual else "automatic")
+    follow = out.get("follow_up")
+    if follow:
+        queue_cart_send(user_id, follow.get("cart_id") or cart_id, bool(follow.get("manual")))
     return out.get("status")
 
 

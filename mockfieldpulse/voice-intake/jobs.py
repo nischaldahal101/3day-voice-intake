@@ -414,6 +414,78 @@ CREATE TABLE IF NOT EXISTS vendor_material_lists (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Ferguson carts (stage E2): each signed-in user's inbound address <alias>@<domain>
+-- (carts_panel picks the alias) and every accepted cart email (raw .eml in R2 under
+-- ferguson-carts/, parsed by ferguson_cart.parse_cart_email; Decimals as strings).
+-- UNIQUE(clerk_user_id, raw_sha256): the same email forwarded twice is one cart.
+CREATE TABLE IF NOT EXISTS cart_addresses (
+    clerk_user_id  TEXT PRIMARY KEY,
+    alias          TEXT NOT NULL UNIQUE CHECK (alias ~ '^[a-z0-9.-]{1,40}$'),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS ferguson_carts (
+    id                      TEXT PRIMARY KEY,
+    clerk_user_id           TEXT NOT NULL,
+    alias                   TEXT NOT NULL,
+    received_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sender                  TEXT,
+    message_id              TEXT,
+    raw_key                 TEXT NOT NULL,
+    raw_sha256              TEXT NOT NULL,
+    parsed                  JSONB,
+    ok                      BOOLEAN NOT NULL DEFAULT false,
+    warnings                JSONB NOT NULL DEFAULT '[]'::jsonb,
+    project_name            TEXT,
+    status                  TEXT NOT NULL DEFAULT 'needs_customer',
+    fieldpulse_customer_id  TEXT,
+    UNIQUE (clerk_user_id, raw_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_ferguson_carts_user
+    ON ferguson_carts(clerk_user_id, received_at DESC);
+-- Stage E3 (additive): the FieldPulse customer a cart is linked to. `customer` = snapshot
+-- {id, display_name, first_name, last_name, phone, email, company_name, address} read from
+-- customer_source at link time (NULL while status = 'needs_customer'); `customer_match` =
+-- {match: auto|manual|null, state: pending|done|error, reason, at}. status: needs_customer |
+-- linked (E4 adds sending | sent | failed; relinking is allowed only from needs_customer/linked).
+ALTER TABLE ferguson_carts ADD COLUMN IF NOT EXISTS customer JSONB;
+ALTER TABLE ferguson_carts ADD COLUMN IF NOT EXISTS customer_match JSONB;
+-- Stage E4 (additive): sending a linked cart to FieldPulse (fieldpulse_sync.sync_cart is
+-- the only writer). Cart status gains 'sent' (set right BEFORE the first request goes out;
+-- a sent cart can't be relinked). fieldpulse = the cart's last send record {status,
+-- message, error, mode, at, estimate_id, list_id, steps{estimate, material_list}, replaces};
+-- superseded_by = the newer cart (same user + customer + project) that took its records.
+ALTER TABLE ferguson_carts ADD COLUMN IF NOT EXISTS fieldpulse JSONB;
+ALTER TABLE ferguson_carts ADD COLUMN IF NOT EXISTS fieldpulse_history JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE ferguson_carts ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+-- One row per (user, customer, normalized project name): the ONE draft estimate + ONE
+-- material list every cart of that project writes to (a re-forward PUTs the same ids).
+-- Same safety model as vendor_material_lists: lease_until serializes syncs; per target
+-- *_create_pending = a POST went out without an id back (automatic syncs then send
+-- nothing); held = recorded in dry_run (only a manual Send releases it). *_cart_id = the
+-- cart whose lines that target holds (set only when it was written successfully).
+CREATE TABLE IF NOT EXISTS cart_fieldpulse_slots (
+    clerk_user_id            TEXT NOT NULL,
+    customer_id              TEXT NOT NULL,
+    project_key              TEXT NOT NULL,
+    cart_id                  TEXT,
+    estimate_id              BIGINT,
+    estimate_status          TEXT,
+    estimate_cart_id         TEXT,
+    estimate_create_pending  BOOLEAN NOT NULL DEFAULT false,
+    list_id                  BIGINT,
+    list_status              TEXT,
+    list_cart_id             TEXT,
+    list_create_pending      BOOLEAN NOT NULL DEFAULT false,
+    held                     BOOLEAN NOT NULL DEFAULT false,
+    mode                     TEXT,
+    lease_until              TIMESTAMPTZ,
+    resync                   BOOLEAN NOT NULL DEFAULT false,
+    resync_manual            BOOLEAN NOT NULL DEFAULT false,
+    resync_cart_id           TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (clerk_user_id, customer_id, project_key)
+);
 """
 
 
@@ -1416,3 +1488,392 @@ def list_vendor_document_customers(limit: int = 500) -> list:
         item["last_done_at"] = _iso(r["last_done_at"])
         out.append(item)
     return out
+
+
+# --- Ferguson carts (stage E2; carts_panel.py is the only caller) ----------------------
+#
+# cart_addresses: one inbound alias per Clerk user. ferguson_carts: one row per accepted
+# cart email, always read and written for ONE user (every query filters clerk_user_id).
+
+def get_cart_alias(user_id: str) -> str | None:
+    """The user's alias, or None."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT alias FROM cart_addresses WHERE clerk_user_id = %s", [user_id])
+        row = cur.fetchone()
+    return row["alias"] if row else None
+
+
+def ensure_cart_alias(user_id: str, candidates) -> str:
+    """The user's alias; when there is none, the first candidate nobody holds is
+    claimed (INSERT ... ON CONFLICT DO NOTHING, so two requests at once can't give
+    one user two aliases or two users one alias). JobError when every candidate is
+    taken."""
+    if not user_id:
+        raise JobError("ensure_cart_alias needs a user id")
+    existing = get_cart_alias(user_id)
+    if existing:
+        return existing
+    for alias in candidates:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO cart_addresses (clerk_user_id, alias) VALUES (%s, %s) "
+                    "ON CONFLICT DO NOTHING RETURNING alias", [user_id, alias])
+                row = cur.fetchone()
+            conn.commit()
+        if row:
+            logger.info("Created a cart address")
+            return row["alias"]
+        existing = get_cart_alias(user_id)      # a parallel request created it
+        if existing:
+            return existing
+    raise JobError("No free cart address alias")
+
+
+def get_cart_alias_user(alias: str) -> str | None:
+    """The Clerk user id that owns `alias`, or None."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT clerk_user_id FROM cart_addresses WHERE alias = %s", [alias])
+        row = cur.fetchone()
+    return row["clerk_user_id"] if row else None
+
+
+def _serialize_cart(row):
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "clerk_user_id": row["clerk_user_id"],
+        "alias": row["alias"],
+        "received_at": _iso(row["received_at"]),
+        "sender": row["sender"],
+        "message_id": row["message_id"],
+        "raw_key": row["raw_key"],
+        "raw_sha256": row["raw_sha256"],
+        "parsed": row["parsed"] if isinstance(row.get("parsed"), dict) else None,
+        "ok": bool(row["ok"]),
+        "warnings": row["warnings"] if isinstance(row.get("warnings"), list) else [],
+        "project_name": row["project_name"],
+        "status": row["status"],
+        "fieldpulse_customer_id": row["fieldpulse_customer_id"],
+        "customer": row["customer"] if isinstance(row.get("customer"), dict) else None,
+        "customer_match": (row["customer_match"]
+                           if isinstance(row.get("customer_match"), dict) else None),
+        "fieldpulse": row["fieldpulse"] if isinstance(row.get("fieldpulse"), dict) else None,
+        "fieldpulse_history": (row["fieldpulse_history"]
+                               if isinstance(row.get("fieldpulse_history"), list) else []),
+        "superseded_by": row.get("superseded_by"),
+    }
+
+
+def find_cart_by_sha(user_id: str, raw_sha256: str) -> dict | None:
+    """This user's cart for exactly these raw bytes, or None (duplicate forward)."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM ferguson_carts WHERE clerk_user_id = %s AND raw_sha256 = %s",
+                    [user_id, raw_sha256])
+        row = cur.fetchone()
+    return _serialize_cart(row)
+
+
+def create_ferguson_cart(user_id: str, alias: str, sender: str, message_id: str,
+                         raw_key: str, raw_sha256: str, parsed: dict, ok: bool,
+                         warnings: list, project_name: str) -> tuple:
+    """Insert a cart (status 'needs_customer') -> (cart, True). The same raw bytes
+    already stored for this user -> (existing cart, False), nothing written."""
+    new_id = f"cart_{uuid.uuid4().hex[:12]}"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ferguson_carts
+                    (id, clerk_user_id, alias, sender, message_id, raw_key, raw_sha256,
+                     parsed, ok, warnings, project_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (clerk_user_id, raw_sha256) DO NOTHING
+                RETURNING *
+                """,
+                [new_id, user_id, alias, sender, message_id, raw_key, raw_sha256,
+                 Jsonb(parsed) if parsed is not None else None, bool(ok),
+                 Jsonb(list(warnings or [])), project_name],
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if row is not None:
+        logger.info("Created Ferguson cart %s (ok=%s)", new_id, bool(ok))
+        return _serialize_cart(row), True
+    return find_cart_by_sha(user_id, raw_sha256), False
+
+
+def list_ferguson_carts(user_id: str, offset: int = 0, limit: int = 50) -> dict:
+    """One user's carts, newest first, compact: {"items": [{id, received_at,
+    project_name, item_count, subtotal (string|None), ok, warning_count, status,
+    customer_name, match_state, fieldpulse_status, fieldpulse_at, superseded_by}],
+    "total"}. JSON paths are guarded so an odd `parsed` can't break the list."""
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), 100))
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM ferguson_carts WHERE clerk_user_id = %s",
+                    [user_id])
+        total = cur.fetchone()["n"]
+        cur.execute(
+            """
+            SELECT id, received_at, left(project_name, 255) AS project_name, ok, status,
+                   CASE WHEN jsonb_typeof(customer) = 'object'
+                        THEN left(customer->>'display_name', 200) END AS customer_name,
+                   CASE WHEN jsonb_typeof(customer_match) = 'object'
+                        THEN left(customer_match->>'state', 20) END AS match_state,
+                   CASE WHEN jsonb_typeof(parsed->'items') = 'array'
+                        THEN jsonb_array_length(parsed->'items') END AS item_count,
+                   CASE WHEN jsonb_typeof(parsed->'subtotal') = 'string'
+                        THEN left(parsed->>'subtotal', 20) END AS subtotal,
+                   CASE WHEN jsonb_typeof(warnings) = 'array'
+                        THEN jsonb_array_length(warnings) ELSE 0 END AS warning_count,
+                   CASE WHEN jsonb_typeof(fieldpulse) = 'object'
+                        THEN left(fieldpulse->>'status', 20) END AS fieldpulse_status,
+                   CASE WHEN jsonb_typeof(fieldpulse) = 'object'
+                        THEN left(fieldpulse->>'at', 40) END AS fieldpulse_at,
+                   left(superseded_by, 40) AS superseded_by
+              FROM ferguson_carts
+             WHERE clerk_user_id = %s
+             ORDER BY received_at DESC, id
+            OFFSET %s LIMIT %s
+            """,
+            [user_id, offset, limit],
+        )
+        rows = cur.fetchall()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["received_at"] = _iso(r["received_at"])
+        items.append(item)
+    return {"items": items, "total": total}
+
+
+def get_ferguson_cart(user_id: str, cart_id: str) -> dict | None:
+    """One cart of THIS user, or None (another user's cart is None too)."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM ferguson_carts WHERE id = %s AND clerk_user_id = %s",
+                    [cart_id, user_id])
+        row = cur.fetchone()
+    return _serialize_cart(row)
+
+
+def delete_ferguson_cart(user_id: str, cart_id: str) -> dict | None:
+    """Hard-delete one cart of THIS user. Returns the deleted row (the caller removes
+    the raw email from R2), or None when there is no such cart for this user."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ferguson_carts WHERE id = %s AND clerk_user_id = %s "
+                        "RETURNING *", [cart_id, user_id])
+            row = cur.fetchone()
+        conn.commit()
+    if row is not None:
+        logger.info("Deleted Ferguson cart %s", cart_id)
+    return _serialize_cart(row)
+
+
+def set_cart_customer(user_id: str, cart_id: str, customer: dict | None, match: dict,
+                      only_from) -> dict | None:
+    """Set THIS user's cart's customer link in one conditional write: `customer` (a
+    snapshot dict with an "id") -> status 'linked' + fieldpulse_customer_id; None ->
+    status 'needs_customer', link cleared. `match` is stored as customer_match. Only
+    when the cart's current status is in `only_from` (so a stale auto-match never
+    overwrites a manual link, and nothing here touches a sent cart). Returns the
+    updated cart, or None (no such cart for this user, or its status didn't allow it)."""
+    statuses = [str(x) for x in only_from]
+    if customer is not None and customer.get("id") in (None, ""):
+        raise JobError("set_cart_customer needs a customer id")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ferguson_carts
+                   SET status = %s, fieldpulse_customer_id = %s, customer = %s,
+                       customer_match = %s
+                 WHERE id = %s AND clerk_user_id = %s AND status = ANY(%s)
+                RETURNING *
+                """,
+                ["linked" if customer else "needs_customer",
+                 str(customer["id"]) if customer else None,
+                 Jsonb(customer) if customer else None, Jsonb(match),
+                 cart_id, user_id, statuses],
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _serialize_cart(row)
+
+
+# --- Ferguson cart -> FieldPulse (stage E4; fieldpulse_sync.sync_cart is the only caller) --
+#
+# cart_fieldpulse_slots: one row per (user, customer, project key) = ONE draft estimate +
+# ONE material list. Same lease pattern as vendor_material_lists: CLAIM (short tx, FOR
+# UPDATE) -> build + send with no transaction open -> FINISH (short tx, always releases
+# the lease). A busy claim flags resync (+ the newest asking cart) for one follow-up run.
+
+CART_SLOT_LEASE_S = 300       # > one sync's worst case (2 targets x PUT + GET + POST, 20 s each)
+_CART_HISTORY = 10
+_SLOT_TARGETS = ("estimate", "list")
+
+
+def _serialize_slot(row):
+    if row is None:
+        return None
+    out = {k: row.get(k) for k in (
+        "clerk_user_id", "customer_id", "project_key", "cart_id", "estimate_id",
+        "estimate_status", "estimate_cart_id", "list_id", "list_status", "list_cart_id",
+        "mode", "resync_cart_id")}
+    for k in ("estimate_create_pending", "list_create_pending", "held", "resync_manual"):
+        out[k] = bool(row.get(k))
+    out["updated_at"] = _iso(row.get("updated_at"))
+    return out
+
+
+def get_cart_slot(user_id: str, customer_id: str, project_key: str) -> dict | None:
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM cart_fieldpulse_slots WHERE clerk_user_id = %s "
+                    "AND customer_id = %s AND project_key = %s",
+                    [user_id, customer_id, project_key])
+        return _serialize_slot(cur.fetchone())
+
+
+def claim_cart_slot(user_id: str, customer_id: str, project_key: str, cart_id: str,
+                    manual: bool = False) -> dict | None:
+    """Take the slot's lease. Returns the slot (with the resync_manual it had) and clears
+    the resync flags; None when another sync holds it (then resync is flagged with the
+    NEWER of the already-flagged cart and this one, by received_at)."""
+    key = [user_id, customer_id, project_key]
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO cart_fieldpulse_slots (clerk_user_id, customer_id, "
+                        "project_key) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", key)
+            cur.execute("SELECT *, (lease_until IS NOT NULL AND lease_until > now()) AS busy "
+                        "FROM cart_fieldpulse_slots WHERE clerk_user_id = %s AND "
+                        "customer_id = %s AND project_key = %s FOR UPDATE", key)
+            row = cur.fetchone()
+            if row["busy"]:
+                cur.execute(
+                    """
+                    UPDATE cart_fieldpulse_slots s SET resync = true,
+                           resync_manual = s.resync_manual OR %s,
+                           resync_cart_id = CASE
+                             WHEN s.resync_cart_id IS NULL THEN %s
+                             WHEN (SELECT received_at FROM ferguson_carts
+                                    WHERE id = s.resync_cart_id) IS NULL THEN %s
+                             WHEN (SELECT received_at FROM ferguson_carts WHERE id = %s)
+                                  >= (SELECT received_at FROM ferguson_carts
+                                       WHERE id = s.resync_cart_id) THEN %s
+                             ELSE s.resync_cart_id END
+                     WHERE clerk_user_id = %s AND customer_id = %s AND project_key = %s
+                    """,
+                    [bool(manual), cart_id, cart_id, cart_id, cart_id] + key)
+                conn.commit()
+                logger.info("Cart slot busy: resync flagged (%s)", cart_id)
+                return None
+            cur.execute("UPDATE cart_fieldpulse_slots SET lease_until = now() + "
+                        "make_interval(secs => %s), resync = false, resync_manual = false, "
+                        "resync_cart_id = NULL WHERE clerk_user_id = %s AND customer_id = %s "
+                        "AND project_key = %s", [CART_SLOT_LEASE_S] + key)
+        conn.commit()
+    return _serialize_slot(row)
+
+
+def mark_cart_sending(user_id: str, cart_id: str, customer_id: str, project_key: str,
+                      target: str, post: bool, request: dict, mode: str) -> bool:
+    """Right before EVERY request to FieldPulse for a cart, in ONE transaction: the cart
+    becomes 'sent' (no relink any more) ONLY if it is still linked to `customer_id`
+    (else nothing is written and False is returned: don't send). For a POST also, like
+    the vendor list: <target>_create_pending = true + the old id cleared."""
+    if target not in _SLOT_TARGETS:
+        raise JobError("mark_cart_sending: unknown target")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ferguson_carts
+                   SET status = 'sent',
+                       fieldpulse = coalesce(fieldpulse, '{}'::jsonb)
+                                    || jsonb_build_object('status', 'sending', 'at', %s::text,
+                                                          'mode', %s::text)
+                 WHERE id = %s AND clerk_user_id = %s AND fieldpulse_customer_id = %s
+                   AND status IN ('linked', 'sent')
+                RETURNING id
+                """,
+                [_iso_now(), mode, cart_id, user_id, customer_id])
+            if cur.fetchone() is None:
+                conn.rollback()
+                return False
+            if post:
+                cur.execute(
+                    f"UPDATE cart_fieldpulse_slots SET {target}_create_pending = true, "
+                    f"{target}_id = NULL, {target}_status = 'sending', mode = %s, "
+                    f"updated_at = now() WHERE clerk_user_id = %s AND customer_id = %s "
+                    f"AND project_key = %s", [mode, user_id, customer_id, project_key])
+        conn.commit()
+    return True
+
+
+def _iso_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+_SLOT_COLUMNS = frozenset((
+    "cart_id", "estimate_id", "estimate_status", "estimate_cart_id", "estimate_create_pending",
+    "list_id", "list_status", "list_cart_id", "list_create_pending", "held", "mode"))
+
+
+def _cart_record_sql(record, history_entry):
+    return ("fieldpulse = %s, fieldpulse_history = (SELECT coalesce(jsonb_agg(e), '[]'::jsonb) "
+            "FROM (SELECT e FROM jsonb_array_elements(%s::jsonb || fieldpulse_history) "
+            "WITH ORDINALITY AS t(e, n) ORDER BY n LIMIT %s) h)",
+            [Jsonb(record), Jsonb([history_entry] if history_entry else []), _CART_HISTORY])
+
+
+def set_cart_fieldpulse(user_id: str, cart_id: str, record: dict,
+                        history_entry: dict = None) -> bool:
+    """Store a cart's send record (refusals and skips outside the slot lease)."""
+    sql, params = _cart_record_sql(record, history_entry)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE ferguson_carts SET {sql} WHERE id = %s AND clerk_user_id = %s "
+                        f"RETURNING id", params + [cart_id, user_id])
+            ok = cur.fetchone() is not None
+        conn.commit()
+    return ok
+
+
+def finish_cart_slot(user_id: str, customer_id: str, project_key: str, updates: dict,
+                     cart_id: str, record: dict, history_entry: dict = None,
+                     supersede: tuple = None) -> tuple:
+    """One transaction: apply `updates` to the slot (only known columns), ALWAYS release
+    the lease, store the cart's record, and (supersede = (old_cart, new_cart)) mark the old
+    cart superseded_by the new one. Returns (again, again_manual, again_cart_id); the
+    resync flags are NOT cleared here (the next claim consumes them)."""
+    bad = set(updates or {}) - _SLOT_COLUMNS
+    if bad:
+        raise JobError("finish_cart_slot: unknown slot column")
+    key = [user_id, customer_id, project_key]
+    sets, params = ["lease_until = NULL", "updated_at = now()"], []
+    for column, value in (updates or {}).items():
+        sets.append(f"{column} = %s")
+        params.append(value)
+    rec_sql, rec_params = _cart_record_sql(record, history_entry)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT resync, resync_manual, resync_cart_id FROM cart_fieldpulse_slots "
+                        "WHERE clerk_user_id = %s AND customer_id = %s AND project_key = %s "
+                        "FOR UPDATE", key)
+            row = cur.fetchone()
+            cur.execute(f"UPDATE cart_fieldpulse_slots SET {', '.join(sets)} WHERE "
+                        f"clerk_user_id = %s AND customer_id = %s AND project_key = %s",
+                        params + key)
+            cur.execute(f"UPDATE ferguson_carts SET {rec_sql} WHERE id = %s AND "
+                        f"clerk_user_id = %s", rec_params + [cart_id, user_id])
+            if supersede:
+                old, new = supersede
+                cur.execute("UPDATE ferguson_carts SET superseded_by = %s WHERE id = %s "
+                            "AND clerk_user_id = %s AND id <> %s", [new, old, user_id, new])
+        conn.commit()
+    if not row:
+        return False, False, None
+    return bool(row["resync"]), bool(row["resync_manual"]), row["resync_cart_id"]

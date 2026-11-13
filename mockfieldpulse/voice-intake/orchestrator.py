@@ -21,6 +21,7 @@ from flask_cors import CORS
 from psycopg_pool import PoolTimeout
 
 import admin_panel
+import carts_panel
 import documents_panel
 import jobs
 from consultation_writer import WriterError as ConsultWriterError
@@ -61,7 +62,7 @@ PORT = int(os.environ.get("PORT", 5100))
 #   /consultation/upload-url, /consultation/submit, /job-status/<id>,
 #   /jobs/recent, /app/customers (GET only), /process-consultation,
 #   /admin/* (admin panel: every signed-in user, deliberately, for now).
-# Public: /health only.
+# Public: /health, and /inbound/cart (own shared secret, see _PUBLIC_PATHS).
 #
 # We used to require x-intake-key on every request. That's retired here —
 # Clerk sessions are the real gate now.
@@ -196,7 +197,9 @@ HOMEOWNER: That works. Thursday at six.
 # a valid Bearer token on the Authorization header. Keep this list tight —
 # add here only if a caller genuinely can't send a token (health checks,
 # public probes). All new app-facing endpoints should stay off this list.
-_PUBLIC_PATHS = frozenset(["/health"])
+# /inbound/cart: called by our Cloudflare Email Worker (E5), not the app; it is
+# guarded by its own shared secret (X-Inbound-Secret, carts_panel.receive_inbound).
+_PUBLIC_PATHS = frozenset(["/health", "/inbound/cart"])
 
 
 @app.before_request
@@ -952,6 +955,74 @@ def documents_delete(doc_id):
     return jsonify(out), code
 
 
+# --- Ferguson carts (stage E2) ------------------------------------------------
+#
+# Thin routes over carts_panel.py. /inbound/cart is public (shared secret, our
+# Cloudflare Email Worker only); /carts* are Clerk-protected and always scoped to
+# the signed-in user's own carts. No FieldPulse write (E3 reads the customer list).
+
+def _user_id():
+    from flask import g
+    return getattr(g, "clerk_user_id", None)
+
+
+@app.post("/inbound/cart")
+def inbound_cart():
+    code, out = carts_panel.receive_inbound(
+        request.headers.get("X-Inbound-Secret"), request.content_length,
+        lambda: request.get_data(cache=False))
+    return jsonify(out), code
+
+
+@app.get("/carts/address")
+def carts_address():
+    code, out = carts_panel.cart_address(_user_id())
+    return jsonify(out), code
+
+
+@app.get("/carts")
+def carts_list():
+    a = request.args
+    code, out = carts_panel.list_carts(_user_id(), offset=a.get("offset", 0),
+                                       limit=a.get("limit", carts_panel.DEFAULT_PAGE))
+    return jsonify(out), code
+
+
+@app.get("/carts/<cart_id>")
+def carts_detail(cart_id):
+    code, out = carts_panel.cart_detail(_user_id(), cart_id)
+    return jsonify(out), code
+
+
+@app.delete("/carts/<cart_id>")
+def carts_delete(cart_id):
+    code, out = carts_panel.delete_cart(_user_id(), cart_id)
+    return jsonify(out), code
+
+
+# Stage E3: link a cart to a FieldPulse customer. /match only queues the worker
+# auto-match; /customer checks the id with the read-only customer list (bounded,
+# like /app/customers). Neither writes to FieldPulse.
+@app.post("/carts/<cart_id>/match")
+def carts_match(cart_id):
+    code, out = carts_panel.request_match(_user_id(), cart_id)
+    return jsonify(out), code
+
+
+# Stage E4: Send/Retry only queues the worker (fieldpulse_sync.sync_cart, mode-gated).
+@app.post("/carts/<cart_id>/send")
+def carts_send(cart_id):
+    code, out = carts_panel.request_send(_user_id(), cart_id)
+    return jsonify(out), code
+
+
+@app.post("/carts/<cart_id>/customer")
+def carts_link_customer(cart_id):
+    code, out = carts_panel.link_customer(_user_id(), cart_id,
+                                          request.get_json(silent=True))
+    return jsonify(out), code
+
+
 # --- Startup ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -974,6 +1045,10 @@ if __name__ == "__main__":
     print(f"    GET  /admin/consultations[/<id>[/audio-url]], POST .../<id>/send, DELETE .../<id>  (Clerk-protected — admin)")
     print(f"    POST /documents/upload-url, POST /documents/submit, GET /documents[/<id>], DELETE /documents/<id>  (Clerk-protected — vendor PDFs)")
     print(f"    GET  /documents/customers[/<customer_id>], POST /documents/customers/<customer_id>/send  (Clerk-protected — vendor lists)")
+    print(f"    POST /inbound/cart              (public — X-Inbound-Secret; Cloudflare Email Worker only)")
+    print(f"    GET  /carts[/address|/<id>], DELETE /carts/<id>  (Clerk-protected — own Ferguson carts)")
+    print(f"    POST /carts/<id>/match, POST /carts/<id>/customer  (Clerk-protected — link a cart to a customer)")
+    print(f"    POST /carts/<id>/send           (Clerk-protected — queue the FieldPulse send, 202)")
     print("  CORS: allow_origins=* (dev only — lock down for prod)")
     print(f"  Auth:         Authorization: Bearer <clerk-session-token>")
     print(f"  Authorized parties: {', '.join(_AUTHORIZED_PARTIES) or '(none — set CLERK_AUTHORIZED_PARTIES)'}")

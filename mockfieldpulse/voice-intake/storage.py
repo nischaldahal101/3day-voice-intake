@@ -298,3 +298,20 @@ def download_bytes(key: str, max_bytes: int) -> bytes:
     if len(data) > max_bytes:
         raise StorageError(f"R2 object is larger than {max_bytes} bytes")
     return data
+
+
+# --- Ferguson cart emails (stage E2, raw .eml under ferguson-carts/) ----------
+
+CART_PREFIX = "ferguson-carts/"
+
+
+def put_bytes(key: str, data: bytes, content_type: str) -> None:
+    """Store bytes under `key`. Called inside an HTTP request (the inbound cart
+    webhook), so it uses the bounded client: an R2 outage fails it in seconds."""
+    _ensure_configured()
+    try:
+        _quick_client.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=data,
+                                 ContentType=content_type)
+    except (ClientError, BotoCoreError) as exc:
+        logger.error("R2 put failed: %s", type(exc).__name__)
+        raise StorageError(f"Failed to upload bytes to r2://{R2_BUCKET_NAME}/{key}: {exc}")

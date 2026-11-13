@@ -68,6 +68,7 @@ _enabled = False
 
 _JOB_ID = r"job_[0-9a-f]{6,32}"
 _DOC_ID = r"doc_[0-9a-f]{12}"          # vendor_documents ids (stage P1b)
+_CART_ID = r"cart_[0-9a-f]{12}"        # ferguson_carts ids (stage E2)
 # Exception values (whole message) known to carry no customer data: our own
 # fixed texts, optionally with a job id / internal status word.
 _SAFE_VALUES = [re.compile(p) for p in (
@@ -92,6 +93,12 @@ _SAFE_VALUES = [re.compile(p) for p in (
     r"R2 object is larger than \d{1,12} bytes",
     r"create_vendor_document needs a file_key",
     r"update_vendor_document: bad status '[a-z_]{1,32}'",
+    r"No free cart address alias",                           # jobs.ensure_cart_alias (E2)
+    r"ensure_cart_alias needs a user id",
+    r"set_cart_customer needs a customer id",                 # jobs.set_cart_customer (E3)
+    r"mark_cart_sending: unknown target",                     # jobs E4 cart send
+    r"finish_cart_slot: unknown slot column",
+    r"estimate body must not carry status_id",               # fieldpulse_sync.sync_cart (E4)
     r"couldn't get a connection after \d{1,4}\.\d{2} sec",   # psycopg_pool.PoolTimeout (F-82)
 )]
 # Known-safe leading text; whatever follows it is replaced by [redacted].
@@ -110,7 +117,8 @@ _SAFE_PREFIXES = [re.compile(p) for p in (
     r"An error occurred \([A-Za-z0-9.]{1,64}\) when calling the [A-Za-z]{1,64} operation",  # boto
 )]
 # Our exception types whose messages are documented as fixed text.
-_SAFE_TYPES = {("customer_source", "CustomerSourceError")}
+_SAFE_TYPES = {("customer_source", "CustomerSourceError"),
+               ("carts_panel", "ProfileError")}   # fixed text: a config message or an exception class name
 
 _FLUSH_TIMEOUT_S = 5
 _REDACTED = "[redacted]"
@@ -149,7 +157,7 @@ _REDIS_COMMANDS = frozenset((
 # report() tag values. A new tag needs a rule here or it is not sent.
 _TAG_RULES = {
     "component": {"orchestrator", "worker"},
-    "job_id": re.compile(rf"{_JOB_ID}|{_DOC_ID}"),     # traced_job tags its first arg
+    "job_id": re.compile(rf"{_JOB_ID}|{_DOC_ID}|{_CART_ID}"),     # traced_job tags its first arg
     "step": {"comment", "return_task", "material_list", "vendor_list"},
     "mode": {"dry_run", "off", "test_customer_only", "live"},
     "manual": {"True", "False"},

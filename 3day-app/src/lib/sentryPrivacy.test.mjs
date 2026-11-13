@@ -388,3 +388,45 @@ test('P2: per-customer vendor list endpoints, #documents/c/<id> hash and message
   assert.equal(safeExceptionValue(`Send vendor list failed (HTTP 503): ${NAME}`),
     'Send vendor list failed (HTTP 503): [redacted]')
 })
+
+test('E2: Ferguson cart endpoints, #carts hash and messages', () => {
+  assert.equal(requestUrl('https://api.example/carts?offset=0&limit=50'), 'https://api.example/carts')
+  assert.equal(requestUrl('https://api.example/carts/address'), 'https://api.example/carts/address')
+  assert.equal(requestUrl('https://api.example/carts/cart_0123456789ab'), 'https://api.example/carts/[id]')
+  assert.equal(requestUrl(`https://api.example/carts/${NAME}/x`), 'https://api.example')
+  assert.equal(requestUrl('https://api.example/inbound/cart'), 'https://api.example')
+  assert.equal(pageUrl('https://a.example/#carts'), 'https://a.example/#carts')
+  assert.equal(pageUrl('https://a.example/#carts/cart_0123456789ab'), 'https://a.example/#carts/[id]')
+  assert.equal(pageUrl(`https://a.example/#carts/${NAME} ${PHONE}`), 'https://a.example/#carts/[id]')
+  assert.equal(pageUrl('https://a.example/#carts/c/x'), 'https://a.example/#carts/[id]')
+  for (const msg of ["Couldn't load your cart address: the server sent an unexpected response.",
+    "Couldn't load carts: the server sent an unexpected response.",
+    "Couldn't load the cart: the server sent an unexpected response."]) {
+    assert.equal(safeExceptionValue(msg), msg)
+  }
+  assert.equal(safeExceptionValue(`Delete cart failed (HTTP 500): ${NAME}`),
+    'Delete cart failed (HTTP 500): [redacted]')
+  assert.equal(safeExceptionValue(`Couldn't load the cart failed (HTTP 404): ${NAME}`),
+    "Couldn't load the cart failed (HTTP 404): [redacted]")
+})
+
+test('E3: cart link / match endpoints and messages', () => {
+  assert.equal(requestUrl('https://api.example/carts/cart_0123456789ab/customer'),
+    'https://api.example/carts/[id]/customer')
+  assert.equal(requestUrl('https://api.example/carts/cart_0123456789ab/match'),
+    'https://api.example/carts/[id]/match')
+  assert.equal(requestUrl(`https://api.example/carts/${NAME}/other`), 'https://api.example')
+  assert.equal(safeExceptionValue(`Link customer failed (HTTP 400): ${NAME}`),
+    'Link customer failed (HTTP 400): [redacted]')
+  assert.equal(safeExceptionValue(`Match cart failed (HTTP 503): ${NAME}`),
+    'Match cart failed (HTTP 503): [redacted]')
+  const msg = "Couldn't link the customer: the server sent an unexpected response."
+  assert.equal(safeExceptionValue(msg), msg)
+})
+
+test('E4: cart send endpoint and message', () => {
+  assert.equal(requestUrl('https://api.example/carts/cart_0123456789ab/send'),
+    'https://api.example/carts/[id]/send')
+  assert.equal(safeExceptionValue(`Send cart failed (HTTP 409): ${NAME}`),
+    'Send cart failed (HTTP 409): [redacted]')
+})

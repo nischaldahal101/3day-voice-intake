@@ -77,6 +77,10 @@ const API_ROUTES = [
   // Stage P2 (per customer) BEFORE '/documents/:id', which would also match 'customers'.
   '/documents/customers', '/documents/customers/:id', '/documents/customers/:id/send',
   '/documents', '/documents/upload-url', '/documents/submit', '/documents/:id',
+  // Ferguson carts (stage E2); '/carts/address' BEFORE '/carts/:id'.
+  '/carts', '/carts/address', '/carts/:id',
+  // Stage E3: link a cart to a customer / retry the name match.
+  '/carts/:id/customer', '/carts/:id/match', '/carts/:id/send',
 ].map((t) => t.split('/').slice(1))
 // Built bundle files (prod /assets/*) and Vite dev module paths: code, not data.
 const CODE_PATH = /^\/(?:assets\/[\w.-]{1,120}\.(?:m?js|css)|src\/[\w./-]{1,200}\.(?:m?jsx?|tsx?|css)|node_modules\/[\w./@-]{1,200}\.m?js|@vite\/client|@react-refresh)$/
@@ -106,10 +110,10 @@ function apiTemplate(path) {
   return route ? '/' + route.map((part) => (part === ':id' ? ID : part)).join('/') : undefined
 }
 
-// #admin, #admin/<id>, #consultations[/<id>], #documents[/<id>], #documents/c/<id> ->
+// #admin, #admin/<id>, #consultations[/<id>], #documents[/<id>], #documents/c/<id>, #carts[/<id>] ->
 // route word (+ "/c") (+ "/[id]"); other hashes dropped.
 function safeHash(hash) {
-  const m = /^#(admin|consultations|documents)(\/c(?=\/))?(\/[^?]*)?(?:\?.*)?$/s.exec(hash || '')
+  const m = /^#(admin|consultations|documents|carts)(\/c(?=\/))?(\/[^?]*)?(?:\?.*)?$/s.exec(hash || '')
   if (!m) return ''
   return `#${m[1]}` + (m[1] === 'documents' && m[2] ? '/c' : '')
     + (m[3] && m[3].length > 1 ? `/${ID}` : '')
@@ -204,6 +208,10 @@ const SAFE_VALUES = new Set([
   "Couldn't load the document: the server sent an unexpected response.",
   "Couldn't load vendor document customers: the server sent an unexpected response.",
   "Couldn't load the customer's documents: the server sent an unexpected response.",
+  "Couldn't load your cart address: the server sent an unexpected response.",
+  "Couldn't load carts: the server sent an unexpected response.",
+  "Couldn't load the cart: the server sent an unexpected response.",
+  "Couldn't link the customer: the server sent an unexpected response.",
   "Couldn't prepare the upload: the server sent an unexpected response.",
   'Choose a PDF file.',
   'That file is not a PDF.',
@@ -229,7 +237,7 @@ const TEMPLATES = [
 // Known-safe leading text; whatever follows becomes [redacted].
 const SAFE_PREFIXES = [
   // api.js assertOk(opName): fixed op names + status; the server's `error` text is dropped.
-  /^(?:Couldn't load customers|upload-url|submit|job-status|Couldn't load consultations|Couldn't load the consultation|Send to FieldPulse|Couldn't get the audio link|Delete|Couldn't load documents|Couldn't load the document|Upload document|Submit document|Delete document|Couldn't load vendor document customers|Couldn't load the customer's documents|Send vendor list) failed \(HTTP \d{3}\)/,
+  /^(?:Couldn't load customers|upload-url|submit|job-status|Couldn't load consultations|Couldn't load the consultation|Send to FieldPulse|Couldn't get the audio link|Delete|Couldn't load documents|Couldn't load the document|Upload document|Submit document|Delete document|Couldn't load vendor document customers|Couldn't load the customer's documents|Send vendor list|Couldn't load your cart address|Couldn't load carts|Couldn't load the cart|Delete cart|Link customer|Match cart|Send cart) failed \(HTTP \d{3}\)/,
   /^R2 upload failed \(HTTP \d{1,3}\)/,
   /^Minified React error #\d+/,
   /^Objects are not valid as a React child/,

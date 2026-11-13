@@ -426,3 +426,101 @@ export async function deleteDocument(docId) {
   await assertOk(resp, 'Delete document')
   return resp.json()
 }
+
+// -------------------- Ferguson carts (stage E2) --------------------
+// Views of the signed-in user's OWN carts (the server scopes every call to
+// the Clerk user). Carts arrive by email (POST /inbound/cart, our email worker), never
+// from the app. No FieldPulse call here.
+
+// { address: "<alias>@voiceconsult.app" }; the alias is created on the first call.
+export async function fetchCartAddress() {
+  const resp = await fetch(`${API_BASE}/carts/address`, { headers: await authHeaders() })
+  await assertOk(resp, "Couldn't load your cart address")
+  const data = await resp.json()
+  if (!isPlainObject(data) || typeof data.address !== 'string') {
+    throw new Error("Couldn't load your cart address: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// { items: [{id, received_at, project_name, item_count, subtotal ("1502.76"|null), ok,
+//   warning_count, status, customer_name, match_state}], total, offset, limit }, newest first.
+export async function fetchCarts({ offset = 0, limit = 50 } = {}) {
+  const qs = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+  const resp = await fetch(`${API_BASE}/carts?${qs}`, { headers: await authHeaders() })
+  await assertOk(resp, "Couldn't load carts")
+  const data = await resp.json()
+  if (!isPlainObject(data) || !Array.isArray(data.items)) {
+    throw new Error("Couldn't load carts: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// { id, received_at, status ('needs_customer'|'linked'), ok, warnings: [string], project_name,
+//   customer: {id, display_name, first_name, last_name, phone, email, company_name, address}|null,
+//   match ('auto'|'manual'|null), match_state ('pending'|'done'|'error'|null), match_reason,
+//   match_at, can_link, can_match,
+//   cart: { pricing_expires, subtotal, items: [{room, brand, model, finish, quantity,
+//   unit_price, product_url, image_url}] } }
+export async function fetchCart(cartId) {
+  const resp = await fetch(`${API_BASE}/carts/${encodeURIComponent(cartId)}`, {
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, "Couldn't load the cart")
+  const data = await resp.json()
+  if (!isPlainObject(data) || typeof data.id !== 'string' || !isPlainObject(data.cart)) {
+    throw new Error("Couldn't load the cart: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// Stage E3: link the cart to a FieldPulse customer (by hand; relink allowed until it is
+// sent). The server re-reads the customer from FieldPulse (read-only) and answers with
+// the updated cart (same shape as fetchCart). Nothing is written to FieldPulse.
+export async function linkCartCustomer(cartId, customerId) {
+  const resp = await fetch(`${API_BASE}/carts/${encodeURIComponent(cartId)}/customer`, {
+    method: 'POST',
+    headers: await authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ customer_id: customerId }),
+  })
+  await assertOk(resp, 'Link customer')
+  const data = await resp.json()
+  if (!isPlainObject(data) || typeof data.id !== 'string' || !isPlainObject(data.cart)) {
+    throw new Error("Couldn't link the customer: the server sent an unexpected response.")
+  }
+  return data
+}
+
+// Stage E3: queue the automatic name match again (202 {status: "queued"}).
+export async function retryCartMatch(cartId) {
+  const resp = await fetch(`${API_BASE}/carts/${encodeURIComponent(cartId)}/match`, {
+    method: 'POST',
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, 'Match cart')
+  return resp.json()
+}
+
+// Stage E4: queue a manual Send / Retry of the cart to FieldPulse (draft estimate + material
+// list). 202 {status: "queued"}; the worker sends (FIELDPULSE_WRITE_MODE decides). 409 = the
+// cart can't be sent (not linked, unreadable, replaced): the server's reason is shown.
+export async function requestCartSend(cartId) {
+  const resp = await fetch(`${API_BASE}/carts/${encodeURIComponent(cartId)}/send`, {
+    method: 'POST',
+    headers: await authHeaders(),
+  })
+  await assertOk(resp, 'Send cart')
+  return resp.json()
+}
+
+// Delete the cart (our database + the raw email in R2). 404 = already gone: treated
+// as deleted ({deleted: true, already_gone: true}).
+export async function deleteCart(cartId) {
+  const resp = await fetch(`${API_BASE}/carts/${encodeURIComponent(cartId)}`, {
+    method: 'DELETE',
+    headers: await authHeaders(),
+  })
+  if (resp.status === 404) return { deleted: true, id: cartId, already_gone: true }
+  await assertOk(resp, 'Delete cart')
+  return resp.json()
+}

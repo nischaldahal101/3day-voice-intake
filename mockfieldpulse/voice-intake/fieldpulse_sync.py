@@ -6,6 +6,9 @@ Entry points (both never raise):
     sync_vendor_materials(customer_id, customer=None, documents=None, manual=False)
         -> summary dict   (stage P2: one combined vendor material list per customer;
                            see "Vendor materials list" near the end of this file)
+    sync_cart(user_id, cart_id, manual=False)
+        -> summary dict   (stage E4: a linked Ferguson cart -> ONE draft estimate + ONE
+                           material list; see "Ferguson cart" at the end of this file)
 
 The worker calls it after the transcript + extraction are already saved on the
 job row (docs/FIELDPULSE_API.md §11 "save first"). Everything else is hidden
@@ -1081,13 +1084,14 @@ class _OutcomeUnknown(Exception):
     """The request may have reached FieldPulse (never auto-retry)."""
 
 
-# The one PUT this module makes: replacing OUR vendor material list (stage P2). The same
-# path is the one GET it makes (F-88): reading that list's header after a failed PUT.
-_VENDOR_PUT_PATH = re.compile(r"/material-lists/[1-9][0-9]{0,17}")
+# The only PUTs this module makes: replacing OUR vendor material list (stage P2) and, E4,
+# OUR cart estimate / cart material list. The same paths are the only GETs it makes (F-88):
+# reading that record's header after a failed PUT.
+_VENDOR_PUT_PATH = re.compile(r"/(?:material-lists|estimates)/[1-9][0-9]{0,17}")
 
 
 def _send(request, cfg):
-    """POST (or PUT / body-less GET of our vendor list) to the real FieldPulse write
+    """POST (or PUT / body-less GET of our own list or estimate) to the real FieldPulse write
     target. Returns (http_status, parsed JSON or text). Only reachable through the
     send gate."""
     if cfg["mode"] not in SEND_MODES or not cfg["base_url"] or not cfg["api_key"]:
@@ -1096,7 +1100,7 @@ def _send(request, cfg):
     ours = bool(_VENDOR_PUT_PATH.fullmatch(request["path"]))
     if not (method == "POST" or (method == "PUT" and ours)
             or (method == "GET" and ours and request.get("body") is None)):
-        raise _NotDelivered("only POST (and PUT / GET of our vendor material list) is used")
+        raise _NotDelivered("only POST (and PUT / GET of our own list or estimate) is used")
     import requests  # local import: dry_run/off never touch the HTTP stack
     headers = {"x-api-key": cfg["api_key"], "Accept": "application/json"}
     try:
@@ -1595,16 +1599,21 @@ def _vendor_attempt(cfg, cid, customer, docs, row, manual):
 
 
 def _vendor_list_gone(cid, list_id, int_cid, cfg):
-    """F-88: after a PUT of our list failed with an answer (not 404), ONE read-only GET of
-    that list's header through the same write target. True only on clear evidence: GET 404,
-    or a 2xx header with `deleted_at` set (FieldPulse soft-deletes; a PUT on a deleted list
-    answers 500) or another customer's `customer_id`. Anything else (live list, error, no
-    answer, odd shape) -> False: keep 'failed', never risk a second list. Never raises."""
+    return _record_gone(cid, f"/material-lists/{int(list_id)}", int_cid, cfg)
+
+
+def _record_gone(cid, path, int_cid, cfg):
+    """F-88: after a PUT of our list (or, E4, our estimate) failed with an answer (not 404),
+    ONE read-only GET of that record's header through the same write target. True only on
+    clear evidence: GET 404, or a 2xx header with `deleted_at` set (FieldPulse soft-deletes
+    lists; a PUT on a deleted list answers 500; UNVERIFIED for estimates, same rule assumed)
+    or another customer's `customer_id`. Anything else (live record, error, no answer, odd
+    shape) -> False: keep 'failed', never risk a second record. Never raises."""
+    list_id = path.rsplit("/", 1)[-1]
     try:
-        status, payload = _send({"method": "GET", "path": f"/material-lists/{int(list_id)}",
-                                 "body": None}, cfg)
+        status, payload = _send({"method": "GET", "path": path, "body": None}, cfg)
     except Exception as exc:  # noqa: BLE001 — _NotDelivered / _OutcomeUnknown / anything
-        logger.info("[%s] vendor list check: no answer (%s)", cid, type(exc).__name__)
+        logger.info("[%s] record check: no answer (%s)", cid, type(exc).__name__)
         return False
     gone, why = False, "exists or unclear"
     if status == 404:
@@ -1618,7 +1627,8 @@ def _vendor_list_gone(cid, list_id, int_cid, cfg):
             gone, why = True, "deleted"
         elif _int_id(owner) is not None and _int_id(owner) != int_cid:
             gone, why = True, "another customer's list"
-    logger.info("[%s] vendor list %s check: HTTP %s, %s", cid, list_id, status, why)
+    logger.info("[%s] %s check: HTTP %s, %s", cid, path.split("/")[1] + "/" + list_id,
+                status, why)
     return gone
 
 
@@ -1646,3 +1656,341 @@ def _vendor_send(cid, request, cfg, manual):
         report(message=f"FieldPulse vendor list failed (HTTP {status_code})", level="warning",
                step="vendor_list", http_status=status_code, mode=cfg["mode"], manual=manual)
     return status_code, payload, _error_text(status_code, payload)
+
+
+# --- Ferguson cart -> draft estimate + material list (stage E4) ------------------------
+#
+# sync_cart(user_id, cart_id, manual=False) -> summary   (the worker's
+# send_cart_to_fieldpulse; never raises). One cart = ONE draft estimate (POST /estimates,
+# never a status_id: FieldPulse's default 1793986 is the draft) + ONE material list
+# (POST /material-lists "Ferguson cart: <project>"), the same lines in both
+# (ferguson_cart.build_estimate_body / build_material_list_body). Records live in the
+# SLOT (user, linked customer, normalized project name), jobs.cart_fieldpulse_slots, so a
+# re-forwarded cart for the same project REPLACES both with a full PUT (no second draft)
+# and the older cart is marked superseded_by the newer one. Safety = the vendor list's:
+#   - lease per slot (two syncs never race; a busy run flags a follow-up for the newest cart)
+#   - per target: before EVERY POST one write sets create_pending + clears the old id; only
+#     a POST answered with an id clears it; while set, automatic syncs send nothing
+#     ("Needs attention", manual Send only)
+#   - held: recorded in dry_run -> automatic syncs never send; only a manual Send releases
+#   - PUT 404 -> POST; other PUT error -> ONE GET of that record: 404 / deleted_at / other
+#     customer -> POST, else failed (deleted estimates: UNVERIFIED, same rule as lists)
+#   - a target already written with THIS cart's lines is never re-sent (partial failure:
+#     a retry sends only the failed part)
+#   - before every request the cart becomes 'sent' only if still linked to that customer
+#     (no relink afterwards; a relink racing the send stops the send)
+# Never sent: ok=false, any line without a readable quantity/price/model, a superseded cart,
+# a cart whose slot already follows a NEWER cart, a non-FieldPulse customer id.
+
+CART_TARGETS = (("estimate", "estimate", "/estimates"),
+                ("material_list", "list", "/material-lists"))
+CART_NOT_READ = ("Not sent: this cart couldn't be read completely. Fix the project in "
+                 "Ferguson and forward the cart again.")
+CART_CREATE_PENDING = ("Needs attention: a create may not have finished. Check the "
+                       "customer's estimates and material lists in FieldPulse (delete a "
+                       "duplicate 'Ferguson cart' draft if there is one), then press Retry.")
+CART_HELD = ("Held: recorded during a dry run, so it is never sent automatically. "
+             "Press Send to send it.")
+CART_SUPERSEDED = "Replaced by a newer cart for this project. Nothing was sent for this cart."
+CART_RELINKED = "The cart's customer changed or it was deleted, so nothing was sent."
+
+
+def sync_cart(user_id, cart_id, manual=False):
+    """Build and (when the mode allows) send one linked cart. NEVER raises; returns a
+    summary {status, message, ..., follow_up?: {cart_id, manual}}."""
+    try:
+        out = _sync_cart(user_id, cart_id, manual)
+    except Exception as exc:  # noqa: BLE001 — never fails the worker job loudly
+        logger.exception("[%s] cart sync crashed", cart_id)
+        report(exc, "Cart FieldPulse sync crashed", job_id=cart_id, manual=manual)
+        out = {"status": "failed", "mode": None, "cart_id": cart_id,
+               "message": "The FieldPulse send hit an internal error. The cart is saved."}
+    out.setdefault("manual", bool(manual))
+    return out
+
+
+def cart_send_problem(cart):
+    """Why this cart can't be sent as it is (a readable sentence), or None."""
+    import ferguson_cart
+    if not cart.get("ok"):
+        return CART_NOT_READ
+    try:
+        ferguson_cart.build_estimate_body(ferguson_cart.stored_cart(cart.get("parsed")), 1, 1)
+    except ValueError as exc:
+        return f"Not sent: {exc} Fix the cart in Ferguson and forward it again."
+    if not ferguson_cart.project_key(cart.get("project_name")):
+        return "Not sent: the cart has no usable project name. Forward it again."
+    return None
+
+
+def _cart_record(status, message, mode, manual, error=None, **extra):
+    now = datetime.now(timezone.utc).isoformat()
+    record = {"status": status, "message": message, "error": error, "mode": mode,
+              "manual": bool(manual), "at": now, **extra}
+    steps = extra.get("steps") or {}
+    entry = {"at": now, "status": status, "mode": mode, "manual": bool(manual),
+             "error": error[:300] if error else None,
+             "steps": {k: {"status": v.get("status"), "method": (v.get("request") or {}).get("method"),
+                           "path": (v.get("request") or {}).get("path"),
+                           "http_status": v.get("http_status")} for k, v in steps.items()}}
+    return record, entry
+
+
+def _sync_cart(user_id, cart_id, manual):
+    import ferguson_cart
+    cfg = _config()
+    mode = cfg["mode"]
+    base = {"cart_id": cart_id, "mode": mode}
+    if mode == "off":
+        return {**base, "status": "off",
+                "message": "FieldPulse sync is off. Nothing was sent to FieldPulse."}
+    store = _store()
+    cart = store.get_ferguson_cart(user_id, cart_id)
+    if cart is None:
+        return {**base, "status": "skipped", "message": "The cart no longer exists."}
+
+    def refuse(status, message, error=None):
+        record, entry = _cart_record(status, message, mode, manual, error=error or message)
+        store.set_cart_fieldpulse(user_id, cart_id, record, entry)
+        return {**base, "status": status, "message": message, "error": error or message}
+
+    cid = cart.get("fieldpulse_customer_id")
+    if cart.get("status") not in ("linked", "sent") or not cid:
+        return refuse("skipped", "Not sent: link a FieldPulse customer first.")
+    if cart.get("superseded_by"):
+        return refuse("superseded", CART_SUPERSEDED)
+    int_cid = _int_id(cid)
+    if int_cid is None:
+        return refuse("skipped", f"Not sent: {VENDOR_NOT_LINKED}.")
+    problem = cart_send_problem(cart)
+    if problem:
+        return refuse("refused", problem)
+    item_id = cfg.get("material_item_id")
+    if not item_id:
+        err = f"{MATERIAL_ITEM_MISSING} (FieldPulse needs an item on every line)"
+        return refuse("needs_config", f"Not sent: {err}.", err)
+
+    parsed = ferguson_cart.stored_cart(cart.get("parsed"))
+    bodies = {"estimate": ferguson_cart.build_estimate_body(parsed, int_cid, item_id),
+              "material_list": ferguson_cart.build_material_list_body(parsed, int_cid, item_id)}
+    if "status_id" in bodies["estimate"]:          # the estimate always stays a draft
+        raise ValueError("estimate body must not carry status_id")
+    key = ferguson_cart.project_key(cart.get("project_name"))
+    slot = store.claim_cart_slot(user_id, str(cid), key, cart_id, manual)
+    if slot is None:
+        record, entry = _cart_record(
+            "queued", "Another send for this project is running; this cart goes next.",
+            mode, manual)
+        store.set_cart_fieldpulse(user_id, cart_id, record, entry)
+        return {**base, "status": "queued", "message": record["message"]}
+    manual = manual or bool(slot.get("resync_manual"))
+    ctx = {"user_id": user_id, "cart_id": cart_id, "customer_id": str(cid), "key": key,
+           "int_cid": int_cid}
+    try:
+        updates, record, entry, supersede = _cart_attempt(cfg, ctx, cart, slot, bodies, manual)
+    except Exception:
+        # Release the lease; flags (create_pending / held / ids) untouched.
+        rec, ent = _cart_record("failed", "Internal error while building or sending.", mode,
+                                manual, error="Internal error while building or sending")
+        store.finish_cart_slot(user_id, str(cid), key, {}, cart_id, rec, ent)
+        raise
+    again, again_manual, again_cart = store.finish_cart_slot(
+        user_id, str(cid), key, updates, cart_id, record, entry, supersede)
+    summary = {**base, "status": record["status"], "message": record["message"],
+               "error": record.get("error"), "manual": manual,
+               "estimate_id": record.get("estimate_id"), "list_id": record.get("list_id"),
+               "steps": {k: v.get("status") for k, v in (record.get("steps") or {}).items()}}
+    if again:
+        summary["follow_up"] = {"cart_id": again_cart or cart_id, "manual": again_manual}
+    return summary
+
+
+def _newer(a, b):
+    """True when cart a arrived after cart b (received_at, then id, as stored)."""
+    return (str(a.get("received_at") or ""), a["id"]) > (str(b.get("received_at") or ""), b["id"])
+
+
+def _cart_attempt(cfg, ctx, cart, slot, bodies, manual):
+    """-> (slot updates, cart record, history entry, supersede pair or None)."""
+    store = _store()
+    mode = cfg["mode"]
+    cart_id = ctx["cart_id"]
+    supersede = None
+    owner = slot.get("cart_id")
+    if owner and owner != cart_id:
+        other = store.get_ferguson_cart(ctx["user_id"], owner)
+        if other is not None and _newer(other, cart):
+            record, entry = _cart_record("superseded", CART_SUPERSEDED, mode, manual,
+                                         error=CART_SUPERSEDED, replaced_by=owner)
+            return {}, record, entry, (cart_id, owner)
+        if other is not None:
+            supersede = (owner, cart_id)
+    updates = {"cart_id": cart_id, "mode": mode}
+    allowed, why = _send_gate(cfg, ctx["int_cid"])
+    held = bool(slot.get("held"))
+    if mode != "dry_run" and allowed and manual and held:
+        updates["held"] = False          # the explicit manual Send releases the dry-run hold
+    now = datetime.now(timezone.utc).isoformat()
+    steps = {}
+    aborted = dispatched = False
+    for target, col, base_path in CART_TARGETS:
+        tid = slot.get(f"{col}_id")
+        pending = bool(slot.get(f"{col}_create_pending"))
+        body = bodies[target]
+        post = {"method": "POST", "path": base_path, "body": body}
+        request = ({"method": "PUT", "path": f"{base_path}/{int(tid)}", "body": body}
+                   if tid else post)
+        stamp = {"mode": mode, "at": now}
+        if (slot.get(f"{col}_status") == "sent" and slot.get(f"{col}_cart_id") == cart_id
+                and tid and not pending):
+            prior = ((cart.get("fieldpulse") or {}).get("steps") or {}).get(target)
+            prior = prior if isinstance(prior, dict) else {}
+            steps[target] = {**prior, "status": "sent", "id": tid,
+                             "message": "Already sent with this cart's lines (not sent again)."}
+            continue
+        if aborted:
+            steps[target] = {"status": "skipped", "message": CART_RELINKED, "id": tid,
+                             "request": None}
+            continue
+        if mode == "dry_run":
+            updates["held"] = True
+            updates[f"{col}_status"] = "dry_run"
+            verb = "replace" if tid else "create"
+            steps[target] = {"status": "dry_run", "id": tid, "request": {**request, **stamp},
+                             "message": f"Dry run: would {verb} it. Nothing sent."}
+            continue
+        if not allowed:
+            steps[target] = {"status": "skipped", "id": tid, "request": {**request, **stamp},
+                             "message": f"Not sent: {_not_sent_reason(cfg, why)}."}
+            continue
+        if not manual and held:
+            steps[target] = {"status": "held", "id": tid, "request": {**request, **stamp},
+                             "message": CART_HELD}
+            continue
+        if not manual and pending:
+            steps[target] = {"status": "unknown", "id": None, "request": {**request, **stamp},
+                             "message": CART_CREATE_PENDING, "error": CART_CREATE_PENDING}
+            continue
+        step = _cart_send_target(cfg, ctx, col, request, post, tid, manual)
+        step["request"] = {**step["request"], **stamp} if step.get("request") else None
+        if step.pop("aborted", False):
+            aborted = True
+        else:
+            dispatched = True
+        steps[target] = step
+        if step["status"] == "sent":
+            updates.update({f"{col}_id": step["id"], f"{col}_status": "sent",
+                            f"{col}_cart_id": cart_id, f"{col}_create_pending": False})
+        elif step.get("posted"):
+            # A POST went out without an id: create_pending stays (set before dispatch).
+            updates.update({f"{col}_id": None, f"{col}_status": step["status"]})
+        elif step["status"] in ("failed", "unknown"):
+            updates[f"{col}_status"] = step["status"]
+        step.pop("posted", None)
+
+    if aborted and not dispatched:
+        # The cart was relinked / deleted before anything went out: leave the slot as it was.
+        updates, supersede = {}, None
+    statuses = [s["status"] for s in steps.values()]
+    if any(s in ("failed", "unknown") for s in statuses):
+        status = "unknown" if "unknown" in statuses else "failed"
+        bad = next(s for s in steps.values() if s["status"] in ("failed", "unknown"))
+        message = ("Needs attention: " if not bad["message"].startswith("Needs attention")
+                   else "") + bad["message"]
+        if any(s == "sent" for s in statuses):
+            message += " (the other part was sent; Retry sends only what failed)"
+    elif all(s == "sent" for s in statuses):
+        status, message = "sent", "Sent: draft estimate and material list are in FieldPulse."
+        if supersede:
+            message = ("Sent: replaced the earlier cart's draft estimate and material list "
+                       "in FieldPulse.")
+    elif "dry_run" in statuses:
+        status = "dry_run"
+        message = "Dry run: nothing sent to FieldPulse. The exact requests are recorded."
+    elif "held" in statuses:
+        status, message = "held", CART_HELD
+    else:
+        status = "skipped"
+        message = next((s["message"] for s in steps.values() if s["status"] == "skipped"),
+                       "Not sent.")
+    error = None if status in ("sent", "dry_run") else message
+    est_id = updates.get("estimate_id", slot.get("estimate_id"))
+    list_id = updates.get("list_id", slot.get("list_id"))
+    record, entry = _cart_record(
+        status, message, mode, manual, error=error, estimate_id=est_id, list_id=list_id,
+        steps={k: {kk: v.get(kk) for kk in ("status", "message", "error", "id", "request",
+                                            "response", "http_status")}
+               for k, v in steps.items()},
+        replaces=supersede[0] if supersede else None)
+    return updates, record, entry, supersede
+
+
+def _cart_send_target(cfg, ctx, col, request, post, tid, manual):
+    """One target: PUT (404 / gone -> POST) or POST. -> step dict {status, message, id,
+    request, response, http_status, error?, posted?, aborted?}."""
+    store = _store()
+    label = "estimate" if col == "estimate" else "material list"
+    cid = ctx["cart_id"]
+
+    def mark(req):
+        return store.mark_cart_sending(ctx["user_id"], cid, ctx["customer_id"], ctx["key"],
+                                       col, req["method"] == "POST", req, cfg["mode"])
+
+    def dispatch(req):
+        try:
+            status_code, payload = _send(req, cfg)
+        except _NotDelivered as exc:
+            report(message="FieldPulse cart send not delivered", level="warning",
+                   step=f"cart_{col}", mode=cfg["mode"], manual=manual)
+            return None, None, str(exc)
+        except _OutcomeUnknown:
+            report(message="FieldPulse cart send, outcome unknown", level="warning",
+                   step=f"cart_{col}", mode=cfg["mode"], manual=manual)
+            return None, None, "unknown"
+        ok = 200 <= status_code < 300 and not (isinstance(payload, dict)
+                                               and payload.get("error") not in (None, False))
+        logger.info("[%s] FieldPulse cart %s %s -> HTTP %s", cid, label, req["method"],
+                    status_code)
+        if ok:
+            return status_code, payload, None
+        if status_code != 404:
+            report(message=f"FieldPulse cart send failed (HTTP {status_code})", level="warning",
+                   step=f"cart_{col}", http_status=status_code, mode=cfg["mode"], manual=manual)
+        return status_code, payload, _error_text(status_code, payload)
+
+    if not mark(request):
+        return {"status": "skipped", "message": CART_RELINKED, "id": tid, "request": request,
+                "aborted": True}
+    status_code, payload, err = dispatch(request)
+    if request["method"] == "PUT":
+        if (status_code is not None and status_code != 404 and not 200 <= status_code < 300
+                and _record_gone(cid, request["path"], ctx["int_cid"], cfg)):
+            status_code = 404        # deleted in FieldPulse (soft delete) = gone
+        if status_code != 404:
+            response = _clip_response(status_code, payload) if status_code is not None else None
+            if err:
+                msg = (f"FieldPulse {label} update failed"
+                       + (" (no answer)" if err == "unknown" else f": {err}") + ".")
+                return {"status": "failed", "message": msg, "error": msg, "id": tid,
+                        "request": request, "response": response, "http_status": status_code}
+            return {"status": "sent", "message": f"Replaced the {label} in FieldPulse.",
+                    "id": tid, "request": request, "response": response,
+                    "http_status": status_code}
+        logger.info("[%s] cart %s %s gone in FieldPulse: creating a new one", cid, label, tid)
+        request = post
+        if not mark(request):         # create_pending set + old id cleared, in one write
+            return {"status": "skipped", "message": CART_RELINKED, "id": None,
+                    "request": request, "aborted": True}
+        status_code, payload, err = dispatch(request)
+    response = _clip_response(status_code, payload) if status_code is not None else None
+    new_id = None if err else _int_id(_record_id(payload))
+    if new_id is None:
+        why_ = ("no answer" if err == "unknown" else err if err
+                else f"FieldPulse answered without an {label} id" if label == "estimate"
+                else f"FieldPulse answered without a {label} id")
+        msg = f"{label.capitalize()} not confirmed ({why_}). {CART_CREATE_PENDING}"
+        return {"status": "unknown" if err in ("unknown", None) else "failed",
+                "message": msg, "error": msg, "id": None, "request": request,
+                "response": response, "http_status": status_code, "posted": True}
+    return {"status": "sent", "message": f"Created the {label} in FieldPulse.", "id": new_id,
+            "request": request, "response": response, "http_status": status_code}

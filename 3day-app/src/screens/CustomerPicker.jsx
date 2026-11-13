@@ -10,7 +10,8 @@ function addedLabel(createdAt) {
 
 // Read-only picker. The list keeps the server's order (newest added first);
 // search only filters it. Customers are created in FieldPulse, not here.
-export default function CustomerPicker({ onBack, onSelect }) {
+// `eyebrow`: the small line above the title (default "Step 1 of 2"; carts pass their own).
+export default function CustomerPicker({ onBack, onSelect, eyebrow = 'Step 1 of 2' }) {
   const [customers, setCustomers] = useState(null) // null = loading
   const [error, setError] = useState(null)
   const [query, setQuery] = useState('')
@@ -57,7 +58,7 @@ export default function CustomerPicker({ onBack, onSelect }) {
           ←
         </button>
         <div className="topbar-text">
-          <span className="topbar-eyebrow">Step 1 of 2</span>
+          <span className="topbar-eyebrow">{eyebrow}</span>
           <h2 className="topbar-title">Choose a customer</h2>
         </div>
       </header>

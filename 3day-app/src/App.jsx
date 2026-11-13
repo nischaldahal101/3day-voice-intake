@@ -10,6 +10,7 @@ import {
 import { clearActiveJob, forgetJob, getActiveJob, setActiveJob } from './lib/activeJob.js'
 import { parseAdminHash } from './lib/admin.js'
 import { parseDocumentsHash } from './lib/documents.js'
+import { parseCartsHash } from './lib/carts.js'
 import Home from './screens/Home.jsx'
 import CustomerPicker from './screens/CustomerPicker.jsx'
 import Capture from './screens/Capture.jsx'
@@ -22,14 +23,18 @@ import DocumentCustomers from './screens/DocumentCustomers.jsx'
 import DocumentCustomer from './screens/DocumentCustomer.jsx'
 import DocumentUpload from './screens/DocumentUpload.jsx'
 import DocumentDetail from './screens/DocumentDetail.jsx'
+import CartList from './screens/CartList.jsx'
+import CartDetail from './screens/CartDetail.jsx'
 
 const isAdminScreen = (s) => s === 'admin' || s === 'admin-detail'
 // Vendor documents (P1b + P2): customers, customer page, pick customer, upload, detail.
 const isDocumentsScreen = (s) => typeof s === 'string' && s.startsWith('documents')
+// Ferguson carts (E2): list + detail.
+const isCartsScreen = (s) => s === 'carts' || s === 'carts-detail'
 // Screens a finishing background consultation must never pull the user out of.
-const isBrowseScreen = (s) => isAdminScreen(s) || isDocumentsScreen(s)
+const isBrowseScreen = (s) => isAdminScreen(s) || isDocumentsScreen(s) || isCartsScreen(s)
 const isWideScreen = (s) => isAdminScreen(s) || s === 'documents' || s === 'documents-detail'
-  || s === 'documents-customer'
+  || s === 'documents-customer' || isCartsScreen(s)
 
 // The Consultations screens (internally 'admin' / 'admin-detail') have their
 // own URL (#admin, #admin/<job_id>; #consultations[/<id>] also accepted) so Mike can
@@ -44,7 +49,8 @@ function replaceAdminHash(hash) {
   window.history.replaceState(null, '', window.location.pathname + window.location.search + hash)
 }
 function clearAdminHash() {
-  if (parseAdminHash(window.location.hash) || parseDocumentsHash(window.location.hash)) {
+  const h = window.location.hash
+  if (parseAdminHash(h) || parseDocumentsHash(h) || parseCartsHash(h)) {
     window.history.pushState(null, '', window.location.pathname + window.location.search)
   }
 }
@@ -92,6 +98,7 @@ export default function App() {
   const [docCustomerId, setDocCustomerId] = useState(null) // open customer page (#documents/c/<id>)
   // Customer page that the upload / document detail screens return to (null = the customers list).
   const [docReturn, setDocReturn] = useState(null)
+  const [cartId, setCartId] = useState(null)            // open Ferguson cart (#carts/<id>)
 
   const pollTimerRef = useRef(null)
   const screenRef = useRef(screen)
@@ -161,6 +168,7 @@ export default function App() {
   useEffect(() => {
     const route = parseAdminHash(window.location.hash)
     const docRoute = route ? null : parseDocumentsHash(window.location.hash)
+    const cartRoute = route || docRoute ? null : parseCartsHash(window.location.hash)
     if (route) {
       setAdminJobId(route.view === 'detail' ? route.jobId : null)
       setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
@@ -169,13 +177,16 @@ export default function App() {
       setDocCustomerId(docRoute.view === 'customer' ? docRoute.customerId : null)
       setScreen(docRoute.view === 'detail' ? 'documents-detail'
         : docRoute.view === 'customer' ? 'documents-customer' : 'documents')
+    } else if (cartRoute) {
+      setCartId(cartRoute.view === 'detail' ? cartRoute.cartId : null)
+      setScreen(cartRoute.view === 'detail' ? 'carts-detail' : 'carts')
     }
     const active = getActiveJob()
     if (active && active.job_id) {
       if (active.customer) setCustomer(active.customer)
       setActiveJobId(active.job_id)
       setPhase('queued')
-      if (!route && !docRoute) setScreen('processing')
+      if (!route && !docRoute && !cartRoute) setScreen('processing')
       startPolling(active.job_id)
     }
     return stopPolling
@@ -186,7 +197,11 @@ export default function App() {
     const onHash = () => {
       const route = parseAdminHash(window.location.hash)
       const docRoute = route ? null : parseDocumentsHash(window.location.hash)
-      if (route) {
+      const cartRoute = route || docRoute ? null : parseCartsHash(window.location.hash)
+      if (cartRoute) {
+        setCartId(cartRoute.view === 'detail' ? cartRoute.cartId : null)
+        setScreen(cartRoute.view === 'detail' ? 'carts-detail' : 'carts')
+      } else if (route) {
         setAdminJobId(route.view === 'detail' ? route.jobId : null)
         setScreen(route.view === 'detail' ? 'admin-detail' : 'admin')
       } else if (docRoute) {
@@ -286,6 +301,27 @@ export default function App() {
     else openDocuments()
   }, [docReturn, openDocumentCustomer, openDocuments])
 
+  // ---- Ferguson carts (#carts, #carts/<cart_id>) ----
+
+  const openCarts = useCallback(() => {
+    setCartId(null)
+    setScreen('carts')
+    setAdminHash('#carts')
+  }, [])
+
+  const openCart = useCallback((id) => {
+    setCartId(id)
+    setScreen('carts-detail')
+    setAdminHash(`#carts/${id}`)
+  }, [])
+
+  // After a delete: back to a fresh list; replace so browser Back skips the deleted cart.
+  const onCartDeleted = useCallback(() => {
+    setCartId(null)
+    setScreen('carts')
+    replaceAdminHash('#carts')
+  }, [])
+
   // ---- reset / navigation ---------------------------------------------
 
   const reset = useCallback(() => {
@@ -373,6 +409,7 @@ export default function App() {
           onStart={() => setScreen('pick')}
           onConsultations={openAdmin}
           onDocuments={openDocuments}
+          onCarts={openCarts}
         />
       )}
       {screen === 'pick' && (
@@ -439,6 +476,10 @@ export default function App() {
         <DocumentUpload customer={docCustomer} step={docReturn ? null : 'Step 2 of 2'}
           onBack={() => (docReturn ? openDocumentCustomer(docReturn) : setScreen('documents-pick'))}
           onUploaded={backToDocuments} />
+      )}
+      {screen === 'carts' && <CartList onBack={leaveAdmin} onOpen={openCart} />}
+      {screen === 'carts-detail' && cartId && (
+        <CartDetail key={cartId} cartId={cartId} onBack={openCarts} onDeleted={onCartDeleted} />
       )}
       {screen === 'documents-detail' && docId && (
         <DocumentDetail key={docId} docId={docId} onBack={leaveDocumentDetail} onDeleted={backToDocuments} />

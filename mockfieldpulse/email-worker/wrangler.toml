@@ -1,0 +1,14 @@
+name = "voiceconsult-cart-email"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+# Email-only Worker: no public web URL needed (and none wanted).
+workers_dev = false
+preview_urls = false
+
+[vars]
+INBOUND_URL = "https://api.voiceconsult.app/inbound/cart"
+DEBUG_AUTH_RESULTS = "1"   # FIRST REAL TEST ONLY: comment out again and redeploy afterwards
+
+# The shared secret is NEVER in this file. Set it with:
+#   npx wrangler secret put INBOUND_EMAIL_SECRET
+# (the same value as INBOUND_EMAIL_SECRET on the Render orchestrator)

@@ -1524,6 +1524,10 @@ code { font-size: 12px; overflow-wrap: anywhere; }
 .fp-list-dry_run { background: #e8eef7; color: #2f4f7a; }
 .fp-list-attention { background: #fbe3e1; color: #a0322a; }
 .fp-list-sending { background: #fbf2cf; color: #856404; }
+.fp-list-queued { background: #fbf2cf; color: #856404; }   /* E4 carts */
+.fp-list-held { background: #e8eef7; color: #2f4f7a; }
+.fp-list-refused { background: #fbe3e1; color: #a0322a; }
+.fp-list-superseded { background: #eceae6; color: #55524c; }
 .doc-flag {
   display: inline-block; margin: 0 4px 2px 0; padding: 1px 6px; border-radius: var(--radius-sm);
   background: #fbf2cf; color: #856404; font-size: 12px; white-space: nowrap;
@@ -1531,3 +1535,16 @@ code { font-size: 12px; overflow-wrap: anywhere; }
 .doc-section-title { margin: 12px 0 4px; font-size: 15px; }
 .doc-list-notes { white-space: pre-wrap; font-size: 13px; color: var(--text-secondary); margin: 0; }
 .doc-cust-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+
+/* ---- Ferguson carts (stage E2) ---- */
+.cart-address-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }
+.cart-address-text {
+  font-size: 16px; font-weight: 600; padding: 6px 10px; border-radius: var(--radius-sm);
+  background: var(--bg); border: 1px solid var(--border); overflow-wrap: anywhere;
+}
+.cart-tools { margin-top: 12px; }
+.cart-status { text-transform: none; letter-spacing: 0; white-space: nowrap; }
+.cart-status-needs_customer { background: #fbf2cf; color: #856404; }
+@media (min-width: 760px) {
+  .cart-table .admin-tr { grid-template-columns: 170px minmax(140px, 1fr) 80px 120px minmax(180px, 1fr); }
+}

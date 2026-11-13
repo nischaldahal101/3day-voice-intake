@@ -87,3 +87,25 @@ def enqueue_vendor_materials(customer_id: str, manual: bool = False, customer: d
     logger.info("Enqueued vendor material sync for customer %s (manual=%s, rq id=%s)",
                 customer_id, manual, rq_job.id)
     return rq_job
+
+
+def enqueue_cart_match(user_id: str, cart_id: str):
+    """Queue matching one Ferguson cart to a FieldPulse customer by its project name
+    (worker.match_cart_customer -> carts_panel.match_cart; a READ through
+    customer_source, never a FieldPulse write). Queued after an inbound cart is stored
+    and by "Try matching again". 90 s: the customer list read has a 20 s budget."""
+    rq_job = consultation_queue.enqueue("worker.match_cart_customer", user_id, cart_id,
+                                        job_timeout=90)
+    logger.info("Enqueued cart match for %s (rq id=%s)", cart_id, rq_job.id)
+    return rq_job
+
+
+def enqueue_cart_send(user_id: str, cart_id: str, manual: bool = False):
+    """Queue sending one LINKED Ferguson cart to FieldPulse as a draft estimate + a
+    material list (worker.send_cart_to_fieldpulse -> fieldpulse_sync.sync_cart; the
+    FIELDPULSE_WRITE_MODE gate decides). Queued after a cart becomes linked and by the
+    manual Send/Retry. 300 s: two targets x (PUT + GET + POST, 20 s each) + DB."""
+    rq_job = consultation_queue.enqueue("worker.send_cart_to_fieldpulse", user_id, cart_id,
+                                        manual, job_timeout=300)
+    logger.info("Enqueued cart send for %s (manual=%s, rq id=%s)", cart_id, manual, rq_job.id)
+    return rq_job
