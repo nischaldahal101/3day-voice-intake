@@ -7,7 +7,7 @@ preview_urls = false
 
 [vars]
 INBOUND_URL = "https://api.voiceconsult.app/inbound/cart"
-DEBUG_AUTH_RESULTS = "1"   # FIRST REAL TEST ONLY: comment out again and redeploy afterwards
+# DEBUG_AUTH_RESULTS = "1"   # first real test only (see README); remove afterwards
 
 # The shared secret is NEVER in this file. Set it with:
 #   npx wrangler secret put INBOUND_EMAIL_SECRET

@@ -486,6 +486,14 @@ CREATE TABLE IF NOT EXISTS cart_fieldpulse_slots (
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (clerk_user_id, customer_id, project_key)
 );
+-- R4 (F-114/F-115, 2026-11-13): a supersede becomes PERMANENT once the newer cart made a
+-- real (non-dry-run) request for the slot. superseded_final_customer = the customer both
+-- carts were on when that happened (written by mark_cart_sending in the same transaction
+-- as the request attempt); see _LIVE_SUPERSEDED. writer_* = the NEWEST cart that ever made
+-- a real request for the slot; an older cart never sends into it again (mark refuses).
+ALTER TABLE ferguson_carts ADD COLUMN IF NOT EXISTS superseded_final_customer TEXT;
+ALTER TABLE cart_fieldpulse_slots ADD COLUMN IF NOT EXISTS writer_cart_id TEXT;
+ALTER TABLE cart_fieldpulse_slots ADD COLUMN IF NOT EXISTS writer_received_at TIMESTAMPTZ;
 """
 
 
@@ -1538,6 +1546,37 @@ def get_cart_alias_user(alias: str) -> str | None:
     return row["clerk_user_id"] if row else None
 
 
+# F-109 invariant (derived, never trusted as stored): cart C is "replaced" only while the
+# cart named in C.superseded_by still exists for the same user, both carts are linked/sent,
+# and both are linked to the SAME customer. (Project names never change after a cart is
+# stored, and supersede is only ever written between carts of the same project key, so
+# same customer = same slot.) The stored column is a hint written by finish_cart_slot;
+# every read below returns this live value instead, so a replacement that is relinked to
+# another customer, unlinked or deleted stops blocking the older cart (no stale state to
+# repair, and a relink racing finish_cart_slot can't leave a cross-customer block).
+#
+# R4 product rule (Nick, 2026-11-13; F-114/F-115): once the NEWER cart actually wrote, or
+# tried to write, to FieldPulse for the slot (any non-dry-run request, incl. a POST whose
+# answer was lost), the older cart is replaced FOR GOOD, even if the newer cart is later
+# deleted or relinked: the estimate/list hold the newer lines (or an unresolved create), so
+# the older cart must never send into them again. To update the estimate the user forwards
+# the cart again. mark_cart_sending writes that in the same transaction as the attempt:
+# superseded_by = the sender, superseded_final_customer = the slot's customer. A final
+# supersede counts while the older cart is on that customer (a cart that never sent may be
+# relinked elsewhere: a different slot, not replaced there), whatever the newer cart does.
+# Until then (newer cart only linked / dry run) it stays the live F-109 value above.
+_FINAL_SUPERSEDED = """(c.superseded_by IS NOT NULL AND c.superseded_final_customer IS NOT NULL
+        AND c.superseded_final_customer = c.fieldpulse_customer_id
+        AND c.status IN ('linked', 'sent'))"""
+_LIVE_SUPERSEDED = """(CASE WHEN """ + _FINAL_SUPERSEDED + """ THEN c.superseded_by ELSE
+      (SELECT n.id FROM ferguson_carts n
+      WHERE n.id = c.superseded_by AND n.clerk_user_id = c.clerk_user_id AND n.id <> c.id
+        AND n.status IN ('linked', 'sent') AND c.status IN ('linked', 'sent')
+        AND n.fieldpulse_customer_id = c.fieldpulse_customer_id) END)"""
+_CART_COLS = (f"c.*, {_LIVE_SUPERSEDED} AS superseded_live, "
+              f"{_FINAL_SUPERSEDED} AS superseded_final_live")
+
+
 def _serialize_cart(row):
     if row is None:
         return None
@@ -1562,15 +1601,19 @@ def _serialize_cart(row):
         "fieldpulse": row["fieldpulse"] if isinstance(row.get("fieldpulse"), dict) else None,
         "fieldpulse_history": (row["fieldpulse_history"]
                                if isinstance(row.get("fieldpulse_history"), list) else []),
-        "superseded_by": row.get("superseded_by"),
+        # Live value only (see _LIVE_SUPERSEDED); rows read without it (insert, delete)
+        # are never "replaced".
+        "superseded_by": row.get("superseded_live"),
+        # True = replaced for good (the newer cart really wrote; R4 rule above).
+        "superseded_final": bool(row.get("superseded_final_live")),
     }
 
 
 def find_cart_by_sha(user_id: str, raw_sha256: str) -> dict | None:
     """This user's cart for exactly these raw bytes, or None (duplicate forward)."""
     with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT * FROM ferguson_carts WHERE clerk_user_id = %s AND raw_sha256 = %s",
-                    [user_id, raw_sha256])
+        cur.execute(f"SELECT {_CART_COLS} FROM ferguson_carts c WHERE c.clerk_user_id = %s "
+                    f"AND c.raw_sha256 = %s", [user_id, raw_sha256])
         row = cur.fetchone()
     return _serialize_cart(row)
 
@@ -1632,8 +1675,8 @@ def list_ferguson_carts(user_id: str, offset: int = 0, limit: int = 50) -> dict:
                         THEN left(fieldpulse->>'status', 20) END AS fieldpulse_status,
                    CASE WHEN jsonb_typeof(fieldpulse) = 'object'
                         THEN left(fieldpulse->>'at', 40) END AS fieldpulse_at,
-                   left(superseded_by, 40) AS superseded_by
-              FROM ferguson_carts
+                   left(""" + _LIVE_SUPERSEDED + """, 40) AS superseded_by
+              FROM ferguson_carts c
              WHERE clerk_user_id = %s
              ORDER BY received_at DESC, id
             OFFSET %s LIMIT %s
@@ -1652,8 +1695,8 @@ def list_ferguson_carts(user_id: str, offset: int = 0, limit: int = 50) -> dict:
 def get_ferguson_cart(user_id: str, cart_id: str) -> dict | None:
     """One cart of THIS user, or None (another user's cart is None too)."""
     with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT * FROM ferguson_carts WHERE id = %s AND clerk_user_id = %s",
-                    [cart_id, user_id])
+        cur.execute(f"SELECT {_CART_COLS} FROM ferguson_carts c WHERE c.id = %s "
+                    f"AND c.clerk_user_id = %s", [cart_id, user_id])
         row = cur.fetchone()
     return _serialize_cart(row)
 
@@ -1687,12 +1730,11 @@ def set_cart_customer(user_id: str, cart_id: str, customer: dict | None, match: 
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE ferguson_carts
+                UPDATE ferguson_carts c
                    SET status = %s, fieldpulse_customer_id = %s, customer = %s,
                        customer_match = %s
                  WHERE id = %s AND clerk_user_id = %s AND status = ANY(%s)
-                RETURNING *
-                """,
+                RETURNING """ + _CART_COLS,
                 ["linked" if customer else "needs_customer",
                  str(customer["id"]) if customer else None,
                  Jsonb(customer) if customer else None, Jsonb(match),
@@ -1741,10 +1783,11 @@ def _serialize_slot(row):
     out = {k: row.get(k) for k in (
         "clerk_user_id", "customer_id", "project_key", "cart_id", "estimate_id",
         "estimate_status", "estimate_cart_id", "list_id", "list_status", "list_cart_id",
-        "mode", "resync_cart_id")}
+        "mode", "resync_cart_id", "writer_cart_id")}
     for k in ("estimate_create_pending", "list_create_pending", "held", "resync_manual"):
         out[k] = bool(row.get(k))
     out["updated_at"] = _iso(row.get("updated_at"))
+    out["writer_received_at"] = _iso(row.get("writer_received_at"))
     return out
 
 
@@ -1799,12 +1842,21 @@ def claim_cart_slot(user_id: str, customer_id: str, project_key: str, cart_id: s
 
 def mark_cart_sending(user_id: str, cart_id: str, customer_id: str, project_key: str,
                       target: str, post: bool, request: dict, mode: str) -> bool:
-    """Right before EVERY request to FieldPulse for a cart, in ONE transaction: the cart
-    becomes 'sent' (no relink any more) ONLY if it is still linked to `customer_id`
-    (else nothing is written and False is returned: don't send). For a POST also, like
-    the vendor list: <target>_create_pending = true + the old id cleared."""
+    """Right before EVERY real request to FieldPulse for a cart, in ONE transaction:
+      - the cart becomes 'sent' (no relink any more) ONLY if it is still linked to
+        `customer_id` (else nothing is written and False is returned: don't send);
+      - refused (False, nothing written) when a NEWER cart already made a real request for
+        this slot (writer_*): an older cart never writes over newer lines or an unresolved
+        create, even after that newer cart was deleted (F-114, defense in depth: sync_cart
+        checks the same thing first);
+      - the slot records this cart as its newest writer;
+      - R4 rule (see _LIVE_SUPERSEDED): every OLDER cart of this slot (same user, customer,
+        project key, linked/sent) becomes replaced FOR GOOD by this cart;
+      - for a POST also, like the vendor list: <target>_create_pending = true + old id cleared.
+    Only called for non-dry-run requests (a dry run never reaches here)."""
     if target not in _SLOT_TARGETS:
         raise JobError("mark_cart_sending: unknown target")
+    import ferguson_cart                      # pure module (project_key normalization)
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1816,18 +1868,48 @@ def mark_cart_sending(user_id: str, cart_id: str, customer_id: str, project_key:
                                                           'mode', %s::text)
                  WHERE id = %s AND clerk_user_id = %s AND fieldpulse_customer_id = %s
                    AND status IN ('linked', 'sent')
-                RETURNING id
+                RETURNING id, received_at
                 """,
                 [_iso_now(), mode, cart_id, user_id, customer_id])
-            if cur.fetchone() is None:
+            me = cur.fetchone()
+            if me is None:
                 conn.rollback()
                 return False
+            key = [user_id, customer_id, project_key]
+            cur.execute("SELECT writer_cart_id, writer_received_at FROM cart_fieldpulse_slots "
+                        "WHERE clerk_user_id = %s AND customer_id = %s AND project_key = %s "
+                        "FOR UPDATE", key)
+            slot = cur.fetchone()
+            if (slot and slot["writer_cart_id"] and slot["writer_cart_id"] != cart_id
+                    and (slot["writer_received_at"], slot["writer_cart_id"])
+                    > (me["received_at"], cart_id)):
+                conn.rollback()
+                logger.warning("[%s] not sent: a newer cart already wrote to this slot", cart_id)
+                return False
+            sets = ["writer_cart_id = %s", "writer_received_at = %s", "mode = %s",
+                    "updated_at = now()"]
+            params = [cart_id, me["received_at"], mode]
             if post:
-                cur.execute(
-                    f"UPDATE cart_fieldpulse_slots SET {target}_create_pending = true, "
-                    f"{target}_id = NULL, {target}_status = 'sending', mode = %s, "
-                    f"updated_at = now() WHERE clerk_user_id = %s AND customer_id = %s "
-                    f"AND project_key = %s", [mode, user_id, customer_id, project_key])
+                sets[3:3] = [f"{target}_create_pending = true", f"{target}_id = NULL",
+                             f"{target}_status = 'sending'"]
+            cur.execute(f"UPDATE cart_fieldpulse_slots SET {', '.join(sets)} WHERE "
+                        f"clerk_user_id = %s AND customer_id = %s AND project_key = %s",
+                        params + key)
+            # Older carts of this slot -> replaced for good. Project names are normalized in
+            # Python, so read the candidates (no row locks: other slots' marks never touch
+            # these rows) and let the UPDATE re-check customer/status/age.
+            cur.execute("SELECT id, project_name FROM ferguson_carts WHERE clerk_user_id = %s "
+                        "AND fieldpulse_customer_id = %s AND status IN ('linked', 'sent') "
+                        "AND id <> %s AND (received_at, id) < (%s, %s)",
+                        [user_id, customer_id, cart_id, me["received_at"], cart_id])
+            older = [r["id"] for r in cur.fetchall()
+                     if ferguson_cart.project_key(r["project_name"]) == project_key]
+            if older:
+                cur.execute("UPDATE ferguson_carts SET superseded_by = %s, "
+                            "superseded_final_customer = %s WHERE id = ANY(%s) "
+                            "AND clerk_user_id = %s AND fieldpulse_customer_id = %s "
+                            "AND status IN ('linked', 'sent') AND id <> %s",
+                            [cart_id, customer_id, older, user_id, customer_id, cart_id])
         conn.commit()
     return True
 
@@ -1868,7 +1950,10 @@ def finish_cart_slot(user_id: str, customer_id: str, project_key: str, updates: 
     """One transaction: apply `updates` to the slot (only known columns), ALWAYS release
     the lease, store the cart's record, and (supersede = (old_cart, new_cart)) mark the old
     cart superseded_by the new one. Returns (again, again_manual, again_cart_id); the
-    resync flags are NOT cleared here (the next claim consumes them)."""
+    resync flags are NOT cleared here (the next claim consumes them). The supersede
+    write only happens while the old cart is still linked/sent to `customer_id`.
+    supersede = (old, new, "final") = the R4 permanent form (new = the slot's newest real
+    writer, which may no longer exist)."""
     bad = set(updates or {}) - _SLOT_COLUMNS
     if bad:
         raise JobError("finish_cart_slot: unknown slot column")
@@ -1889,10 +1974,28 @@ def finish_cart_slot(user_id: str, customer_id: str, project_key: str, updates: 
                         params + key)
             cur.execute(f"UPDATE ferguson_carts SET {rec_sql} WHERE id = %s AND "
                         f"clerk_user_id = %s", rec_params + [cart_id, user_id])
-            if supersede:
-                old, new = supersede
+            if supersede and len(supersede) > 2 and supersede[2] == "final":
+                # R4: the slot's newest real writer is newer than this cart (it may have been
+                # deleted since): replaced for good, only while it is on this customer.
+                old, new = supersede[0], supersede[1]
+                cur.execute("UPDATE ferguson_carts SET superseded_by = %s, "
+                            "superseded_final_customer = %s WHERE id = %s "
+                            "AND clerk_user_id = %s AND id <> %s "
+                            "AND fieldpulse_customer_id = %s AND status IN ('linked', 'sent')",
+                            [new, customer_id, old, user_id, new, customer_id])
+            elif supersede:
+                # Only while the old cart still belongs to THIS slot's customer (F-109: a
+                # relink racing this run must not mark another customer's cart replaced).
+                old, new = supersede[0], supersede[1]
+                # The new cart must still be in it too; reads re-check both anyway
+                # (_LIVE_SUPERSEDED), so a relink committing after this write is harmless.
                 cur.execute("UPDATE ferguson_carts SET superseded_by = %s WHERE id = %s "
-                            "AND clerk_user_id = %s AND id <> %s", [new, old, user_id, new])
+                            "AND clerk_user_id = %s AND id <> %s "
+                            "AND fieldpulse_customer_id = %s AND status IN ('linked', 'sent') "
+                            "AND EXISTS (SELECT 1 FROM ferguson_carts n WHERE n.id = %s "
+                            "AND n.clerk_user_id = %s AND n.fieldpulse_customer_id = %s "
+                            "AND n.status IN ('linked', 'sent'))",
+                            [new, old, user_id, new, customer_id, new, user_id, customer_id])
         conn.commit()
     if not row:
         return False, False, None

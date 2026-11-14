@@ -239,6 +239,256 @@ class TestSend(Base):
         self.assertEqual(out["status"], "superseded")
         self.assertEqual((self.cart()["superseded_by"], len(self.sent)), (c2, 2))
 
+    def test_f109_relinked_cart_not_superseded_by_its_old_customer_slot(self):
+        # C1 is dry-run for customer 101 (owns that slot, still relinkable) ...
+        with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "dry_run"}):
+            self.assertEqual(self.sync(manual=True)["status"], "dry_run")
+        self.assertEqual(self.slot()["cart_id"], self.c1)
+        # ... then relinked to 102 and sent there: estimate ok, material list fails.
+        self.link(self.c1, OTHER_CID)
+        self.responses = [ok(5001), (422, {"error": True, "message": "Made-up failure"})]
+        self.assertEqual(self.sync(manual=True)["status"], "failed")
+        # A newer C2 for Testproject / customer 101 is sent by hand (releases the old hold).
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [ok(5101), ok(6101)]
+        out = self.sync(c2, manual=True)
+        self.assertEqual(out["status"], "sent")
+        self.assertIsNone(out.get("replaces"))
+        self.assertIsNone(self.cart(c2)["fieldpulse"]["replaces"])
+        self.assertIsNone(self.cart()["superseded_by"])          # C1 is NOT replaced
+        self.assertEqual(self.slot()["cart_id"], c2)
+        # C1's failed list for 102 can still be retried.
+        with self.as_user(tc.USER_A):
+            self.assertEqual(self.client.post(f"/carts/{self.c1}/send").status_code, 202)
+        self.responses = [ok(6201)]
+        out = self.sync(manual=True)
+        self.assertEqual(out["status"], "sent")
+        self.assertEqual(self.methods()[-1], ("POST", "/material-lists"))
+        self.assertEqual(self.sent[-1][2]["customer_id"], int(OTHER_CID))
+
+    def test_f109_stale_newer_owner_does_not_supersede_this_cart(self):
+        # A NEWER cart dry-run on 101 and then relinked to 102 must not block the older
+        # cart that is still on 101.
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "dry_run"}):
+            self.sync(c2, manual=True)
+        self.link(c2, OTHER_CID)
+        self.responses = [ok(5001), ok(6001)]
+        out = self.sync(manual=True)
+        self.assertEqual(out["status"], "sent")
+        self.assertIsNone(self.cart()["superseded_by"])
+        self.assertIsNone(self.cart(c2)["superseded_by"])
+
+    # F-109 (R3): superseded_by is LIVE (jobs._LIVE_SUPERSEDED): it only holds while the
+    # replacement exists and is linked/sent to the same customer. One test per path.
+    def _dry_run_pair(self):
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "dry_run"}):
+            self.assertEqual(self.sync()["status"], "dry_run")
+            self.assertEqual(self.sync(c2)["status"], "dry_run")
+        self.assertEqual(self.cart()["superseded_by"], c2)
+        return c2
+
+    def _relink(self, cart_id, cid):
+        code, body = self.post(f"/carts/{cart_id}/customer", body={"customer_id": cid},
+                               customers=[{"id": int(cid), "display_name": "Synthetic"}])
+        self.assertEqual(code, 200, body)
+        return body
+
+    def _view(self, cart_id=None):
+        with self.as_user(tc.USER_A):
+            return self.client.get(f"/carts/{cart_id or self.c1}").get_json()
+
+    def test_f109_r3_replacement_relinked_frees_the_original(self):
+        c2 = self._dry_run_pair()
+        self._relink(c2, OTHER_CID)
+        d = self._view()
+        self.assertIsNone(d["superseded_by"])
+        self.assertEqual((d["fieldpulse"]["state"], d["fieldpulse"]["can_send"],
+                          d["fieldpulse"]["replaced_by"], d["fieldpulse"]["error"]),
+                         ("dry_run", True, None, None))        # its own last record
+        with self.as_user(tc.USER_A):
+            items = self.client.get("/carts").get_json()["items"]
+        row = next(i for i in items if i["id"] == self.c1)
+        self.assertEqual((row["fieldpulse_state"], row["superseded_by"]), ("dry_run", None))
+        self.assertEqual(self.post(f"/carts/{self.c1}/send")[0], 202)
+        # The send goes to the 101 slot C2 left (released by the manual send).
+        self.responses = [ok(5001), ok(6001)]
+        out = self.sync(manual=True)
+        self.assertEqual(out["status"], "sent")
+        self.assertTrue(all(b["customer_id"] == int(CID) for _, _, b in self.sent))
+        self.assertEqual(self.slot()["cart_id"], self.c1)
+
+    def test_f109_r3_replacement_relinked_back_supersedes_again(self):
+        c2 = self._dry_run_pair()
+        self._relink(c2, OTHER_CID)
+        self.assertIsNone(self._view()["superseded_by"])
+        self._relink(c2, CID)
+        self.assertEqual(self._view()["superseded_by"], c2)       # newest wins again
+        self.assertEqual(self.post(f"/carts/{self.c1}/send")[0], 409)
+
+    def test_f109_r3_replacement_deleted_frees_the_original(self):
+        c2 = self._dry_run_pair()
+        with self.as_user(tc.USER_A):
+            self.assertEqual(self.client.delete(f"/carts/{c2}").status_code, 200)
+        self.assertIsNone(self._view()["superseded_by"])
+        self.assertEqual(self.post(f"/carts/{self.c1}/send")[0], 202)
+
+    def test_f109_r3_original_relinked_is_not_replaced_on_its_new_customer(self):
+        c2 = self._dry_run_pair()
+        self._relink(self.c1, OTHER_CID)
+        self.assertIsNone(self._view()["superseded_by"])
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync(manual=True)["status"], "sent")
+        self.assertTrue(all(b["customer_id"] == int(OTHER_CID) for _, _, b in self.sent))
+        self.assertEqual(self._view(c2)["superseded_by"], None)
+
+    def test_f109_r3_replacement_relinked_during_finish(self):
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        with mock.patch.dict(os.environ, {"FIELDPULSE_WRITE_MODE": "dry_run"}):
+            self.assertEqual(self.sync(c2)["status"], "dry_run")
+        real = self.db.finish_cart_slot
+
+        def racing(*args, **kwargs):
+            self._relink(c2, OTHER_CID)
+            return real(*args, **kwargs)
+        with mock.patch.object(self.db, "finish_cart_slot", side_effect=racing):
+            self.assertEqual(self.sync(manual=True)["status"], "superseded")
+        self.assertIsNone(self.cart()["superseded_by"])           # not even stored
+        d = self._view()
+        # Its own record says 'superseded', but the replacement left: shown as sendable.
+        self.assertEqual(d["fieldpulse"]["raw_status"], "superseded")
+        self.assertEqual((d["superseded_by"], d["fieldpulse"]["state"], d["fieldpulse"]["error"],
+                          d["fieldpulse"]["replaced_by"], d["fieldpulse"]["can_send"]),
+                         (None, "not_sent", None, None, True))
+        self.assertEqual(self.post(f"/carts/{self.c1}/send")[0], 202)
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync(manual=True)["status"], "sent")
+
+    def test_f109_r3_same_customer_replacement_still_blocks(self):
+        c2 = self._dry_run_pair()
+        self.assertEqual(self._view()["fieldpulse"]["state"], "superseded")
+        self.assertEqual(self.post(f"/carts/{self.c1}/send")[0], 409)
+        self.assertEqual(self.sync(manual=True)["status"], "superseded")
+        self.assertEqual(self.sent, [])
+
+    # R4 (Nick's rule, F-114/F-115): once a NEWER cart really wrote (or tried to) to the
+    # slot, the older cart is replaced FOR GOOD, even when that newer cart is deleted or
+    # relinked; the way forward is to forward the cart again. One test per path.
+    def _delete(self, cart_id):
+        with self.as_user(tc.USER_A):
+            self.assertEqual(self.client.delete(f"/carts/{cart_id}").status_code, 200)
+
+    def _assert_replaced_for_good(self, gone=True):
+        d = self._view()
+        fp = d["fieldpulse"]
+        self.assertEqual((fp["state"], fp["can_send"]), ("superseded", False))
+        self.assertTrue(d["superseded_by"])
+        self.assertEqual(fp["replaced_note"], tc.cp.REPLACED_FINAL_NOTE)
+        self.assertIn("forward the cart from Ferguson again", fp["replaced_note"])
+        if gone:
+            self.assertIsNone(fp["replaced_by"])          # no link to a deleted cart
+        with self.as_user(tc.USER_A):
+            items = self.client.get("/carts").get_json()["items"]
+        row = next(i for i in items if i["id"] == self.c1)
+        self.assertEqual(row["fieldpulse_state"], "superseded")
+        code, body = self.post(f"/carts/{self.c1}/send")
+        self.assertEqual(code, 409)
+        self.assertIn("forward the cart from Ferguson again", body["error"])
+
+    def test_r4_f114_unresolved_create_then_replacement_deleted_never_posts_again(self):
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [fs._OutcomeUnknown("ReadTimeout: no response"), ok(6001)]
+        self.assertEqual(self.sync(c2)["status"], "unknown")
+        self.assertTrue(self.slot()["estimate_create_pending"])
+        self.assertTrue(self.cart()["superseded_final_customer"])   # written at mark time
+        self._delete(c2)
+        self._assert_replaced_for_good()
+        n = len(self.sent)
+        for manual in (False, True):
+            out = self.sync(manual=manual)
+            self.assertEqual(out["status"], "superseded")
+        self.assertEqual(len(self.sent), n)                  # no POST, no PUT
+        self.assertTrue(self.slot()["estimate_create_pending"])     # warning kept on the slot
+
+    def test_r4_f115_previously_sent_cart_stays_replaced_after_deletion(self):
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync()["status"], "sent")
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [PUT_OK, PUT_OK]
+        self.assertEqual(self.sync(c2)["status"], "sent")
+        self._delete(c2)
+        self._assert_replaced_for_good()
+        self.assertEqual((self.slot()["estimate_id"], self.slot()["list_id"]), (5001, 6001))
+
+    def test_r4_live_replacement_view_links_and_explains(self):
+        self.responses = [ok(5001), ok(6001)]
+        self.sync()
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [PUT_OK, PUT_OK]
+        self.sync(c2)
+        fp = self._view()["fieldpulse"]
+        self.assertEqual((fp["state"], fp["replaced_by"], fp["can_send"]),
+                         ("superseded", c2, False))
+
+    def test_r4_older_cart_linked_after_the_newer_sent_is_stopped_by_the_slot(self):
+        # C1 (older) was not linked when C2 sent, so mark_cart_sending couldn't finalize it.
+        self.db.carts[self.c1].update(status="needs_customer", fieldpulse_customer_id=None,
+                                      customer=None)
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync(c2)["status"], "sent")
+        self.link(self.c1, CID)
+        self._delete(c2)
+        self.assertIsNone(self._view()["superseded_by"])     # not known yet ...
+        n = len(self.sent)
+        out = self.sync(manual=True)                         # ... the slot stops it
+        self.assertEqual(out["status"], "superseded")
+        self.assertEqual(len(self.sent), n)
+        self._assert_replaced_for_good()
+
+    def test_r4_mark_refuses_an_older_cart_when_a_newer_one_wrote(self):
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [ok(5001), ok(6001)]
+        self.sync(c2)
+        self._delete(c2)
+        # Even if sync's own check were bypassed, the write that precedes a request refuses.
+        self.assertFalse(self.db.mark_cart_sending(tc.USER_A, self.c1, CID, "testproject",
+                                                   "estimate", True, {"method": "POST"},
+                                                   "live"))
+        self.assertEqual(self.slot()["estimate_id"], 5001)   # id kept, nothing cleared
+
+    def test_r4_dry_run_replacement_relinked_or_deleted_still_frees_the_original(self):
+        c2 = self._dry_run_pair()                            # F-109 kept: no real send
+        self.assertIsNone(self.cart()["superseded_final_customer"])
+        self.assertEqual(self._view()["fieldpulse"]["replaced_note"], tc.cp.REPLACED_LIVE_NOTE)
+        self._delete(c2)
+        self.assertIsNone(self._view()["superseded_by"])
+        self.responses = [ok(5001), ok(6001)]
+        self.assertEqual(self.sync(manual=True)["status"], "sent")
+
+    def test_r4_final_supersede_ignores_replacement_relink_but_follows_own_customer(self):
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [ok(5001), ok(6001)]
+        self.sync(c2)
+        self.assertEqual(self.cart()["superseded_by"], c2)
+        # C1 never sent (only linked), so it may be relinked: another slot, not replaced there.
+        self._relink(self.c1, OTHER_CID)
+        self.assertIsNone(self._view()["superseded_by"])
+        self._relink(self.c1, CID)                           # back on 101: replaced again
+        self.assertEqual(self._view()["fieldpulse"]["state"], "superseded")
+        self.assertEqual(self.post(f"/carts/{self.c1}/send")[0], 409)
+
+    def test_r4_newer_cart_still_replaces_after_older_real_send(self):
+        self.responses = [ok(5001), ok(6001)]
+        self.sync()
+        c2 = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.responses = [PUT_OK, PUT_OK]
+        self.assertEqual(self.sync(c2)["status"], "sent")
+        self.assertEqual(self.methods()[2:], [("PUT", "/estimates/5001"),
+                                              ("PUT", "/material-lists/6001")])
+        self.assertEqual(self.slot()["writer_cart_id"], c2)
+
     def test_put_404_posts_new(self):
         self.responses = [ok(5001), ok(6001)]
         self.sync()
@@ -513,6 +763,36 @@ class TestItemTypes(Base):
         self.assertEqual([c["title"] for c in comps],
                          ["Testbrand TB-100 - bathroom", "Otherbrand Co OB-200-NODRAIN - Kitchen"])
 
+    def test_f111_conflicting_duplicate_answers_are_null(self):
+        lines = [{"brand": "Testbrand", "model": "TB-1"}, {"brand": "Testbrand", "model": "TB-2"}]
+        vocab = ferguson_cart.ITEM_TYPES
+        cases = (
+            # type vs type, in both orders: null (never "first wins")
+            ('[{"index":0,"type":"Faucet"},{"index":0,"type":"Toilet"},{"index":1,"type":"Toilet"}]',
+             [None, "Toilet"]),
+            ('[{"index":0,"type":"Toilet"},{"index":0,"type":"Faucet"}]', [None, None]),
+            # type vs null, null vs type, type vs an unknown word: null
+            ('[{"index":0,"type":"Faucet"},{"index":0,"type":null}]', [None, None]),
+            ('[{"index":0,"type":null},{"index":0,"type":"Faucet"}]', [None, None]),
+            ('[{"index":0,"type":"Faucet"},{"index":0,"type":"Spaceship"}]', [None, None]),
+            # identical repeats (case/space differences only) are the same answer
+            ('[{"index":0,"type":"Faucet"},{"index":0,"type":" faucet "},{"index":1,"type":"Toilet"}]',
+             ["Faucet", "Toilet"]),
+        )
+        for rows, want in cases:
+            with self.subTest(rows=rows), self.ai('{"types": %s}' % rows):
+                self.assertEqual(self.ex.classify_product_types(lines, vocab), want)
+        # End to end: the conflicting line is stored null and titled by brand/model.
+        with self.ai('{"types": [{"index": 0, "type": "Faucet"}, {"index": 0, "type": "Toilet"},'
+                     ' {"index": 1, "type": "Toilet"}]}'):
+            self.ensure()
+        parsed = self.cart()["parsed"]
+        self.assertEqual([it["item_type"] for it in parsed["items"]], [None, "Toilet"])
+        self.responses = [ok(5001), ok(6001)]
+        self.sync()
+        comps = [c for g in self.sent[0][2]["line_items"] for c in g["line_components"]]
+        self.assertEqual(comps[0]["title"], "Testbrand TB-100 - bathroom")
+
     def test_ai_failure_all_null_send_goes_ahead(self):
         import anthropic
         for answer in (anthropic.APIConnectionError(request=mock.Mock()), "not json",
@@ -554,7 +834,8 @@ class TestItemTypes(Base):
         unlinked = self.new_cart(customer=None)
         bad = self.new_cart(cart_html(project="Testproject", subtotal="$1.00"))
         self.cart(bad)["ok"] = False
-        self.cart()["superseded_by"] = unlinked
+        newer = self.new_cart(cart_html(project="Testproject", expires="12/11/2026"))
+        self.cart()["superseded_by"] = newer        # live: newer is on the same customer
         with self.ai(self.GOOD):
             for cid in (unlinked, bad, self.c1, "cart_000000000fff"):
                 self.assertEqual(self.ensure(cid), "skipped")

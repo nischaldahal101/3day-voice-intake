@@ -262,12 +262,19 @@ def _trusted_results(headers, authserv_id):
 def sender_authenticated(headers, sender, authserv_id):
     """True when our receiver's topmost Authentication-Results header shows
     spf=pass for the sender's domain (smtp.mailfrom), dkim=pass for it (header.d /
-    header.i, the domain or a parent of it) or dmarc=pass for it (header.from).
+    header.i, the domain or a parent of it) or dmarc=pass for it (header.from),
+    and no dmarc=fail for it. This proves the DOMAIN only; the forward path calls
+    it with the message's header From (F-108), whose mailbox must itself be one
+    of the user's verified emails.
     Header shape verified 2026-11-12 on a real Ferguson email via Cloudflare."""
     sender_domain = _domain_of(sender)
     if not sender_domain:
         return False
-    for method, result, props in _trusted_results(headers, authserv_id):
+    results = _trusted_results(headers, authserv_id)
+    if any(m == "dmarc" and r == "fail" and _domain_of(p.get("header.from")) == sender_domain
+           for m, r, p in results):
+        return False
+    for method, result, props in results:
         if result != "pass":
             continue
         if method == "spf" and _domain_of(props.get("smtp.mailfrom")) == sender_domain:
@@ -351,18 +358,26 @@ def accepted_sender(user_id, envelope_sender, headers):
     """(sender_to_store, None) when accepted, else (None, drop_code). Two paths:
     1. Ferguson direct (ferguson_direct): no Clerk lookup, envelope ignored.
     2. User forward: envelope sender is one of the user's VERIFIED Clerk emails AND
-       sender_authenticated for it.
-    Drop codes: 'sender_not_allowed' (not Ferguson, not one of the user's emails) or
-    'auth_failed' (one of the user's emails but not authenticated, or the From
-    claims fergusonhome.com but DMARC didn't pass). ProfileError when the user's
-    emails can't be read."""
+       the message has exactly ONE header From address that is ALSO one of them AND
+       that From's domain is authenticated (sender_authenticated). The authenticated
+       From mailbox is what gets stored. (F-108: domain-only DKIM/DMARC for the
+       envelope address let a signed message from ANOTHER mailbox at the same
+       provider in; binding the From mailbox closes that. Residual: a provider that
+       lets its users sign any From in its domain; DMARC can't tell those apart.)
+    Drop codes: 'sender_not_allowed' (not Ferguson, envelope not one of the user's
+    emails) or 'auth_failed' (envelope is the user's, but the From is missing /
+    ambiguous / someone else / not authenticated, or the From claims
+    fergusonhome.com but DMARC didn't pass). ProfileError when the user's emails
+    can't be read."""
     authserv = _env("INBOUND_AUTHSERV_ID", DEFAULT_AUTHSERV_ID)
     direct = ferguson_direct(headers, authserv)
     if direct:
         return direct, None
-    if envelope_sender in _profile(user_id)["emails"]:
-        if sender_authenticated(headers, envelope_sender, authserv):
-            return envelope_sender, None
+    emails = _profile(user_id)["emails"]
+    if envelope_sender in emails:
+        claimed = _header_from(headers)
+        if claimed in emails and sender_authenticated(headers, claimed, authserv):
+            return claimed, None
         return None, "auth_failed"
     claimed = _header_from(headers)
     if claimed and claimed.rsplit("@", 1)[1] == FERGUSON_DOMAIN:
@@ -824,7 +839,9 @@ def _age_s(iso):
 def fp_state(raw, at=None, superseded_by=None):
     """The app's FieldPulse state for a cart: not_sent | queued | sending | dry_run | held |
     sent | attention | refused | superseded. A 'sending' older than 5 min = the worker
-    died mid-send -> attention."""
+    died mid-send -> attention. `superseded_by` = the LIVE value (jobs._LIVE_SUPERSEDED):
+    a stored 'superseded' record whose replacement left the slot (relinked, unlinked,
+    deleted) reads as not_sent again, so the cart can be sent (F-109)."""
     if superseded_by:
         return "superseded"
     if raw == "sending":
@@ -832,14 +849,33 @@ def fp_state(raw, at=None, superseded_by=None):
         return "sending" if age is not None and age <= _STALE_SENDING_S else "attention"
     if raw in _FP_ATTENTION:
         return "attention"
-    if raw in ("queued", "dry_run", "held", "sent", "refused", "superseded"):
+    if raw in ("queued", "dry_run", "held", "sent", "refused"):
         return raw
     return "not_sent"
+
+
+# R4 (F-115): what a replaced cart's page says. Final = the newer cart really wrote to
+# FieldPulse (replaced for good, even after that cart is deleted/relinked; jobs._LIVE_SUPERSEDED).
+REPLACED_FINAL_NOTE = ("A newer cart for this project already updated the draft estimate and "
+                       "material list in FieldPulse, so nothing more is sent for this cart. "
+                       "To change the estimate, forward the cart from Ferguson again.")
+REPLACED_LIVE_NOTE = ("A newer cart for this project takes over its draft estimate and "
+                      "material list. Send the newer cart instead.")
+
+
+def _replacement_exists(cart):
+    sb = cart.get("superseded_by")
+    if not sb:
+        return False
+    if not cart.get("superseded_final"):
+        return True                     # the live value already means it exists
+    return jobs.get_ferguson_cart(cart.get("clerk_user_id"), sb) is not None
 
 
 def _fp_view(cart):
     rec = cart.get("fieldpulse") if isinstance(cart.get("fieldpulse"), dict) else {}
     state = fp_state(rec.get("status"), rec.get("at"), cart.get("superseded_by"))
+    stale = rec.get("status") == "superseded" and not cart.get("superseded_by")
     steps = rec.get("steps") if isinstance(rec.get("steps"), dict) else {}
     problem = None
     if cart.get("status") in ("linked", "sent"):
@@ -847,10 +883,15 @@ def _fp_view(cart):
         problem = cart_send_problem(cart)
     return {
         "state": state, "label": FP_LABELS[state], "raw_status": rec.get("status"),
-        "message": rec.get("message"), "error": rec.get("error"), "mode": rec.get("mode"),
+        # A 'superseded' record whose replacement left the slot: its text no longer applies.
+        "message": None if stale else rec.get("message"),
+        "error": None if stale else rec.get("error"), "mode": rec.get("mode"),
         "updated_at": rec.get("at"), "estimate_id": rec.get("estimate_id"),
         "list_id": rec.get("list_id"), "replaces": rec.get("replaces"),
-        "replaced_by": cart.get("superseded_by") or rec.get("replaced_by"),
+        # Link to the replacement only while it exists (a final one may have been deleted).
+        "replaced_by": cart.get("superseded_by") if _replacement_exists(cart) else None,
+        "replaced_note": ((REPLACED_FINAL_NOTE if cart.get("superseded_final")
+                           else REPLACED_LIVE_NOTE) if state == "superseded" else None),
         "steps": {k: v for k, v in steps.items() if isinstance(v, dict)},
         "history": cart.get("fieldpulse_history") or [],
         "problem": problem,
@@ -881,7 +922,8 @@ def request_send(user_id, cart_id):
         return 409, {"error": "Link this cart to a FieldPulse customer first."}
     if cart.get("superseded_by"):
         return 409, {"error": "This cart was replaced by a newer cart for the same project. "
-                              "Send the newer cart instead."}
+                              + (REPLACED_FINAL_NOTE if cart.get("superseded_final")
+                                 else "Send the newer cart instead.")}
     from fieldpulse_sync import cart_send_problem
     problem = cart_send_problem(cart)
     if problem:

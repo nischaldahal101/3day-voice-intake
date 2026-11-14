@@ -180,3 +180,81 @@ export function sendCartPrompt(projectName, customerName) {
     'It creates (or replaces) ONE draft estimate and ONE material list "Ferguson cart: ' + p +
     '". After it is sent, the customer can\'t be changed.'
 }
+
+// F-110: every link (automatic match or manual) queues an automatic send, but the server keeps
+// no "queued" record for it. A linked cart with NO FieldPulse record yet = that send is still
+// to come, so the detail waits for it (bounded, like a manual Send).
+export function autoSendExpected(d) {
+  if (!d || typeof d !== 'object' || d.status !== 'linked' || d.superseded_by) return false
+  const fp = d.fieldpulse && typeof d.fieldpulse === 'object' ? d.fieldpulse : null
+  if (!fp) return true
+  return fp.raw_status == null && fp.updated_at == null && !fp.problem
+}
+
+// The detail waits on the worker (one bounded wait per FieldPulse record) when a send is
+// queued/running or an automatic send is expected.
+export function shouldWaitForSend(d) {
+  if (!d || typeof d !== 'object') return false
+  const fp = d.fieldpulse && typeof d.fieldpulse === 'object' ? d.fieldpulse : null
+  return fpBusy(fp) || autoSendExpected(d)
+}
+
+export const SEND_WAIT_MAX_POLLS = 40 // ~2 min at 3 s
+
+function fpOf(d) {
+  return d && typeof d === 'object' && d.fieldpulse && typeof d.fieldpulse === 'object' ? d.fieldpulse : {}
+}
+
+// The record a wait watches (state + updated_at). F-112: ONE polling budget per record: the
+// screen remembers the key of every record any wait has seen (start + each reload) and an
+// automatic wait never starts again for a remembered key.
+export function waitKey(d) {
+  const fp = fpOf(d)
+  return `${fp.state}|${fp.updated_at}`
+}
+
+// A new automatic wait for this detail, or null. `seen` = every record key any wait has seen
+// (a Set; a single key string is accepted too), so the same record is waited on at most once,
+// even when an older response shows it again (always bounded).
+export function autoSendWait(d, seen) {
+  if (!shouldWaitForSend(d)) return null
+  const key = waitKey(d)
+  const known = seen instanceof Set ? seen.has(key) : key === seen
+  return known ? null : { since: fpOf(d).updated_at ?? null, polls: 0, errors: 0, auto: true, key }
+}
+
+// A wait after a manual Send or a link (the caller knows a send was just queued).
+export function manualSendWait(d, auto = false) {
+  return { since: fpOf(d).updated_at ?? null, polls: 0, errors: 0, auto, key: waitKey(d) }
+}
+
+// F-113: a reload that fails still counts as a poll and the wait goes on; after
+// SEND_WAIT_MAX_ERRORS failures IN A ROW it stops with a visible note (manual Send re-enabled).
+export const SEND_WAIT_MAX_ERRORS = 3
+
+// One reload during a wait -> { done, polls, errors, note }. `error` = the failed reload (data
+// is then ignored). Done when the record changed and is no longer busy, after
+// SEND_WAIT_MAX_POLLS reloads (manual waits then say so), or after SEND_WAIT_MAX_ERRORS failed
+// reloads in a row (always says so).
+export function sendWaitStep(wait, data, error = null) {
+  const polls = (wait && wait.polls ? wait.polls : 0) + 1
+  if (error) {
+    const errors = (wait && wait.errors ? wait.errors : 0) + 1
+    if (errors >= SEND_WAIT_MAX_ERRORS || polls >= SEND_WAIT_MAX_POLLS) {
+      const why = (error && error.message) || String(error)
+      return { done: true, polls, errors,
+        note: `Couldn't check the send status (${why}). Press Refresh to see the latest.` }
+    }
+    return { done: false, polls, errors, note: null }
+  }
+  const fp = fpOf(data)
+  if ((fp.updated_at ?? null) !== (wait ? wait.since : null) && !fpBusy(fp)) {
+    const problem = fp.state === 'attention' || fp.state === 'refused'
+    return { done: true, polls, errors: 0, note: problem ? 'Finished with a problem (see above).' : null }
+  }
+  if (polls >= SEND_WAIT_MAX_POLLS) {
+    return { done: true, polls, errors: 0,
+      note: wait && wait.auto ? null : 'Still waiting for the worker. Refresh this page in a minute.' }
+  }
+  return { done: false, polls, errors: 0, note: null }
+}

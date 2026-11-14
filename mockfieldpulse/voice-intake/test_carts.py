@@ -17,6 +17,7 @@ from unittest import mock
 import test_fieldpulse_sync  # noqa: F401  (env scrub, network block, stubs)
 
 import observability  # noqa: E402
+import ferguson_cart  # noqa: E402
 from test_ferguson_cart import cart_html, direct_email, gmail_forward  # noqa: E402
 
 # carts_panel (and through it admin_panel / orchestrator) is imported when the tests
@@ -93,8 +94,24 @@ class FakeCartDB:
     def get_cart_alias_user(self, alias):
         return next((u for u, a in self.aliases.items() if a == alias), None)
 
+    def _live(self, c):
+        """jobs._LIVE_SUPERSEDED: a FINAL supersede (R4: the newer cart really wrote) counts
+        while the cart is linked/sent to the customer it was finalized on; otherwise the
+        stored superseded_by counts only while that cart exists for the same user and both
+        are linked/sent to the same customer."""
+        final = bool(c.get("superseded_by") and c.get("superseded_final_customer")
+                     and c["superseded_final_customer"] == c["fieldpulse_customer_id"]
+                     and c["status"] in ("linked", "sent"))
+        if final:
+            return {**c, "superseded_final": True}
+        n = self.carts.get(c.get("superseded_by") or "")
+        ok = (n is not None and n["id"] != c["id"] and n["clerk_user_id"] == c["clerk_user_id"]
+              and n["status"] in ("linked", "sent") and c["status"] in ("linked", "sent")
+              and n["fieldpulse_customer_id"] == c["fieldpulse_customer_id"])
+        return {**c, "superseded_by": n["id"] if ok else None, "superseded_final": False}
+
     def find_cart_by_sha(self, user_id, sha):
-        return next((dict(c) for c in self.carts.values()
+        return next((self._live(c) for c in self.carts.values()
                      if c["clerk_user_id"] == user_id and c["raw_sha256"] == sha), None)
 
     def create_ferguson_cart(self, user_id, alias, sender, message_id, raw_key, raw_sha256,
@@ -110,7 +127,8 @@ class FakeCartDB:
                "warnings": list(warnings), "project_name": project_name,
                "status": "needs_customer", "fieldpulse_customer_id": None,
                "customer": None, "customer_match": None, "fieldpulse": None,
-               "fieldpulse_history": [], "superseded_by": None}
+               "fieldpulse_history": [], "superseded_by": None,
+               "superseded_final_customer": None}
         self.carts[row["id"]] = row
         return dict(row), True
 
@@ -126,13 +144,13 @@ class FakeCartDB:
                   "match_state": (c["customer_match"] or {}).get("state"),
                   "fieldpulse_status": (c["fieldpulse"] or {}).get("status"),
                   "fieldpulse_at": (c["fieldpulse"] or {}).get("at"),
-                  "superseded_by": c["superseded_by"]}
+                  "superseded_by": self._live(c)["superseded_by"]}
                  for c in rows[offset:offset + limit]]
         return {"items": items, "total": len(rows)}
 
     def get_ferguson_cart(self, user_id, cart_id):
         c = self.carts.get(cart_id)
-        return dict(c) if c and c["clerk_user_id"] == user_id else None
+        return self._live(c) if c and c["clerk_user_id"] == user_id else None
 
     def delete_ferguson_cart(self, user_id, cart_id):
         c = self.get_ferguson_cart(user_id, cart_id)
@@ -148,7 +166,7 @@ class FakeCartDB:
                  fieldpulse_customer_id=str(customer["id"]) if customer else None,
                  customer=json.loads(json.dumps(customer)) if customer else None,
                  customer_match=dict(match))
-        return dict(c)
+        return self._live(c)
 
     def set_cart_item_types(self, user_id, cart_id, parsed):
         c = self.carts.get(cart_id)
@@ -175,7 +193,7 @@ class FakeCartDB:
             "estimate_cart_id": None, "estimate_create_pending": False, "list_id": None,
             "list_status": None, "list_cart_id": None, "list_create_pending": False,
             "held": False, "mode": None, "resync": False, "resync_manual": False,
-            "resync_cart_id": None})
+            "resync_cart_id": None, "writer_cart_id": None, "writer_received_at": None})
 
     def claim_cart_slot(self, user_id, customer_id, project_key, cart_id, manual=False):
         key = (user_id, customer_id, project_key)
@@ -200,12 +218,23 @@ class FakeCartDB:
         if (not c or c["clerk_user_id"] != user_id or c["fieldpulse_customer_id"] != customer_id
                 or c["status"] not in ("linked", "sent")):
             return False
+        slot = self._slot((user_id, customer_id, project_key))
+        w = slot.get("writer_cart_id")
+        if w and w != cart_id and (slot["writer_received_at"], w) > (c["received_at"], cart_id):
+            return False                 # R4: a newer cart already wrote to this slot
         c["status"] = "sent"
         c["fieldpulse"] = {**(c["fieldpulse"] or {}), "status": "sending", "mode": mode}
+        slot.update(writer_cart_id=cart_id, writer_received_at=c["received_at"], mode=mode)
         if post:
-            self._slot((user_id, customer_id, project_key)).update(
-                {f"{target}_create_pending": True, f"{target}_id": None,
-                 f"{target}_status": "sending"})
+            slot.update({f"{target}_create_pending": True, f"{target}_id": None,
+                         f"{target}_status": "sending"})
+        for o in self.carts.values():   # R4: older carts of the slot -> replaced for good
+            if (o["id"] != cart_id and o["clerk_user_id"] == user_id
+                    and o["fieldpulse_customer_id"] == customer_id
+                    and o["status"] in ("linked", "sent")
+                    and (o["received_at"], o["id"]) < (c["received_at"], cart_id)
+                    and ferguson_cart.project_key(o["project_name"]) == project_key):
+                o.update(superseded_by=cart_id, superseded_final_customer=customer_id)
         return True
 
     def set_cart_fieldpulse(self, user_id, cart_id, record, history_entry=None):
@@ -224,9 +253,20 @@ class FakeCartDB:
         row.update(updates or {})
         self.busy_keys.discard(key)
         self.set_cart_fieldpulse(user_id, cart_id, record, history_entry)
-        if supersede:
+        if supersede and len(supersede) > 2 and supersede[2] == "final":
             old = self.carts.get(supersede[0])
-            if old and old["clerk_user_id"] == user_id and supersede[0] != supersede[1]:
+            if (old and old["clerk_user_id"] == user_id and supersede[0] != supersede[1]
+                    and str(old.get("fieldpulse_customer_id")) == str(customer_id)
+                    and old.get("status") in ("linked", "sent")):
+                old.update(superseded_by=supersede[1], superseded_final_customer=customer_id)
+        elif supersede:
+            old, new = self.carts.get(supersede[0]), self.carts.get(supersede[1])
+            if (old and old["clerk_user_id"] == user_id and supersede[0] != supersede[1]
+                    and str(old.get("fieldpulse_customer_id")) == str(customer_id)
+                    and old.get("status") in ("linked", "sent")
+                    and new and new["clerk_user_id"] == user_id
+                    and str(new.get("fieldpulse_customer_id")) == str(customer_id)
+                    and new.get("status") in ("linked", "sent")):
                 old["superseded_by"] = supersede[1]
         return row["resync"], row["resync_manual"], row["resync_cart_id"]
 
@@ -489,6 +529,51 @@ class TestInboundSender(Base):
         with mock.patch.dict(PROFILES, {USER_A: prof}):
             code, out = self.inbound(FORWARD_OK, sender="pat@example.invalid")
         self.assertEqual(out, {"status": "dropped", "reason": "sender_not_allowed"})
+
+    def forward_from(self, from_, header, sender="pat@example.invalid"):
+        raw = gmail_forward(cart_html(project="Testproject"))
+        raw = raw.replace(b"From: Pat Example <pat@example.invalid>", f"From: {from_}".encode(), 1)
+        return self.inbound(with_headers(raw, header), sender=sender)
+
+    def test_f108_same_domain_other_mailbox_replay_is_dropped(self):
+        # A DKIM/DMARC-valid message from ANOTHER mailbox at the user's provider,
+        # replayed with the victim's envelope address (SPF fails).
+        replay = ar(spf=("fail", "pat@example.invalid"), dkim=("pass", "example.invalid"),
+                    dmarc=("pass", "example.invalid"))
+        for from_ in ("Attacker <attacker@example.invalid>", "sam@example.invalid",
+                      "pat@example.invalid, attacker@example.invalid", ""):
+            with self.subTest(from_=from_):
+                self.assertEqual(self.forward_from(from_, replay),
+                                 (202, {"status": "dropped", "reason": "auth_failed"}))
+        self.assertEqual(self.db.carts, {})
+
+    def test_f108_from_must_be_the_users_and_aligned(self):
+        # Verified From + aligned DKIM/DMARC: accepted; the From mailbox is stored.
+        ok = ar(spf=("fail", "pat@example.invalid"), dkim=("pass", "example.invalid"),
+                dmarc=("pass", "example.invalid"))
+        code, out = self.forward_from("Pat <PAT@example.invalid>", ok)
+        self.assertEqual((code, out["status"]), (202, "stored"))
+        self.assertEqual(self.db.carts[out["cart_id"]]["sender"], "pat@example.invalid")
+        self.db.carts.clear()
+        # The user's OTHER verified address in From with the envelope one: accepted.
+        code, out = self.forward_from("pat.work@example.invalid",
+                                      ar(spf=("pass", "pat@example.invalid")))
+        self.assertEqual(out["status"], "stored")
+        self.assertEqual(self.db.carts[out["cart_id"]]["sender"], "pat.work@example.invalid")
+        self.db.carts.clear()
+        # Authentication for a different domain than the From's: dropped.
+        for header in (ar(dkim=("pass", "evil.invalid"), dmarc=("pass", "evil.invalid")),
+                       ar(spf=("pass", "x@evil.invalid")),
+                       # dkim passes but DMARC says the From domain failed
+                       ar(dkim=("pass", "example.invalid"), dmarc=("fail", "example.invalid"))):
+            with self.subTest(header=header):
+                self.assertEqual(self.forward_from("pat@example.invalid", header),
+                                 (202, {"status": "dropped", "reason": "auth_failed"}))
+        # A verified From with a stranger envelope is still not allowed.
+        self.assertEqual(self.forward_from("pat@example.invalid", ok,
+                                           sender="stranger@example.invalid"),
+                         (202, {"status": "dropped", "reason": "sender_not_allowed"}))
+        self.assertEqual(self.db.carts, {})
 
     def test_clerk_failure_is_503_retry(self):
         def boom(uid):

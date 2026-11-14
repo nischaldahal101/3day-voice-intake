@@ -219,6 +219,181 @@ class TestCartsDB(unittest.TestCase):
         self.assertEqual((item["fieldpulse_status"], item["superseded_by"]), ("sent", c2["id"]))
         self.assertIsNotNone(J.claim_cart_slot(self.ua, "19237287", key, c2["id"]))  # released
 
+    def test_f109_supersede_only_while_old_cart_is_on_this_customer(self):
+        J = self.jobs
+        c1, _ = self.new(self.ua)
+        c2, _ = self.new(self.ua)
+        key = f"testproject {self.base}"
+        link = {"match": "manual", "state": "done", "reason": "x", "at": "x"}
+        for c in (c1, c2):
+            J.set_cart_customer(self.ua, c["id"], {"id": 101, "display_name": "A"}, link,
+                                ("needs_customer",))
+        # C1 owned the 101 slot (dry run), then was relinked to 102 (a relink racing the run).
+        self.assertIsNotNone(J.claim_cart_slot(self.ua, "101", key, c1["id"]))
+        J.finish_cart_slot(self.ua, "101", key, {"cart_id": c1["id"], "held": True}, c1["id"],
+                           {"status": "dry_run", "at": "x"})
+        self.assertIsNotNone(J.set_cart_customer(self.ua, c1["id"], {"id": 102, "display_name": "B"},
+                                                 link, ("needs_customer", "linked")))
+        self.assertIsNotNone(J.claim_cart_slot(self.ua, "101", key, c2["id"]))
+        J.finish_cart_slot(self.ua, "101", key, {"cart_id": c2["id"]}, c2["id"],
+                           {"status": "sent", "at": "x"}, supersede=(c1["id"], c2["id"]))
+        self.assertIsNone(J.get_ferguson_cart(self.ua, c1["id"])["superseded_by"])
+        # Still on the slot's customer: the supersede write happens.
+        J.set_cart_customer(self.ua, c1["id"], {"id": 101, "display_name": "A"}, link,
+                            ("needs_customer", "linked"))
+        self.assertIsNotNone(J.claim_cart_slot(self.ua, "101", key, c2["id"]))
+        J.finish_cart_slot(self.ua, "101", key, {}, c2["id"], {"status": "sent", "at": "x"},
+                           supersede=(c1["id"], c2["id"]))
+        self.assertEqual(J.get_ferguson_cart(self.ua, c1["id"])["superseded_by"], c2["id"])
+
+    def test_f109_r3_superseded_is_live_while_replacement_stays_in_slot(self):
+        """superseded_by is derived on read (jobs._LIVE_SUPERSEDED): it holds only while
+        the replacement is linked/sent to the SAME customer and still exists."""
+        J = self.jobs
+        c1, _ = self.new(self.ua)
+        c2, _ = self.new(self.ua)
+        key = f"testproject {self.base}"
+        link = {"match": "manual", "state": "done", "reason": "x", "at": "x"}
+        allowed = ("needs_customer", "linked")
+
+        def on(c, cid):
+            return J.set_cart_customer(self.ua, c["id"], {"id": cid, "display_name": "A"},
+                                       link, allowed)
+
+        def sup(c):
+            return J.get_ferguson_cart(self.ua, c["id"])["superseded_by"]
+
+        def listed(c):
+            return next(i for i in J.list_ferguson_carts(self.ua)["items"]
+                        if i["id"] == c["id"])["superseded_by"]
+
+        on(c1, 101), on(c2, 101)
+        J.claim_cart_slot(self.ua, "101", key, c2["id"])
+        J.finish_cart_slot(self.ua, "101", key, {"cart_id": c2["id"]}, c2["id"],
+                           {"status": "dry_run", "at": "x"}, supersede=(c1["id"], c2["id"]))
+        self.assertEqual((sup(c1), listed(c1)), (c2["id"], c2["id"]))
+        # Replacement relinked to another customer -> the original is free again
+        on(c2, 102)
+        self.assertEqual((sup(c1), listed(c1)), (None, None))
+        # Replacement back on 101 -> newest wins again (same rule as the slot).
+        on(c2, 101)
+        self.assertEqual(sup(c1), c2["id"])
+        # The original itself relinked away -> not replaced on its new customer.
+        self.assertIsNone(on(c1, 103)["superseded_by"])
+        self.assertEqual(on(c1, 101)["superseded_by"], c2["id"])     # RETURNING path
+        # Replacement deleted -> the original is free again.
+        J.delete_ferguson_cart(self.ua, c2["id"])
+        self.assertEqual((sup(c1), listed(c1)), (None, None))
+
+    def test_f109_r3_finish_skips_supersede_when_new_cart_left_the_slot(self):
+        J = self.jobs
+        c1, _ = self.new(self.ua)
+        c2, _ = self.new(self.ua)
+        key = f"testproject {self.base}"
+        link = {"match": "manual", "state": "done", "reason": "x", "at": "x"}
+        for c in (c1, c2):
+            J.set_cart_customer(self.ua, c["id"], {"id": 101, "display_name": "A"}, link,
+                                ("needs_customer",))
+        J.claim_cart_slot(self.ua, "101", key, c1["id"])
+        # The NEW cart relinks to 102 while the run that would mark C1 replaced is open.
+        J.set_cart_customer(self.ua, c2["id"], {"id": 102, "display_name": "B"}, link,
+                            ("needs_customer", "linked"))
+        J.finish_cart_slot(self.ua, "101", key, {}, c1["id"], {"status": "superseded"},
+                           supersede=(c1["id"], c2["id"]))
+        with J.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT superseded_by FROM ferguson_carts WHERE id = %s", [c1["id"]])
+            self.assertIsNone(cur.fetchone()["superseded_by"])      # not even stored
+        self.assertIsNone(J.get_ferguson_cart(self.ua, c1["id"])["superseded_by"])
+
+    def test_r4_real_write_makes_supersede_final_and_blocks_older_writers(self):
+        """R4 (F-114/F-115): mark_cart_sending (the write right before a REAL request) makes
+        every older cart of the slot replaced for good and refuses older carts afterwards,
+        even after the newer cart is deleted; a final supersede follows the older cart's own
+        customer, not the replacement's existence."""
+        J = self.jobs
+        proj = f"Testproject {self.base}"
+        key = f"testproject {self.base}"
+        other, _ = self.new(self.ua, project_name=f"Other {self.base}")
+        c1, _ = self.new(self.ua, project_name=proj)
+        c2, _ = self.new(self.ua, project_name=proj)
+        c3, _ = self.new(self.ua, project_name=proj)
+        link = {"match": "manual", "state": "done", "reason": "x", "at": "x"}
+        allowed = ("needs_customer", "linked")
+
+        def on(c, cid):
+            return J.set_cart_customer(self.ua, c["id"], {"id": cid, "display_name": "A"},
+                                       link, allowed)
+
+        def get(c):
+            return J.get_ferguson_cart(self.ua, c["id"])
+
+        def listed(c):
+            return next(i for i in J.list_ferguson_carts(self.ua)["items"]
+                        if i["id"] == c["id"])["superseded_by"]
+
+        for c in (other, c1, c2, c3):
+            on(c, 101)
+        self.assertIsNotNone(J.claim_cart_slot(self.ua, "101", key, c2["id"]))
+        self.assertTrue(J.mark_cart_sending(self.ua, c2["id"], "101", key, "estimate", True,
+                                            {"method": "POST"}, "live"))
+        slot = J.get_cart_slot(self.ua, "101", key)
+        self.assertEqual((slot["writer_cart_id"], slot["estimate_create_pending"]),
+                         (c2["id"], True))
+        self.assertEqual((get(c1)["superseded_by"], get(c1)["superseded_final"]),
+                         (c2["id"], True))
+        self.assertIsNone(get(other)["superseded_by"])       # other project: untouched
+        self.assertIsNone(get(c3)["superseded_by"])          # newer: untouched
+        J.finish_cart_slot(self.ua, "101", key, {"cart_id": c2["id"]}, c2["id"],
+                           {"status": "unknown", "at": "x"})
+        # The replacement is deleted: C1 stays replaced (get, list, duplicate lookup).
+        J.delete_ferguson_cart(self.ua, c2["id"])
+        self.assertEqual((get(c1)["superseded_by"], listed(c1)), (c2["id"], c2["id"]))
+        self.assertEqual(J.find_cart_by_sha(self.ua, c1["raw_sha256"])["superseded_by"], c2["id"])
+        # Defense in depth: the pre-request write refuses the older cart, slot untouched.
+        self.assertIsNotNone(J.claim_cart_slot(self.ua, "101", key, c1["id"]))
+        self.assertFalse(J.mark_cart_sending(self.ua, c1["id"], "101", key, "estimate", True,
+                                             {"method": "POST"}, "live"))
+        slot = J.get_cart_slot(self.ua, "101", key)
+        self.assertEqual((slot["writer_cart_id"], slot["estimate_create_pending"]),
+                         (c2["id"], True))
+        self.assertEqual(get(c1)["status"], "linked")        # not marked sent either
+        J.finish_cart_slot(self.ua, "101", key, {}, c1["id"], {"status": "superseded"})
+        # A final supersede follows C1's own customer: relinked away it is free there,
+        # back on 101 it is replaced again (RETURNING path).
+        self.assertIsNone(on(c1, 102)["superseded_by"])
+        self.assertEqual(on(c1, 101)["superseded_by"], c2["id"])
+        # A NEWER cart may still write; it takes over as writer and as C1's replacement.
+        self.assertIsNotNone(J.claim_cart_slot(self.ua, "101", key, c3["id"]))
+        self.assertTrue(J.mark_cart_sending(self.ua, c3["id"], "101", key, "estimate", True,
+                                            {"method": "POST"}, "live"))
+        self.assertEqual(get(c1)["superseded_by"], c3["id"])
+        self.assertEqual(J.get_cart_slot(self.ua, "101", key)["writer_cart_id"], c3["id"])
+        J.finish_cart_slot(self.ua, "101", key, {}, c3["id"], {"status": "sent"})
+        self.assertIsNone(get(c3)["superseded_by"])
+
+    def test_r4_finish_final_supersede_needs_only_the_old_cart(self):
+        J = self.jobs
+        proj = f"Testproject {self.base}"
+        key = f"testproject {self.base}"
+        c1, _ = self.new(self.ua, project_name=proj)
+        link = {"match": "manual", "state": "done", "reason": "x", "at": "x"}
+        J.set_cart_customer(self.ua, c1["id"], {"id": 101, "display_name": "A"}, link,
+                            ("needs_customer",))
+        J.claim_cart_slot(self.ua, "101", key, c1["id"])
+        gone = "cart_000000000000"                           # the writer no longer exists
+        J.finish_cart_slot(self.ua, "101", key, {}, c1["id"], {"status": "superseded"},
+                           supersede=(c1["id"], gone, "final"))
+        got = J.get_ferguson_cart(self.ua, c1["id"])
+        self.assertEqual((got["superseded_by"], got["superseded_final"]), (gone, True))
+        # Another customer's slot can't finalize it (customer re-checked in the write).
+        c2, _ = self.new(self.ua, project_name=proj)
+        J.set_cart_customer(self.ua, c2["id"], {"id": 101, "display_name": "A"}, link,
+                            ("needs_customer",))
+        J.claim_cart_slot(self.ua, "999", key, c2["id"])
+        J.finish_cart_slot(self.ua, "999", key, {}, c2["id"], {"status": "superseded"},
+                           supersede=(c2["id"], gone, "final"))
+        self.assertIsNone(J.get_ferguson_cart(self.ua, c2["id"])["superseded_by"])
+
     def test_schema_objects_known(self):
         rels, cols = self.jobs._schema_objects()
         for r in ("cart_addresses", "ferguson_carts", "idx_ferguson_carts_user",

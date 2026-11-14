@@ -1680,7 +1680,9 @@ def _vendor_send(cid, request, cfg, manual):
 #   - before every request the cart becomes 'sent' only if still linked to that customer
 #     (no relink afterwards; a relink racing the send stops the send)
 # Never sent: ok=false, any line without a readable quantity/price/model, a superseded cart,
-# a cart whose slot already follows a NEWER cart, a non-FieldPulse customer id.
+# a cart whose slot already follows a NEWER cart, a cart OLDER than the slot's newest real
+# writer (R4: replaced for good once a newer cart really wrote, even if that cart is gone),
+# a non-FieldPulse customer id.
 
 CART_TARGETS = (("estimate", "estimate", "/estimates"),
                 ("material_list", "list", "/material-lists"))
@@ -1814,15 +1816,40 @@ def _newer(a, b):
     return (str(a.get("received_at") or ""), a["id"]) > (str(b.get("received_at") or ""), b["id"])
 
 
+def _cart_in_slot(other, ctx):
+    """True when cart `other` still belongs to the slot in ctx: linked/sent to the same
+    customer, same project key."""
+    import ferguson_cart
+    return (other.get("status") in ("linked", "sent")
+            and str(other.get("fieldpulse_customer_id") or "") == ctx["customer_id"]
+            and ferguson_cart.project_key(other.get("project_name")) == ctx["key"])
+
+
 def _cart_attempt(cfg, ctx, cart, slot, bodies, manual):
     """-> (slot updates, cart record, history entry, supersede pair or None)."""
     store = _store()
     mode = cfg["mode"]
     cart_id = ctx["cart_id"]
     supersede = None
+    writer = slot.get("writer_cart_id")
+    if (writer and writer != cart_id
+            and (str(slot.get("writer_received_at") or ""), writer)
+            > (str(cart.get("received_at") or ""), cart_id)):
+        # R4 (F-114/F-115): a NEWER cart already made a real request for this slot (its
+        # lines, or an unresolved create, are in FieldPulse), even if that cart was deleted
+        # or relinked since. This older cart is replaced for good and never sends into the
+        # slot (mark_cart_sending refuses it too). Re-forwarding the cart is the way forward.
+        record, entry = _cart_record("superseded", CART_SUPERSEDED, mode, manual,
+                                     error=CART_SUPERSEDED, replaced_by=writer)
+        return {}, record, entry, (cart_id, writer, "final")
     owner = slot.get("cart_id")
     if owner and owner != cart_id:
         other = store.get_ferguson_cart(ctx["user_id"], owner)
+        if other is not None and not _cart_in_slot(other, ctx):
+            # F-109: the recorded owner was relinked to another customer (only possible
+            # before anything was sent for it, e.g. after a dry run). It no longer
+            # belongs to this slot: neither replaces nor is replaced by this cart.
+            other = None
         if other is not None and _newer(other, cart):
             record, entry = _cart_record("superseded", CART_SUPERSEDED, mode, manual,
                                          error=CART_SUPERSEDED, replaced_by=owner)

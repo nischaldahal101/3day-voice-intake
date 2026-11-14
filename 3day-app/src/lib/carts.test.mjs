@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import {
   FP_STATE_LABEL, cartBadge, cartMoney, cartStatusLabel, fpBusy, fpStateLabel, sendButtonText, sendCartPrompt, matchPending, matchText, count, deleteCartPrompt, expiryText, groupByRoom, itemTitle, itemTypeView, TYPE_UNKNOWN,
   lineTotal, parseCartsHash, qtyText, safeLink, toCents,
+  SEND_WAIT_MAX_ERRORS, SEND_WAIT_MAX_POLLS, autoSendExpected, autoSendWait, manualSendWait, sendWaitStep,
+  shouldWaitForSend, waitKey,
 } from './carts.js'
 
 test('hashes', () => {
@@ -108,4 +110,96 @@ test('item type view: not decided / typed / flagged', () => {
     assert.deepEqual(itemTypeView(it, info), { text: TYPE_UNKNOWN, flag: true })
   }
   assert.deepEqual(itemTypeView({ item_type: null }, { source: 'unavailable' }), { text: TYPE_UNKNOWN, flag: true })
+})
+
+test('F-110: a link / queued / sending / not-yet-recorded linked cart waits for the worker', () => {
+  const linkedNoRecord = { status: 'linked', fieldpulse: { state: 'not_sent', raw_status: null, updated_at: null, problem: null } }
+  assert.equal(autoSendExpected(linkedNoRecord), true)
+  assert.equal(autoSendExpected({ status: 'linked' }), true)
+  assert.equal(autoSendExpected({ ...linkedNoRecord, superseded_by: 'cart_0123456789ab' }), false)
+  assert.equal(autoSendExpected({ ...linkedNoRecord, status: 'needs_customer' }), false)
+  assert.equal(autoSendExpected({ ...linkedNoRecord, fieldpulse: { ...linkedNoRecord.fieldpulse, problem: 'Not sent: x' } }), false)
+  // an earlier record (e.g. skipped / dry run) is not an automatic wait by itself
+  assert.equal(autoSendExpected({ status: 'linked', fieldpulse: { state: 'not_sent', raw_status: 'skipped', updated_at: 't1' } }), false)
+  for (const state of ['queued', 'sending']) {
+    assert.equal(shouldWaitForSend({ status: 'linked', fieldpulse: { state, updated_at: 't1' } }), true)
+  }
+  assert.equal(shouldWaitForSend({ status: 'sent', fieldpulse: { state: 'sent', updated_at: 't1' } }), false)
+  assert.equal(shouldWaitForSend(null), false)
+
+  // one automatic wait per record
+  const w = autoSendWait(linkedNoRecord, null)
+  assert.deepEqual(w, { since: null, polls: 0, errors: 0, auto: true, key: 'not_sent|null' })
+  assert.equal(autoSendWait(linkedNoRecord, w.key), null)
+  const queued = { status: 'linked', fieldpulse: { state: 'queued', updated_at: 't1' } }
+  assert.equal(autoSendWait(queued, w.key).since, 't1')
+
+  // link -> queued -> sending -> sent, no manual refresh
+  let s = sendWaitStep(w, queued)
+  assert.deepEqual(s, { done: false, polls: 1, errors: 0, note: null })
+  s = sendWaitStep({ ...w, polls: s.polls }, { fieldpulse: { state: 'sending', updated_at: 't2' } })
+  assert.equal(s.done, false)
+  s = sendWaitStep({ ...w, polls: s.polls }, { fieldpulse: { state: 'sent', updated_at: 't3' } })
+  assert.deepEqual(s, { done: true, polls: 3, errors: 0, note: null })
+  // ... or failed
+  assert.equal(sendWaitStep(w, { fieldpulse: { state: 'attention', updated_at: 't3' } }).note,
+    'Finished with a problem (see above).')
+  // unchanged record: bounded; an automatic wait ends quietly, a manual one says so
+  const stuck = { fieldpulse: { state: 'not_sent', updated_at: null } }
+  assert.deepEqual(sendWaitStep({ ...w, polls: SEND_WAIT_MAX_POLLS - 1 }, stuck), { done: true, polls: SEND_WAIT_MAX_POLLS, errors: 0, note: null })
+  const m = manualSendWait({ fieldpulse: { updated_at: 't0' } })
+  assert.deepEqual(m, { since: 't0', polls: 0, errors: 0, auto: false, key: 'undefined|t0' })
+  assert.match(sendWaitStep({ ...m, polls: SEND_WAIT_MAX_POLLS - 1 }, { fieldpulse: { updated_at: 't0' } }).note, /Still waiting/)
+  // relink of a dry-run cart: the link wait starts from the current record and ends on the new one
+  const relink = manualSendWait({ fieldpulse: { state: 'dry_run', updated_at: 't5' } }, true)
+  assert.equal(sendWaitStep(relink, { fieldpulse: { state: 'dry_run', updated_at: 't5' } }).done, false)
+  assert.equal(sendWaitStep(relink, { fieldpulse: { state: 'dry_run', updated_at: 't6' } }).done, true)
+})
+
+test('F-112: one polling budget per record (waitKey shared by link/manual/auto waits)', () => {
+  const linked = { status: 'linked', fieldpulse: { state: 'not_sent', updated_at: null } }
+  const link = manualSendWait(linked, true)
+  assert.equal(link.key, waitKey(linked))
+  // after the link wait ends on the unchanged record, no automatic wait restarts for it
+  assert.equal(autoSendWait(linked, link.key), null)
+  // a different record does get its own (bounded) wait
+  const queued = { status: 'linked', fieldpulse: { state: 'queued', updated_at: 't1' } }
+  assert.notEqual(autoSendWait(queued, link.key), null)
+  assert.equal(autoSendWait(queued, waitKey(queued)), null)
+})
+
+test('F-112 R4: every key a wait saw stays consumed (a late older response cannot rearm)', () => {
+  const queued = { status: 'linked', fieldpulse: { state: 'queued', updated_at: 'q' } }
+  const sending = { status: 'sent', fieldpulse: { state: 'sending', updated_at: 's' } }
+  const seen = new Set()
+  const w = autoSendWait(queued, seen)
+  seen.add(w.key)                       // the screen records the start key ...
+  seen.add(waitKey(sending))            // ... and every key a reload during the wait saw
+  assert.equal(autoSendWait(sending, seen), null)
+  assert.equal(autoSendWait(queued, seen), null)   // the old queued record comes back late
+  assert.notEqual(autoSendWait({ status: 'sent', fieldpulse: { state: 'sending', updated_at: 's2' } }, seen), null)
+})
+
+test('F-113: a failed reload keeps the wait going, bounded, then stops with a visible note', () => {
+  const m = manualSendWait({ fieldpulse: { state: 'not_sent', updated_at: null } })
+  const err = new Error('HTTP 503')
+  let s = sendWaitStep(m, null, err)
+  assert.deepEqual(s, { done: false, polls: 1, errors: 1, note: null })
+  // transient error -> success: errors reset, wait continues / finishes normally
+  s = sendWaitStep({ ...m, polls: s.polls, errors: s.errors }, { fieldpulse: { state: 'queued', updated_at: 't1' } })
+  assert.deepEqual(s, { done: false, polls: 2, errors: 0, note: null })
+  s = sendWaitStep({ ...m, polls: s.polls, errors: s.errors }, { fieldpulse: { state: 'sent', updated_at: 't2' } })
+  assert.equal(s.done, true)
+  // persistent error -> stops after SEND_WAIT_MAX_ERRORS in a row, with the reason
+  let w = { ...m }
+  for (let i = 1; i <= SEND_WAIT_MAX_ERRORS; i++) {
+    s = sendWaitStep(w, null, err)
+    w = { ...w, polls: s.polls, errors: s.errors }
+    assert.equal(s.done, i === SEND_WAIT_MAX_ERRORS)
+  }
+  assert.match(s.note, /Couldn't check the send status \(HTTP 503\)\. Press Refresh/)
+  // automatic waits show it too; the poll cap also bounds errors
+  const a = autoSendWait({ status: 'linked', fieldpulse: null }, null)
+  assert.match(sendWaitStep({ ...a, errors: SEND_WAIT_MAX_ERRORS - 1 }, null, err).note, /Couldn't check/)
+  assert.equal(sendWaitStep({ ...a, polls: SEND_WAIT_MAX_POLLS - 1 }, null, err).done, true)
 })

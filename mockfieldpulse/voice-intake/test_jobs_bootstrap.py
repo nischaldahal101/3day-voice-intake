@@ -201,13 +201,16 @@ class SchemaObjectsTests(unittest.TestCase):
             "idx_vendor_documents_customer", "vendor_material_lists",
             "cart_addresses", "ferguson_carts", "idx_ferguson_carts_user",     # E2
             "cart_fieldpulse_slots"]))                                         # E4
-        self.assertEqual(sorted(columns), [("consultation_jobs", "customer"),
+        self.assertEqual(sorted(columns), [("cart_fieldpulse_slots", "writer_cart_id"),  # R4
+                                           ("cart_fieldpulse_slots", "writer_received_at"),
+                                           ("consultation_jobs", "customer"),
                                            ("consultation_jobs", "transcript"),
                                            ("ferguson_carts", "customer"),          # E3
                                            ("ferguson_carts", "customer_match"),
                                            ("ferguson_carts", "fieldpulse"),        # E4
                                            ("ferguson_carts", "fieldpulse_history"),
-                                           ("ferguson_carts", "superseded_by")])
+                                           ("ferguson_carts", "superseded_by"),
+                                           ("ferguson_carts", "superseded_final_customer")])
 
     def test_unknown_statement_means_always_run_ddl(self):
         sql = self.jobs._SCHEMA_SQL + "\nALTER TABLE consultation_jobs ADD CONSTRAINT x CHECK (true);\n"

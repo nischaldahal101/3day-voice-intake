@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { deleteCart, fetchCart, linkCartCustomer, requestCartSend, retryCartMatch } from '../lib/api.js'
 import { fmtDateTime, isObj, str } from '../lib/admin.js'
 import {
-  DASH, cartBadge, cartMoney, deleteCartPrompt, expiryText, fpBusy, fpStateLabel, groupByRoom,
-  itemTitle, itemTypeView, lineTotal, matchPending, matchText, qtyText, safeLink, sendButtonText, sendCartPrompt,
+  DASH, autoSendWait, cartBadge, cartMoney, deleteCartPrompt, expiryText, fpStateLabel, groupByRoom,
+  itemTitle, itemTypeView, lineTotal, manualSendWait, matchPending, matchText, qtyText, safeLink, sendButtonText,
+  sendCartPrompt, sendWaitStep, waitKey,
 } from '../lib/carts.js'
 import CustomerPicker from './CustomerPicker.jsx'
 
@@ -90,7 +91,10 @@ function FieldPulseCard({ d, onSend, onRefresh, sending, sendNote }) {
   const f = isObj(d.fieldpulse) ? d.fieldpulse : {}
   const attention = f.state === 'attention' || f.state === 'refused'
   const replacedBy = str(f.replaced_by)
-  const text = str(f.problem) || str(f.message)
+  const replaced = f.state === 'superseded'
+  // A replaced cart shows the server's explanation (F-115: replaced for good -> forward the
+  // cart again), not its old send record's text.
+  const text = replaced ? null : (str(f.problem) || str(f.message))
   return (
     <div className="admin-card">
       <h3 className="admin-card-title">
@@ -107,10 +111,11 @@ function FieldPulseCard({ d, onSend, onRefresh, sending, sendNote }) {
           with these lines. Forwarding the cart again for the same project replaces both (no second draft).
         </p>
       )}
-      {replacedBy && (
+      {replaced && (
         <p className="admin-note">
-          <strong>Replaced by a newer cart.</strong> A newer cart for this project now owns this estimate and
-          list. <a href={`#carts/${replacedBy}`}>Open the newer cart</a>.
+          <strong>Replaced by a newer cart.</strong>{' '}
+          {str(f.replaced_note) || 'A newer cart for this project now owns this estimate and list.'}
+          {replacedBy && <> <a href={`#carts/${replacedBy}`}>Open the newer cart</a>.</>}
         </p>
       )}
       {str(f.replaces) && <p className="admin-note">This cart replaced an <a href={`#carts/${str(f.replaces)}`}>earlier cart</a>.</p>}
@@ -254,12 +259,22 @@ export default function CartDetail({ cartId, onBack, onDeleted }) {
   const [polls, setPolls] = useState(0)
   const [sending, setSending] = useState(false)
   const [sendNote, setSendNote] = useState(null)
-  const sendWait = useRef(null)          // {since, polls} while waiting for the worker
+  const [waitTick, setWaitTick] = useState(0)   // one per wait reload (ok or failed): next poll
+  const sendWait = useRef(null)          // {since, polls, errors, auto, key} while waiting
+  const autoWaited = useRef(new Set())   // every record key any wait saw (F-112)
+  const reqSeq = useRef(0)               // F-112: order of fetchCart calls ...
+  const appliedSeq = useRef(0)           // ... and the newest one shown
   const mounted = useRef(true)
 
+  // A response older than one already shown is never applied (a slow Refresh can't bring
+  // back an old record and restart a wait for it).
   const load = useCallback(async () => {
+    const seq = ++reqSeq.current
     const data = await fetchCart(cartId)
-    if (mounted.current) setD(data)
+    if (mounted.current && seq > appliedSeq.current) {
+      appliedSeq.current = seq
+      setD(data)
+    }
     return data
   }, [cartId])
 
@@ -281,37 +296,49 @@ export default function CartDetail({ cartId, onBack, onDeleted }) {
     return () => clearTimeout(t)
   }, [d, polls, load])
 
-  // After Send (or while the worker reports queued/sending): reload every 3 s until the
-  // record's updated_at changes and it is no longer busy (max ~2 min).
+  // Wait for the worker (reload every 3 s, max ~2 min) after Send, after a link (it queues the
+  // automatic send), while the record is queued/sending, and when a linked cart has no record
+  // yet (its automatic send is still to come; F-110). Done when the record's updated_at
+  // changes and it is no longer busy. ONE budget per record (F-112): every key any wait saw
+  // is remembered (a Set), an automatic wait never restarts for it, and an older
+  // overlapping response never replaces newer data (load). Every reload, ok or failed, bumps
+  // waitTick so the next poll is always scheduled (F-113); failures are bounded by sendWaitStep.
   useEffect(() => {
-    const w = sendWait.current
-    // Without a pending Send, only a live 'sending' reloads (it turns into "Needs attention"
-    // server-side after 5 min, so this always ends).
-    const busy = !!d && isObj(d.fieldpulse) && d.fieldpulse.state === 'sending'
-    if (!d || (!w && !busy)) return undefined
+    if (!d) return undefined
+    if (!sendWait.current) {
+      const w = autoSendWait(d, autoWaited.current)
+      if (w) startWait(w)
+    }
+    if (!sendWait.current) return undefined
     const t = setTimeout(async () => {
+      let data = null
+      let failed = null
       try {
-        const data = await load()
-        if (!mounted.current) return
-        const fp = isObj(data.fieldpulse) ? data.fieldpulse : {}
-        const cur = sendWait.current
-        if (cur) {
-          cur.polls += 1
-          if (fp.updated_at !== cur.since && !fpBusy(fp)) {
-            sendWait.current = null
-            setSending(false)
-            setSendNote(fp.state === 'attention' || fp.state === 'refused'
-              ? 'Finished with a problem (see above).' : null)
-          } else if (cur.polls >= MAX_POLLS) {
-            sendWait.current = null
-            setSending(false)
-            setSendNote('Still waiting for the worker. Refresh this page in a minute.')
-          }
-        }
-      } catch (_) { /* the Refresh button shows errors */ }
+        data = await load()
+      } catch (e) {
+        failed = e || new Error('Request failed')
+      }
+      if (!mounted.current) return
+      const cur = sendWait.current
+      if (!cur) return
+      if (!failed) autoWaited.current.add(waitKey(data))
+      const step = sendWaitStep(cur, data, failed)
+      cur.polls = step.polls
+      cur.errors = step.errors
+      if (step.done) {
+        sendWait.current = null
+        if (!cur.auto) setSending(false)
+        if (!cur.auto || step.note) setSendNote(step.note)
+      }
+      setWaitTick((n) => n + 1)
     }, POLL_MS)
     return () => clearTimeout(t)
-  }, [d, load])
+  }, [d, waitTick, load])
+
+  function startWait(w) {
+    autoWaited.current.add(w.key)
+    sendWait.current = w
+  }
 
   const onSend = async () => {
     if (!d) return
@@ -322,7 +349,7 @@ export default function CartDetail({ cartId, onBack, onDeleted }) {
     try {
       await requestCartSend(cartId)
       if (!mounted.current) return
-      sendWait.current = { since: isObj(d.fieldpulse) ? d.fieldpulse.updated_at : null, polls: 0 }
+      startWait(manualSendWait(d))
       setD({ ...d })                       // start the wait loop
     } catch (e) {
       if (!mounted.current) return
@@ -342,7 +369,12 @@ export default function CartDetail({ cartId, onBack, onDeleted }) {
     setLinkNote(null)
     try {
       const data = await linkCartCustomer(cartId, c.id)
-      if (mounted.current) setD(data)
+      if (!mounted.current) return
+      // The link queued the automatic send: wait for its record (unless a wait is running).
+      if (data && data.status === 'linked' && !sendWait.current) {
+        startWait(manualSendWait(data, true))
+      }
+      setD(data)
     } catch (e) {
       if (mounted.current) setLinkNote((e && e.message) || String(e))
     } finally {

@@ -377,8 +377,8 @@ Reply with JSON only, no prose:
 
 def classify_product_types(lines, vocabulary):
     """lines = [{brand, model, finish, url_slug}] -> [type | None] (same length), each
-    type exactly one of `vocabulary`; None when the model wasn't confident or answered
-    something else. Returns None when the call failed (API error, timeout, unreadable
+    type exactly one of `vocabulary`; None when the model wasn't confident, answered
+    something else, or answered the same line more than once with different answers. Returns None when the call failed (API error, timeout, unreadable
     answer). One Claude call, no retries. NEVER raises except RQ's job deadline."""
     try:
         allowed = {str(v).casefold(): str(v) for v in vocabulary}
@@ -400,17 +400,20 @@ def classify_product_types(lines, vocabulary):
         rows = data.get("types") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise ValueError("no types list")
-        out = [None] * n
-        seen = set()
+        # Every answer per line is collected; a line answered more than once keeps its type
+        # only when ALL its answers are the same allowed type (F-111: conflicting answers,
+        # type vs null or type vs an unknown word, are null-flagged, never "first wins").
+        answers = [set() for _ in range(n)]
         for row in rows:
             if not isinstance(row, dict):
                 continue
             idx = _int_or_none(row.get("index"))
-            if idx is None or not 0 <= idx < n or idx in seen:
+            if idx is None or not 0 <= idx < n:
                 continue
-            seen.add(idx)
             t = row.get("type")
-            out[idx] = allowed.get(" ".join(t.split()).casefold()) if isinstance(t, str) else None
+            answers[idx].add(allowed.get(" ".join(t.split()).casefold())
+                             if isinstance(t, str) else None)
+        out = [next(iter(a)) if len(a) == 1 else None for a in answers]
         logger.info("Product types: %d of %d lines typed", sum(t is not None for t in out), n)
         return out
     except Exception as exc:  # noqa: BLE001 — optional step, never blocks the send
